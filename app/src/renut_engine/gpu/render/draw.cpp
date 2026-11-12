@@ -6668,6 +6668,8 @@ u32 DescribeBoundFetches(const GuestDevice &device, const DrawCall &call, const 
   for (u32 i = 0; i < count; ++i) {
     if (!(inputs[i].flags & kVertexInputBoundFetch))
       continue;
+    // fable2-nx (2026-11-11): no element for it: nothing read (a previous draw's description stayed here).
+    sc.bound_fetch[i][0] = sc.bound_fetch[i][1] = sc.bound_fetch[i][2] = sc.bound_fetch[i][3] = 0;
     for (const GuestVertexElement &e : declaration.elements) {
       if (e.Usage != inputs[i].usage || e.UsageIndex != inputs[i].usageIndex)
         continue;
@@ -8867,7 +8869,7 @@ VertexDeclarationRecord &NoDeclaration() {
 // Its D3DVERTEXELEMENT9s (12 bytes each, ended by D3DDECL_END) are at +52 of the declaration, inside the device
 // snapshot, so a draw reads them from its own snapshot; at most 15 before the device's next field (+0x3088). One record
 // per distinct element list; each new list is logged once with its elements, to check the layout.
-constexpr u32 kDeviceDeclarationOffset = 0x2F98;
+constexpr u32 kDeviceDeclarationOffset = 0x2FA0;  // fable2-nx: Fable 2 (N&B base game); Katamari 0x2F98, N&B TU3 0x2FA8
 constexpr u32 kDeclarationElementsOffset = 52;
 constexpr u32 kDeviceDeclarationMaxElements = 15;
 
@@ -11972,6 +11974,13 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   auto *vs = FindShaderLocked(vs_va, RecordKind::VertexShader);
   const u32 declaration_va = device.U32(d3d::kDeviceOffsetVertexDeclaration);
   auto *ps = FindShaderLocked(device.U32(d3d::kDeviceOffsetPixelShader), RecordKind::PixelShader);
+  // fable2-nx (2026-11-10): shader objects no hook saw (Fable sets some up in place), taken from their bytes
+  // (d3d/hooks/shader.cpp AdoptGuestShaderLocked).
+  if (!vs && vs_va)
+    vs = AdoptGuestShaderLocked(vs_va, false);
+  if (!ps)
+    if (const u32 ps_va = device.U32(d3d::kDeviceOffsetPixelShader))
+      ps = AdoptGuestShaderLocked(ps_va, true);
   // Without a declaration set, the shader fetches as D3DVertexShader_Bind
   // bound it, or else as its own vfetches describe (bundle meshes).
   const VertexDeclarationRecord *declaration = nullptr;
@@ -11985,6 +11994,8 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     declaration = g_last_declaration_va == declaration_va ? g_last_declaration : nullptr;
     if (!declaration && declaration_va == Video::GuestDevice() + kDeviceDeclarationOffset)
       declaration = DeviceDeclarationLocked(device);  // katamari-nx
+    if (!declaration)
+      declaration = AdoptGuestDeclarationLocked(declaration_va);  // fable2-nx (2026-11-10): one no hook saw
   } else if (vs && vs->bound_declaration) {
     declaration = vs->bound_declaration.get();
     shader_strides = vs->bound_strides;
@@ -15044,8 +15055,8 @@ void ClearStateLocked(const u8 *device_state, u32 flags, const ClearRect *rect,
 
   // D3D clamps clears to the viewport (CDevice viewport floats at 0x3170).
   ClearRect r = rect ? *rect : ClearRect{0, 0, int32_t(targets.width), int32_t(targets.height)};
-  const float vx = device.F32(0x3160), vy = device.F32(0x3164);  // katamari-nx: 0x3170->0x3160, 0x3174->0x3164
-  const float vw = device.F32(0x3168), vh = device.F32(0x316C);  // katamari-nx: 0x3178->0x3168, 0x317C->0x316C
+  const float vx = device.F32(0x3168), vy = device.F32(0x316C);  // fable2-nx (N&B TU3->Fable 2): 0x3170->0x3168, 0x3174->0x316C
+  const float vw = device.F32(0x3170), vh = device.F32(0x3174);  // fable2-nx (N&B TU3->Fable 2): 0x3178->0x3170, 0x317C->0x3174
   if (vw > 0.0f && vh > 0.0f) {
     int32_t vx2 = int32_t(vx + vw), vy2 = int32_t(vy + vh);
     // A target grown for tiling: D3D bounds the viewport by the tile-sized

@@ -5,6 +5,7 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,17 @@ constexpr u32 kCommonD3DCreated = 0x100000;
 struct VertexDeclarationRecord {
   d3d::Shader x360;  // D3DVertexDeclaration header
 
+  // fable2-nx (2026-11-07, second console run): the rest of the original D3DVertexDeclaration as the guest sees it
+  // (D3D's CreateVertexDeclaration = ProcessAndProcessAndProcess2275_82B92EC0): Fable's declaration builder
+  // (ProcessAndProcessAndProcess1797_82B86DF8) extends a declaration by reading its element count at +24 and its
+  // elements at +52 (12 bytes each, no D3DDECL_END). Without these it copied Renut's host fields (a count of
+  // 0x02000000) and wrote far past its table. Written once, by D3DDevice_CreateVertexDeclaration_hook.
+  be_u32 guest_count;          // +24: elements, without D3DDECL_END
+  be_u32 guest_max_stream;     // +28: the highest stream an element reads
+  u8 guest_streams[16];        // +32: 0xFF for each stream an element reads
+  be_u32 guest_48;             // +48: 0
+  GuestVertexElement guest_elements[64];  // +52
+
   RecordKind kind = RecordKind::VertexDeclaration;
   u32 self_va = 0;
 
@@ -38,6 +50,9 @@ struct VertexDeclarationRecord {
   std::vector<GuestVertexElement> elements;  // without D3DDECL_END
   HostVertexLayout layout;
 };
+
+static_assert(offsetof(VertexDeclarationRecord, guest_count) == 24 &&
+              offsetof(VertexDeclarationRecord, guest_elements) == 52);  // fable2-nx: the original's layout
 
 struct ShaderRecord {
   d3d::Shader x360;  // D3DVertexShader / D3DPixelShader header
@@ -115,6 +130,10 @@ struct ShaderRecord {
 // side of a guest object set up in place (XGRegisterVertexShader/PixelShader).
 // nullptr if it is neither. Requires State().mutex.
 ShaderRecord *FindShaderLocked(u32 shader_va, RecordKind kind);
+// fable2-nx (2026-11-10): a guest shader / vertex declaration object no hook saw, taken from its bytes at a draw;
+// nullptr if the bytes are not one (d3d/hooks/shader.cpp). Require State().mutex.
+ShaderRecord *AdoptGuestShaderLocked(u32 shader_va, bool pixel);
+const VertexDeclarationRecord *AdoptGuestDeclarationLocked(u32 declaration_va);
 // banjo-nx (2026-10-23): prefetches what FindShaderLocked will read for this shader (no other effect).
 void PrefetchShaderLocked(u32 shader_va, RecordKind kind);
 // banjo-nx (2026-10-27): the record's first lines when the memo holds the shader already (prefetches only).

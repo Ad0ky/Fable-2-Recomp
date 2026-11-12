@@ -839,7 +839,8 @@ uint64_t ChangedChunks(const u8 *device, u8 *shadow) {
 // compare, stored whether or not they differ: no branch on the compare; storing equal bytes changes nothing).
 // Title update 3 (banjo-nx 2026-10-29): the snapshot is 12,720 bytes (d3d.h), its last chunk 48 bytes (40 on the base).
 // katamari-nx (2026-10-30): XDK 2.0.5632's snapshot is 12,704 bytes (0x31A0): its last chunk is 32 bytes.
-static_assert(kLastChunkBytes == 32, "TakeLastChunk's loads");
+// fable2-nx (2026-11-12): Fable 2 (XDK 2.0.7645, N&B's base-game layout): 12,712 bytes (0x31A8), its last chunk 40.
+static_assert(kLastChunkBytes == 40, "TakeLastChunk's loads");
 inline uint64_t TakeChunk(const u8 *device, u8 *shadow) {
 #if defined(__aarch64__)
   const uint8x16_t a0 = vld1q_u8(device), a1 = vld1q_u8(device + 16);
@@ -860,10 +861,13 @@ inline uint64_t TakeChunk(const u8 *device, u8 *shadow) {
 inline uint64_t TakeLastChunk(const u8 *device, u8 *shadow) {
 #if defined(__aarch64__)
   const uint8x16_t a0 = vld1q_u8(device), a1 = vld1q_u8(device + 16);
+  const uint8x8_t a2 = vld1_u8(device + 32);
   const uint8x16_t d0 = veorq_u8(a0, vld1q_u8(shadow)), d1 = veorq_u8(a1, vld1q_u8(shadow + 16));
+  const uint8x8_t d2 = veor_u8(a2, vld1_u8(shadow + 32));
   vst1q_u8(shadow, a0);
   vst1q_u8(shadow + 16, a1);
-  return vmaxvq_u8(vorrq_u8(d0, d1)) != 0;
+  vst1_u8(shadow + 32, a2);
+  return (vmaxvq_u8(vorrq_u8(d0, d1)) | vmaxv_u8(d2)) != 0;
 #else
   const bool differs = std::memcmp(device, shadow, kLastChunkBytes) != 0;
   std::memcpy(shadow, device, kLastChunkBytes);
@@ -3753,7 +3757,7 @@ bool TilesOnce(u32 device_va, const u8 *device, u32 command_buffer_va, const std
   if (banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed) == 86)
     return false;
   // Tiling (BeginTiling sets Flags 0x20 until EndTiling) with two tiles or more.
-  const u32 tiles = *reinterpret_cast<const be_u32 *>(device + 0x30B8);  // native::off::TileCount
+  const u32 tiles = *reinterpret_cast<const be_u32 *>(device + native::off::TileCount);  // fable2-nx: was 0x30B8, another port's layout
   if (!(device[0x2A38] & 0x20) || tiles < 2 || tiles > 16)  // native::off::Flags
     return false;
   const u32 predication = Predication(run->running.data());

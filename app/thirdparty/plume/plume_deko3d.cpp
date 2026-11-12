@@ -1084,7 +1084,9 @@ namespace plume {
         qm.flushThreshold = qm.commandMemorySize / 8;
         // Scratch (local) memory per warp: Renut's biggest vertex shaders need 32 KB (uam's DKSH headers; 81 of the 4,881
         // need some), variants maybe more: 64 KB a warp (about 8 MB for the GPU's warps).
-        qm.perWarpScratchMemorySize = 64u << 10;
+        // fable2-nx (2026-11-11): 128 KB; Fable 2's biggest mesh vertex shader (vs_C6F41EDC5FB1189C) needed 96,256
+        // bytes and was not loaded ("needs 96256 bytes of scratch a warp, the queue has 65536").
+        qm.perWarpScratchMemorySize = 128u << 10;
         perWarpScratch = qm.perWarpScratchMemorySize;
         queue = dkQueueCreate(&qm);
         if (!queue) {

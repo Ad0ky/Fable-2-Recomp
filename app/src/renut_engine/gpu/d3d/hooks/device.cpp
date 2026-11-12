@@ -13,6 +13,10 @@
  * render thread has read the batch's data; D3D's fence waits wait for that
  * (BlockOnFence_hook), and Swap waits when the game gets a frame too far ahead.
  */
+#include <cstdio>  // fable2-nx
+#include <unordered_map>  // fable2-nx
+#include <rex/logging.h>  // fable2-nx
+#include <rex/system/xthread.h>  // fable2-nx: GuestGetCurrentThreadId
 #include <rex/frame_latency.h>  // banjo-nx (2026-10-19)
 #include "renut_engine/display_sync.h"
 #include "renut_engine/gpu/render/pipeline.h"  // banjo-nx (2026-10-20): SyncPipelineListLocked
@@ -75,9 +79,9 @@ REXCVAR_DEFINE_BOOL(banjo_renut_core_layout, false, "Banjo/Enhancements",
 using namespace renut::gpu;
 
 // Kernel exports the device code uses.
-// katamari-nx: Beautiful Katamari's GetCurrentThreadId is sub_824C1C10 (`lwz r11,256(r13); lwz r3,332(r11); blr`,
-// N&B's rex_GetCurrentThreadId 0x8220F1E0 byte for byte).
-REX_IMPORT(__imp__sub_824C1C10, GuestGetCurrentThreadId, u32());
+// fable2-nx: Fable 2 inlines GetCurrentThreadId (KTHREAD+0x14C, which the runtime sets to the XThread's id), so the id
+// is taken from the runtime (Katamari's was sub_824C1C10).
+static u32 GuestGetCurrentThreadId() { return rex::system::XThread::GetCurrentThreadId(); }
 REX_IMPORT(__imp__RtlInitializeCriticalSection, RtlInitializeCriticalSection, void(u32));
 REX_IMPORT(__imp__KeQueryPerformanceFrequency, KeQueryPerformanceFrequency, u32());
 REX_IMPORT(__imp__KeGetCurrentProcessType, KeGetCurrentProcessType, u32());
@@ -111,24 +115,24 @@ constexpr u8 kDeviceFlagImmediateFences = 0x02;
 // Pointer to the completed-fence word IsFencePending / BlockOnFence read.
 constexpr u32 kDeviceOffsetFenceCompletion = 10896;
 // Nonzero while a KickOff is in progress (BlockOnFence does not kick then).
-constexpr u32 kDeviceOffsetInKickOff = 13216;  // katamari-nx: 13232->13216
+constexpr u32 kDeviceOffsetInKickOff = 13232;  // fable2-nx (N&B TU3->Fable 2): 13232->13232
 // Side buffer (0x12C0 bytes) every device gets.
-constexpr u32 kDeviceOffsetSideBuffer = 16704;  // katamari-nx: 16728->16704
+constexpr u32 kDeviceOffsetSideBuffer = 16728;  // fable2-nx (N&B TU3->Fable 2): 16728->16728
 constexpr u32 kSideBufferSize = 0x12C0;
 // Set to -1 by the device-type-2 path.
-constexpr u32 kDeviceOffsetsMinusOne[] = {21532, 21536, 14912};  // katamari-nx: 21560->21532, 21564->21536, 14936->14912
+constexpr u32 kDeviceOffsetsMinusOne[] = {21560, 21564, 14936};  // fable2-nx (N&B TU3->Fable 2): 21560->21560, 21564->21564, 14936->14936
 constexpr u32 kDeviceTypeNoHardware = 2;
 // Copied from the global qword at 0x82DA3478 into every device.
 constexpr u32 kDeviceOffsetGlobalQword = 10880;
-constexpr u32 kGlobalQwordVa = 0x82AD93F8;  // katamari-nx: 0x82DA3478->0x82AD93F8
+constexpr u32 kGlobalQwordVa = 0x83321A70;  // fable2-nx (N&B TU3->Fable 2): 0x82DA3478->0x83321A70
 // Hardware-path fields: two critical sections, QueryPerformanceFrequency and
 // its reciprocal as floats, and 41 words set to -1.
-constexpr u32 kDeviceOffsetCriticalSection0 = 14920;  // katamari-nx: 14944->14920
-constexpr u32 kDeviceOffsetCriticalSection1 = 14948;  // katamari-nx: 14972->14948
-constexpr u32 kDeviceOffsetPerfFrequency = 21560;  // katamari-nx: 21588->21560
-constexpr u32 kDeviceOffsetTitleMinusOne = 21672;  // katamari-nx: 23380->21672
+constexpr u32 kDeviceOffsetCriticalSection0 = 14944;  // fable2-nx (N&B TU3->Fable 2): 14944->14944
+constexpr u32 kDeviceOffsetCriticalSection1 = 14972;  // fable2-nx (N&B TU3->Fable 2): 14972->14972
+constexpr u32 kDeviceOffsetPerfFrequency = 21588;  // fable2-nx (N&B TU3->Fable 2): 21588->21588
+constexpr u32 kDeviceOffsetTitleMinusOne = 23380;  // fable2-nx (N&B TU3->Fable 2): 23380->23380
 // Import slot holding the address of the kernel's VdGlobalDevice variable.
-constexpr u32 kVdGlobalDeviceImportSlot = 0x82000750;  // katamari-nx: 0x820007F8->0x82000750
+constexpr u32 kVdGlobalDeviceImportSlot = 0x820009AC;  // fable2-nx (N&B TU3->Fable 2): 0x820007F8->0x820009AC
 
 constexpr u32 kE_OUTOFMEMORY = 0x8007000Eu;
 
@@ -182,7 +186,7 @@ bool FencePending(const u8 *bytes, u32 fence) {
 // D3D::XenonGpu_Initialize: the register image's power-on values, everything
 // dirty. (Its register writes go into the ring.)
 void XenonGpuInitialize(native::Device d) {
-  d.SetQ(0x2E28, 0x00000000FFFFFFFFull);  // katamari-nx: 0x2E38->0x2E28
+  d.SetQ(0x2E30, 0x00000000FFFFFFFFull);  // fable2-nx (N&B TU3->Fable 2): 0x2E38->0x2E30
   for (u32 i = 0; i < 26; ++i)  // texture fetch constants: type 0
     d.SetW(native::off::TextureFetch + i * 24, d.W(native::off::TextureFetch + i * 24) & ~3u);
   for (u32 i = 0; i < 18; ++i) {  // vertex fetch constants: type 1
@@ -211,32 +215,32 @@ void XenonGpuInitialize(native::Device d) {
 
 // D3D::InitializeApiState (0x82641BC8).
 void InitializeApiState(native::Device d) {
-  const u32 present_interval = d.W(0x3504);  // katamari-nx: 0x351C->0x3504
-  const u32 behavior_flags2 = d.W(0x56F8);  // katamari-nx: 0x5DAC->0x56F8
+  const u32 present_interval = d.W(0x351C);  // fable2-nx (N&B TU3->Fable 2): 0x351C->0x351C
+  const u32 behavior_flags2 = d.W(0x5DAC);  // fable2-nx (N&B TU3->Fable 2): 0x5DAC->0x5DAC
   native::InitializeStateTables(d);
-  d.SetW(0x2F98, 5);  // katamari-nx: 0x2FA8->0x2F98
-  d.SetW(0x2F9C, 1);  // katamari-nx: 0x2FAC->0x2F9C
+  d.SetW(0x2FA0, 5);  // fable2-nx (N&B TU3->Fable 2): 0x2FA8->0x2FA0
+  d.SetW(0x2FA4, 1);  // fable2-nx (N&B TU3->Fable 2): 0x2FAC->0x2FA4
   native::SetScreenExtentQueryMode(d, 2);  // D3DSEQM_PRECLIP
-  d.SetW(0x3088, 2);  // katamari-nx: 0x3098->0x3088
-  d.SetW(0x2FD0, 0x2A23B9);  // katamari-nx: 0x2FE0->0x2FD0
-  d.SetH(0x2FCC, 0);  // katamari-nx: 0x2FDC->0x2FCC
-  d.SetH(0x2FCE, 0);  // katamari-nx: 0x2FDE->0x2FCE
-  d.SetB(0x2FD4, 0);  // katamari-nx: 0x2FE4->0x2FD4
-  d.SetB(0x2FD5, 0);  // katamari-nx: 0x2FE5->0x2FD5
-  d.SetB(0x2FD6, 0);  // katamari-nx: 0x2FE6->0x2FD6
-  d.SetW(0x2FDC, ~0u);  // katamari-nx: 0x2FEC->0x2FDC
+  d.SetW(0x3090, 2);  // fable2-nx (N&B TU3->Fable 2): 0x3098->0x3090
+  d.SetW(0x2FD8, 0x2A23B9);  // fable2-nx (N&B TU3->Fable 2): 0x2FE0->0x2FD8
+  d.SetH(0x2FD4, 0);  // fable2-nx (N&B TU3->Fable 2): 0x2FDC->0x2FD4
+  d.SetH(0x2FD6, 0);  // fable2-nx (N&B TU3->Fable 2): 0x2FDE->0x2FD6
+  d.SetB(0x2FDC, 0);  // fable2-nx (N&B TU3->Fable 2): 0x2FE4->0x2FDC
+  d.SetB(0x2FDD, 0);  // fable2-nx (N&B TU3->Fable 2): 0x2FE5->0x2FDD
+  d.SetB(0x2FDE, 0);  // fable2-nx (N&B TU3->Fable 2): 0x2FE6->0x2FDE
+  d.SetW(0x2FE4, ~0u);  // fable2-nx (N&B TU3->Fable 2): 0x2FEC->0x2FE4
   // Three zero bytes; N&B leaves the fourth from its stack.
-  d.SetW(0x2FE0, 0);  // katamari-nx: 0x2FF0->0x2FE0
-  d.SetW(0x2FD8, 0x00FF0000);  // katamari-nx: 0x2FE8->0x2FD8
-  d.SetW(0x2FB0, 1);  // katamari-nx: 0x2FC0->0x2FB0
-  d.SetW(0x2FB4, 0);  // katamari-nx: 0x2FC4->0x2FB4
-  d.SetW(0x2FC8, 0);  // katamari-nx: 0x2FD8->0x2FC8
+  d.SetW(0x2FE8, 0);  // fable2-nx (N&B TU3->Fable 2): 0x2FF0->0x2FE8
+  d.SetW(0x2FE0, 0x00FF0000);  // fable2-nx (N&B TU3->Fable 2): 0x2FE8->0x2FE0
+  d.SetW(0x2FB8, 1);  // fable2-nx (N&B TU3->Fable 2): 0x2FC0->0x2FB8
+  d.SetW(0x2FBC, 0);  // fable2-nx (N&B TU3->Fable 2): 0x2FC4->0x2FBC
+  d.SetW(0x2FD0, 0);  // fable2-nx (N&B TU3->Fable 2): 0x2FD8->0x2FD0
   // The default vertex declaration is the device's own, at +0x2FA8.
-  d.SetW(d3d::kDeviceOffsetVertexDeclaration, d.va + 0x2F98);  // katamari-nx: 0x2FA8->0x2F98
+  d.SetW(d3d::kDeviceOffsetVertexDeclaration, d.va + 0x2FA0);  // fable2-nx (N&B TU3->Fable 2): 0x2FA8->0x2FA0
   d.Dirty(2, 0x80000);
-  d.SetW(0x3504, present_interval);  // katamari-nx: 0x351C->0x3504
-  const u32 flags2 = d.W(0x56F8);  // katamari-nx: 0x5DAC->0x56F8
-  d.SetW(0x56F8, (behavior_flags2 & 1) ? (flags2 | 1) : (flags2 & ~1u));  // katamari-nx: 0x5DAC->0x56F8
+  d.SetW(0x351C, present_interval);  // fable2-nx (N&B TU3->Fable 2): 0x351C->0x351C
+  const u32 flags2 = d.W(0x5DAC);  // fable2-nx (N&B TU3->Fable 2): 0x5DAC->0x5DAC
+  d.SetW(0x5DAC, (behavior_flags2 & 1) ? (flags2 | 1) : (flags2 & ~1u));  // fable2-nx (N&B TU3->Fable 2): 0x5DAC->0x5DAC
   d.SetW(native::off::PredicationSet, 0);
   native::UpdateTilePredicated(d);
   d.SetW(native::off::Predication, ~0u);
@@ -256,7 +260,7 @@ void SetScalerParameters(native::Device d, const be_u32 *scaler) {
     copy[i] = scaler[i];
   copy[6] = copy[10] = scaler[6] ? 3 : 0;
   for (u32 i = 0; i < 14; ++i)
-    d.SetW(0x3584 + i * 4, copy[i]);  // katamari-nx: 0x359C->0x3584
+    d.SetW(0x359C + i * 4, copy[i]);  // fable2-nx (N&B TU3->Fable 2): 0x359C->0x359C
   d.SetB(native::off::Flags2, d.B(native::off::Flags2) | 0x10);
 }
 
@@ -289,10 +293,10 @@ bool InitializePresentationParameters(native::Device d, u32 parameters_va) {
 
   rex::system::X_VIDEO_MODE mode{};
   rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
-  d.SetW(0x540C, u32(mode.display_width));  // katamari-nx: 0x5428->0x540C
-  d.SetW(0x5414, u32(mode.display_width));  // katamari-nx: 0x5430->0x5414
-  d.SetW(0x5418, u32(i64(float(mode.refresh_rate) + 0.5f)));  // katamari-nx: 0x5434->0x5418
-  d.SetW(0x5410, u32(mode.display_height));  // katamari-nx: 0x542C->0x5410
+  d.SetW(0x5428, u32(mode.display_width));  // fable2-nx (N&B TU3->Fable 2): 0x5428->0x5428
+  d.SetW(0x5430, u32(mode.display_width));  // fable2-nx (N&B TU3->Fable 2): 0x5430->0x5430
+  d.SetW(0x5434, u32(i64(float(mode.refresh_rate) + 0.5f)));  // fable2-nx (N&B TU3->Fable 2): 0x5434->0x5434
+  d.SetW(0x542C, u32(mode.display_height));  // fable2-nx (N&B TU3->Fable 2): 0x542C->0x542C
 
   if (!p[15])  // DisableAutoFrontBuffer
     RGPU_ERROR("InitializePresentationParameters: an automatic front buffer is not supported");
@@ -311,9 +315,9 @@ bool InitializePresentationParameters(native::Device d, u32 parameters_va) {
     native::SetDepthStencilSurface(d, surface);
   }
   for (u32 i = 0; i < 0x7C / 4; ++i)
-    d.SetW(0x34D0 + i * 4, p[i]);  // katamari-nx: 0x34E8->0x34D0
+    d.SetW(0x34E8 + i * 4, p[i]);  // fable2-nx (N&B TU3->Fable 2): 0x34E8->0x34E8
   if ((front_format & 0x3FFC0000u) != 0x24900000u)
-    d.SetW(0x3510, (front_format & 0x3F) | 0x28280100u);  // katamari-nx: 0x3528->0x3510
+    d.SetW(0x3528, (front_format & 0x3F) | 0x28280100u);  // fable2-nx (N&B TU3->Fable 2): 0x3528->0x3528
   SetScalerParameters(d, p + 0x60 / 4);
   // The default gamma: linear, as a piecewise-linear ramp for the front
   // buffer formats 7 and 0x36 (0x32 counts as 6).
@@ -340,7 +344,7 @@ bool InitializePresentationParameters(native::Device d, u32 parameters_va) {
     }
     SetGammaRamp(d, ramp);
   }
-  d.SetW(0x412C, ~0u);  // katamari-nx: 0x4144->0x412C
+  d.SetW(0x4144, ~0u);  // fable2-nx (N&B TU3->Fable 2): 0x4144->0x4144
   return true;
 }
 
@@ -350,7 +354,7 @@ bool InitializePresentationParameters(native::Device d, u32 parameters_va) {
 bool InitializeTitleDevice(native::Device d, u32 present_parameters) {
   RtlInitializeCriticalSection(d.va + kDeviceOffsetCriticalSection0);
   RtlInitializeCriticalSection(d.va + kDeviceOffsetCriticalSection1);
-  d.SetW(16688, 0);  // katamari-nx: 16712->16688
+  d.SetW(16712, 0);  // fable2-nx (N&B TU3->Fable 2): 16712->16712
 
   // D3D reads the device through the kernel's VdGlobalDevice from any thread
   // (resource locks, blockers).
@@ -436,8 +440,8 @@ u32 Direct3D_CreateDevice_hook(u32 /*adapter*/, u32 device_type, u32 /*unused*/,
     if (!(behavior_flags & 0x100) && !(behavior_flags & 0x3F000000))
       behavior_flags |= 0xC000000;
     WriteU32(bytes, d3d::kDeviceOffsetBehaviorFlags, behavior_flags);
-    WriteU32(bytes, 21532, 0xFFFFFFFFu);  // katamari-nx: 21560->21532
-    WriteU32(bytes, 21536, 0xFFFFFFFFu);  // katamari-nx: 21564->21536
+    WriteU32(bytes, 21560, 0xFFFFFFFFu);  // fable2-nx (N&B TU3->Fable 2): 21560->21560
+    WriteU32(bytes, 21564, 0xFFFFFFFFu);  // fable2-nx (N&B TU3->Fable 2): 21564->21564
   } else {
     for (u32 offset : kDeviceOffsetsMinusOne)
       WriteU32(bytes, offset, 0xFFFFFFFFu);
@@ -682,14 +686,14 @@ void ConfigureForOnePassZPass(native::Device d, bool flag, u32 tile_count, u32 w
   for (u32 i = 0; i < tile_count; ++i) {
     const u32 x = d.W(native::off::TileOrigins + i * 8);
     const u32 y = d.W(native::off::TileOrigins + i * 8 + 4);
-    d.SetW(0x3330 + i * 4, (y / tile_height) * tiles_per_row + x / tile_width);  // katamari-nx: 0x3340->0x3330
+    d.SetW(0x3338 + i * 4, (y / tile_height) * tiles_per_row + x / tile_width);  // fable2-nx (N&B TU3->Fable 2): 0x3340->0x3338
   }
-  d.SetW(0x336C, pitch);  // katamari-nx: 0x337C->0x336C
+  d.SetW(0x3374, pitch);  // fable2-nx (N&B TU3->Fable 2): 0x337C->0x3374
   d.SetW(native::off::SurfaceInfo, native::Insert(d.W(native::off::SurfaceInfo), pitch, 18, 14));
   d.Dirty(2, 0x100);
-  d.SetW(0x3370, ((unit + width - 1) / unit) * unit);  // katamari-nx: 0x3380->0x3370
+  d.SetW(0x3378, ((unit + width - 1) / unit) * unit);  // fable2-nx (N&B TU3->Fable 2): 0x3380->0x3378
   u64 predicated = d.Q(native::off::PredicatedPending2);
-  if ((d.B(native::off::Flags3) & 0x20) || (d.W(0x2E44) & 0xE0000) != 0x40000)  // katamari-nx: 0x2E54->0x2E44
+  if ((d.B(native::off::Flags3) & 0x20) || (d.W(0x2E4C) & 0xE0000) != 0x40000)  // fable2-nx (N&B TU3->Fable 2): 0x2E54->0x2E4C
     predicated |= 0x100;
   else
     predicated &= ~u64(0x100);
@@ -720,11 +724,11 @@ u32 D3DDevice_BeginCommandBuffer_hook(u32 device_va, u32 command_buffer, u32 fla
   bw(kBufferFlags) = u32(bw(kBufferFlags)) & ~0x70u;
   for (u32 offset : {0x7Cu, 0x80u, 0x84u, 0x70u, 0x90u, 0x74u, 0x78u})
     bw(offset) = 0u;
-  d.SetW(0x3A38, 8);  // katamari-nx: 0x3A50->0x3A38
+  d.SetW(0x3A50, 8);  // fable2-nx (N&B TU3->Fable 2): 0x3A50->0x3A50
   d.SetB(native::off::Flags1, d.B(native::off::Flags1) & 0xDF);
-  d.SetW(0x3A2C, 0);  // katamari-nx: 0x3A44->0x3A2C
-  d.SetW(0x3A28, bw(kBufferAllocatorSize));  // katamari-nx: 0x3A40->0x3A28
-  for (u32 offset = 0x34B8; offset <= 0x34CC; offset += 4)  // katamari-nx: 0x34D0->0x34B8, 0x34E4->0x34CC
+  d.SetW(0x3A44, 0);  // fable2-nx (N&B TU3->Fable 2): 0x3A44->0x3A44
+  d.SetW(0x3A40, bw(kBufferAllocatorSize));  // fable2-nx (N&B TU3->Fable 2): 0x3A40->0x3A40
+  for (u32 offset = 0x34D0; offset <= 0x34E4; offset += 4)  // fable2-nx (N&B TU3->Fable 2): 0x34D0->0x34D0, 0x34E4->0x34E4
     d.SetW(offset, 0);
   native::RewindRing(d);
 
@@ -782,8 +786,8 @@ u32 D3DDevice_BeginCommandBuffer_hook(u32 device_va, u32 command_buffer, u32 fla
     }
     d.SetW(native::off::TilingExtent, extent_x);
     d.SetW(native::off::TilingExtent + 4, extent_y);
-    d.SetW(0x337C, 0);  // katamari-nx: 0x338C->0x337C
-    d.SetW(0x31A8, 2);  // katamari-nx: 0x31B8->0x31A8
+    d.SetW(0x3384, 0);  // fable2-nx (N&B TU3->Fable 2): 0x338C->0x3384
+    d.SetW(0x31B0, 2);  // fable2-nx (N&B TU3->Fable 2): 0x31B8->0x31B0
     if (flags & 0x40) {
       ConfigureForOnePassZPass(d, (flags >> 7) & 1, tile_count, extent_x);
       bw(kBufferFlags) = u32(bw(kBufferFlags)) | 0x20000;
@@ -791,10 +795,10 @@ u32 D3DDevice_BeginCommandBuffer_hook(u32 device_va, u32 command_buffer, u32 fla
   }
   if (flags & 4) {
     d.SetB(native::off::Flags, d.B(native::off::Flags) | 0x40);
-    d.SetW(0x3198, native::Extract(d.W(native::off::DepthControl), 4, 3));  // katamari-nx: 0x31A8->0x3198
+    d.SetW(0x31A0, native::Extract(d.W(native::off::DepthControl), 4, 3));  // fable2-nx (N&B TU3->Fable 2): 0x31A8->0x31A0
     if (d.B(native::off::Flags3) & 0x20) {
       u64 predicated = d.Q(native::off::PredicatedPending2) | (u64(1) << 37);
-      if (d.W(0x3370) != (d.W(native::off::SurfaceInfo) & 0x3FFF))  // katamari-nx: 0x3380->0x3370
+      if (d.W(0x3378) != (d.W(native::off::SurfaceInfo) & 0x3FFF))  // fable2-nx (N&B TU3->Fable 2): 0x3380->0x3378
         predicated |= u64(1) << 57;
       d.SetQ(native::off::PredicatedPending2, predicated);
     }
@@ -924,7 +928,7 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
     banjo::renut_gpu::checks::QueueKickFlush();
     KickFence(device);
     // banjo-nx (2026-10-20, banjo_renut_game_gamma): the device's gamma ramp (StoreGamma's +0x3A9C) for the present.
-    Video::NoteGameGamma(device + 0x3A84, g_gamma_piecewise);  // katamari-nx: 0x3A9C->0x3A84; halo3-nx: the form
+    Video::NoteGameGamma(device + 0x3A9C, g_gamma_piecewise);  // fable2-nx (N&B TU3->Fable 2): 0x3A9C->0x3A9C; halo3-nx: the form
   }
 
   render_thread::QueueFrame([front_buffer, swap_ordinal] {
@@ -982,7 +986,7 @@ void D3DDevice_InsertCallback_hook(u32 device, u32 /*type*/, u32 callback, u32 c
 
 constexpr u32 kDeviceOffsetReferenceCount = 0x3C;
 constexpr u32 kDeviceOffsetOwnerThread = 0x2A88;
-constexpr u32 kDeviceCapsVa = 0x820FC1F8;  // N&B's constant D3DCAPS9 (katamari-nx: 0x82161B30->0x820FC1F8)
+constexpr u32 kDeviceCapsVa = 0x820FA890;  // N&B's constant D3DCAPS9 (fable2-nx (N&B TU3->Fable 2): 0x82161B30->0x820FA890)
 constexpr u32 kDeviceCapsSize = 0x130;
 // katamari-nx: XDK 2.0.5632 has no D3D_IsFusion and no such word (N&B's 0x82DC67D4); 0 = not a Fusion GPU.
 constexpr u32 kFusionVa = 0;      // non-zero on a Fusion GPU
@@ -1026,10 +1030,10 @@ void D3DDevice_GetDisplayMode_hook(u32 device_va, u32 /*swap_chain*/, mapped_u32
   const native::Device d = native::DeviceAt(device_va);
   if (!d || !mode)
     return;
-  mode[0] = d.W(0x34D0);  // katamari-nx: 0x34E8->0x34D0
-  mode[1] = d.W(0x34D4);  // katamari-nx: 0x34EC->0x34D4
-  mode[2] = d.W(0x5418);  // katamari-nx: 0x5434->0x5418
-  mode[3] = d.W(0x34D8);  // katamari-nx: 0x34F0->0x34D8
+  mode[0] = d.W(0x34E8);  // fable2-nx (N&B TU3->Fable 2): 0x34E8->0x34E8
+  mode[1] = d.W(0x34EC);  // fable2-nx (N&B TU3->Fable 2): 0x34EC->0x34EC
+  mode[2] = d.W(0x5434);  // fable2-nx (N&B TU3->Fable 2): 0x5434->0x5434
+  mode[3] = d.W(0x34F0);  // fable2-nx (N&B TU3->Fable 2): 0x34F0->0x34F0
 }
 
 // void D3DDevice_BlockOnFence(DWORD Fence) [0x8225D1D0]: on the device D3D
@@ -1133,22 +1137,22 @@ std::array<u16, 1024> GammaTable(bool inverse) {
 
 // The device's gamma (+0x3A9C, red, green, blue: 256 words each) for the
 // display to pick up; the renderer presents without it.
-constexpr u32 kDeviceOffsetGammaRamp = 0x3A84;  // katamari-nx: 0x3A9C->0x3A84
+constexpr u32 kDeviceOffsetGammaRamp = 0x3A9C;  // fable2-nx (N&B TU3->Fable 2): 0x3A9C->0x3A9C
 
 void StoreGamma(native::Device d, const be_u16 (&corrected)[768]) {
   if (std::memcmp(corrected, d.bytes + kDeviceOffsetGammaRamp, sizeof(corrected)) == 0)
     return;
   if (KeGetCurrentProcessType() != 2) {
     // The display's pending copy takes the previous ramp first.
-    const u32 pending = d.W(0x56E4);  // katamari-nx: 0x5D90->0x56E4
-    if (pending && !(d.W(0x56E8) & 0x80000000u)) {  // katamari-nx: 0x5D94->0x56E8
+    const u32 pending = d.W(0x5D90);  // fable2-nx (N&B TU3->Fable 2): 0x5D90->0x5D90
+    if (pending && !(d.W(0x5D94) & 0x80000000u)) {  // fable2-nx (N&B TU3->Fable 2): 0x5D94->0x5D94
       if (auto *dest = GuestPtr<u8>(pending))
         std::memcpy(dest, d.bytes + kDeviceOffsetGammaRamp, sizeof(corrected));
     }
-    d.SetW(0x56E8, d.W(0x56E8) | 0x80000000u);  // katamari-nx: 0x5D94->0x56E8, 0x5D94->0x56E8
+    d.SetW(0x5D94, d.W(0x5D94) | 0x80000000u);  // fable2-nx (N&B TU3->Fable 2): 0x5D94->0x5D94, 0x5D94->0x5D94
   }
   std::memcpy(d.bytes + kDeviceOffsetGammaRamp, corrected, sizeof(corrected));
-  d.SetW(0x412C, d.W(0x412C) | 2);  // katamari-nx: 0x4144->0x412C, 0x4144->0x412C
+  d.SetW(0x4144, d.W(0x4144) | 2);  // fable2-nx (N&B TU3->Fable 2): 0x4144->0x4144, 0x4144->0x4144
 }
 
 // D3DDevice_SetGammaRamp's work: the ramp (D3DGAMMARAMP, 3 x 256 words)
@@ -1227,9 +1231,182 @@ void D3D_CDevice_Uninitialize_hook(u32 device) {
 
 namespace renut::gpu::native {
 
+// fable2-nx (2026-11-11): what the game wrote into the ring sink itself since the last rewind: the packets of the
+// Direct3D functions reNut does not hook and of Fable's own code (GpuLoadShaders' microcode loads, constants loaded
+// from memory, fetch constants set straight into the ring...). reNut never reads the sink, so each kind of packet here
+// is state the renderer does not see. Counted by type-0 register and type-3 opcode; every 10 s one line, busiest
+// first ("[renut] ring census").
+void RingCensus(u32 ring) {
+  static std::mutex mutex;
+  static std::unordered_map<u32, std::pair<uint64_t, uint64_t>> &counts =
+      *new std::unordered_map<u32, std::pair<uint64_t, uint64_t>>();  // key: type << 16 | reg or opcode; packets, dwords
+  static auto last = std::chrono::steady_clock::now();
+  if (!ring || ring <= g_ring_sink || ring >= g_ring_sink + kRingSinkSize)
+    return;
+  std::lock_guard lock(mutex);
+  const u32 end = ring + 4;  // m_pRing is the last dword written (stwu)
+  u32 at = g_ring_sink + 4;
+  for (u32 n = 0; at < end && n < 262144; ++n) {
+    const u32 header = LoadGuestU32(at);
+    const u32 type = header >> 30;
+    u32 key = 0, body = 0;
+    switch (type) {
+      case 0:
+        key = header & 0x7FFF;
+        body = ((header >> 16) & 0x3FFF) + 1;
+        break;
+      case 1:
+        key = 1u << 16;
+        body = 2;
+        break;
+      case 2:
+        key = 2u << 16;
+        body = 0;
+        break;
+      default:
+        key = 3u << 16 | ((header >> 8) & 0x7F);
+        body = ((header >> 16) & 0x3FFF) + 1;
+        break;
+    }
+    auto &c = counts[key];
+    ++c.first;
+    c.second += body;
+    at += 4 + body * 4;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(10))
+    return;
+  last = now;
+  std::vector<std::pair<u32, std::pair<uint64_t, uint64_t>>> rows(counts.begin(), counts.end());
+  std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second.first > b.second.first; });
+  std::string text;
+  for (size_t i = 0; i < rows.size() && i < 40; ++i) {
+    const u32 key = rows[i].first;
+    char buffer[64];
+    if ((key >> 16) == 3)
+      std::snprintf(buffer, sizeof(buffer), "%sop%02X x%llu (%llu dw)", text.empty() ? "" : ", ", key & 0x7F,
+                    (unsigned long long)rows[i].second.first, (unsigned long long)rows[i].second.second);
+    else if ((key >> 16) == 0)
+      std::snprintf(buffer, sizeof(buffer), "%sreg%04X x%llu (%llu dw)", text.empty() ? "" : ", ", key,
+                    (unsigned long long)rows[i].second.first, (unsigned long long)rows[i].second.second);
+    else
+      std::snprintf(buffer, sizeof(buffer), "%stype%u x%llu", text.empty() ? "" : ", ", key >> 16,
+                    (unsigned long long)rows[i].second.first);
+    text += buffer;
+  }
+  counts.clear();
+  REXLOG_INFO("[renut] ring census (10 s, packets the game wrote past reNut): {}", text.empty() ? "none" : text);
+}
+
+// fable2-nx (2026-11-12, gameplay geometry in shards; the ring census): Fable writes shader constants and fetch
+// constants straight into the ring as type-0 register writes (D3D's GPU-owned constants: VS c8.., c44.., PS c8..,
+// c28..; fetch constants 0x4800..), so the device's constant image, which reNut draws from, never had them. The
+// device's _D3DConstants (m_Constants, +0x480) is laid out as those registers are: 0x4800 fetch constants (+0x000),
+// 0x4000 vertex then pixel float constants (+0x300), 0x4900 bools and loops (+0x2300). Before each draw (Capture in
+// backend/queued.cpp) and at each rewind, the ring's new type-0 writes in 0x4000..0x4927 are copied into the image,
+// float constant groups marked dirty (m_Pending[0] vertex, [1] pixel, most significant bit first) as an inline
+// Set*ShaderConstantF would, every word touched for the snapshot. Other registers (render state written to the ring)
+// are left out: counted only (the ring census).
+u32 g_ring_scanned = 0;  // the last ring dword applied (the sink's start: none)
+std::mutex g_ring_apply_mutex;
+
+void ApplyRingRegistersLocked(Device device, u32 ring) {
+  if (!g_ring_sink || ring < g_ring_sink || ring >= g_ring_sink + kRingSinkSize)
+    return;
+  if (g_ring_scanned < g_ring_sink || g_ring_scanned > ring)
+    g_ring_scanned = g_ring_sink;
+  u32 at = g_ring_scanned + 4;
+  const u32 end = ring + 4;
+  u64 vs_groups = 0, ps_groups = 0;
+  static uint64_t applied = 0, logged_at = 0;
+  for (u32 n = 0; at < end && n < 262144; ++n) {
+    const u32 header = LoadGuestU32(at);
+    const u32 type = header >> 30;
+    u32 body = 0;
+    if (type == 0) {
+      const u32 reg = header & 0x7FFF;
+      body = ((header >> 16) & 0x3FFF) + 1;
+      if (header & 0x8000) {  // one register written body times
+        if (reg >= 0x4000 && reg < 0x4928 && at + body * 4 < end) {
+          const u32 value = LoadGuestU32(at + body * 4);
+          const u32 offset = reg >= 0x4800 ? 0x480 + (reg - 0x4800) * 4 : 0x480 + 0x300 + (reg - 0x4000) * 4;
+          device.SetW(offset, value);
+        }
+      } else {
+        for (u32 k = 0; k < body && at + 4 + k * 4 < end; ++k) {
+          const u32 r = reg + k;
+          if (r < 0x4000 || r >= 0x4928)
+            continue;
+          const u32 value = LoadGuestU32(at + 4 + k * 4);
+          if (r >= 0x4800) {
+            device.SetW(0x480 + (r - 0x4800) * 4, value);  // fetch constants, then bools and loops (0x4900)
+          } else {
+            device.SetW(0x480 + 0x300 + (r - 0x4000) * 4, value);
+            const u32 constant = (r - 0x4000) / 4;
+            if (constant < 256)
+              vs_groups |= u64(1) << (63 - constant / 4);
+            else
+              ps_groups |= u64(1) << (63 - (constant - 256) / 4);
+          }
+          ++applied;
+        }
+      }
+    } else if (type == 1) {
+      body = 2;
+    } else if (type == 3) {
+      body = ((header >> 16) & 0x3FFF) + 1;
+      // LOAD_ALU_CONSTANT (0x2F): the constants from memory, read now (the GPU reads them when it gets there, so
+      // the game may fill the memory after the call that wrote the packet). Words: the data's physical address, the
+      // first register's dword offset in ALU constant memory (vertex 0..1023, pixel 1024..2047), the dword count.
+      if (((header >> 8) & 0x7F) == 0x2F && body >= 3 && at + 12 < end) {
+        const u32 address = LoadGuestU32(at + 4) & ~3u;
+        const u32 first = LoadGuestU32(at + 8) & 0xFFFF;
+        const u32 dwords = LoadGuestU32(at + 12) & 0xFFFF;
+        const u8 *from = address < 0x20000000u ? GuestPhysicalPtr<const u8>(address) : GuestPtr<const u8>(address);
+        if (from && dwords && first + dwords <= 2048) {
+          for (u32 k = 0; k < dwords; ++k)
+            device.SetW(0x480 + 0x300 + (first + k) * 4,
+                        u32(*reinterpret_cast<const be_u32 *>(from + k * 4)));
+          for (u32 c = first / 4; c <= (first + dwords - 1) / 4; ++c) {
+            if (c < 256)
+              vs_groups |= u64(1) << (63 - c / 4);
+            else
+              ps_groups |= u64(1) << (63 - (c - 256) / 4);
+          }
+          applied += dwords;
+        }
+      }
+    }
+    at += 4 + body * 4;
+  }
+  g_ring_scanned = ring;
+  if (vs_groups)
+    device.SetPending(0, device.Pending(0) | vs_groups);
+  if (ps_groups)
+    device.SetPending(1, device.Pending(1) | ps_groups);
+  if (applied >= logged_at + 100000 || (applied && !logged_at)) {
+    logged_at = applied;
+    REXLOG_INFO("[renut] ring constants: {} register words copied into the device's constant image so far", applied);
+  }
+}
+
+void ApplyRingRegisters(u32 device_va) {
+  Device device = DeviceAt(device_va);
+  if (!device)
+    return;
+  std::lock_guard lock(g_ring_apply_mutex);
+  ApplyRingRegistersLocked(device, device.W(off::Ring));
+}
+
 void RewindRing(Device device) {
   if (!device || !g_ring_sink)
     return;
+  RingCensus(device.W(off::Ring));  // fable2-nx (2026-11-11)
+  {
+    std::lock_guard lock(g_ring_apply_mutex);  // fable2-nx (2026-11-12): the rest, then from the start again
+    ApplyRingRegistersLocked(device, device.W(off::Ring));
+    g_ring_scanned = g_ring_sink;
+  }
   device.SetW(off::Ring, g_ring_sink);
   device.SetW(off::RingLimit, g_ring_sink + kRingSinkSize);
   device.SetW(off::RingGuarantee, g_ring_sink + kRingSinkSize - kRingSinkGuaranteeMargin);
@@ -1263,10 +1440,10 @@ void SetFence(u32 device_va) {
   if (bytes[kDeviceOffsetFlags2] & kDeviceFlagImmediateFences) {
     Device d = DeviceAt(device_va);
     const u32 fence = d.W(off::FenceTag);
-    if (!d.W(0x5404)) {  // katamari-nx: 0x541C->0x5404
+    if (!d.W(0x541C)) {  // fable2-nx (N&B TU3->Fable 2): 0x541C->0x541C
       if (auto *completion = GuestPtr<be_u32>(d.W(off::FenceCompletion))) {
         completion[0] = fence;
-        completion[1] = (d.W(0x3A30) & 3) | d.W(off::Ring);  // katamari-nx: 0x3A48->0x3A30
+        completion[1] = (d.W(0x3A48) & 3) | d.W(off::Ring);  // fable2-nx (N&B TU3->Fable 2): 0x3A48->0x3A48
       }
     }
     d.SetW(off::FenceTag, fence + 2);
@@ -1278,35 +1455,139 @@ void SetFence(u32 device_va) {
 
 } // namespace renut::gpu::native
 
-BANJO_RENUT_HOOK(sub_824E0590, D3DDevice_InsertCallback_hook);  // D3DDevice_InsertCallback  // katamari-nx: N&B sub_821CAF18, signature 0.88 (next 0.59)
-BANJO_RENUT_HOOK(sub_824D01C8, D3DDevice_AddRef_hook);  // D3DDevice_AddRef  // katamari-nx: N&B sub_82634AD0, signature 1.00 (next 0.43)
-BANJO_RENUT_HOOK(sub_824D0430, D3DDevice_AcquireThreadOwnership_hook);  // D3DDevice_AcquireThreadOwnership  // katamari-nx: N&B sub_82634B40, signature 1.00 (next 0.78)
-BANJO_RENUT_HOOK(sub_824D0470, D3DDevice_ReleaseThreadOwnership_hook);  // D3DDevice_ReleaseThreadOwnership  // katamari-nx: N&B sub_82634B80, signature 1.00 (next 0.46)
-BANJO_RENUT_HOOK(sub_824E6410, D3DDevice_GetDeviceCaps_hook);  // D3DDevice_GetDeviceCaps  // katamari-nx: N&B sub_82641480, D3DDevice_GetDeviceCaps: memcpy(out, 0x820FC1F8, 304), N&B's memcpy(out, 0x82161B30, 304)
-BANJO_RENUT_UNHOOKED_HOOK(sub_82641498, D3DDevice_GetDisplayMode_hook);  // D3DDevice_GetDisplayMode  // katamari-nx: not hooked (signature too weak or ambiguous (sub_824E67A0 0.38, next 0.35))
-BANJO_RENUT_UNHOOKED_HOOK(sub_8225D1D0, D3DDevice_BlockOnFence_hook);  // D3DDevice_BlockOnFence  // katamari-nx: not hooked (signature too weak or ambiguous (sub_824E8610 0.51, next 0.51))
-BANJO_RENUT_HOOK(sub_824E89E8, D3D_SynchronizeToPresentationInterval_hook);  // D3D_SynchronizeToPresentationInterval  // katamari-nx: N&B sub_82258778, D3D_SynchronizeToPresentationInterval: called by Present before the resolve; sig 0.72/0.39
-BANJO_RENUT_UNHOOKED_HOOK(sub_8263D4B8, D3DResource_GetDevice_hook);  // D3DResource_GetDevice  // katamari-nx: not hooked (signature too weak or ambiguous (sub_824E8610 0.43, next 0.43))
-BANJO_RENUT_UNHOOKED_HOOK(sub_82BC8078, D3D_IsFusion_hook);  // D3D_IsFusion  // katamari-nx: not hooked (signature too weak or ambiguous (sub_824903A8 0.56, next 0.43))
-BANJO_RENUT_HOOK(sub_824DE218, D3DDevice_SetGammaRamp_hook);  // D3DDevice_SetGammaRamp  // katamari-nx: N&B sub_82636F48, D3DDevice_SetGammaRamp: InitializePresentationParameters calls it, then SetPWLGamma, in N&B's order; sig 0.63 for both
-BANJO_RENUT_HOOK(sub_824DE2F8, D3DDevice_SetPWLGamma_hook);  // D3DDevice_SetPWLGamma  // katamari-nx: N&B sub_82637018, D3DDevice_SetPWLGamma: as above
-BANJO_RENUT_HOOK(sub_824D0598, Direct3D_CreateDevice_hook);  // Direct3D_CreateDevice  // katamari-nx: N&B sub_82634990, Direct3D_CreateDevice: allocates the 0x5700 device (li r3,22272 / 128 alignment, sub_824D0240), calls the device init sub_824E18D0 (XenonGpu_Initialize, InitializePresentationParameters, InitializeApiState); sig 0.39 because N&B inlines that init
-BANJO_RENUT_HOOK(sub_824D0368, D3DDevice_Release_hook);  // D3DDevice_Release  // katamari-nx: N&B sub_82634AE8, signature 1.00 (next 0.59)
-BANJO_RENUT_HOOK(sub_824ED278, D3D_XenonGpu_Initialize_hook);  // D3D_XenonGpu_Initialize  // katamari-nx: N&B sub_8264B748, D3D_XenonGpu_Initialize: called by the device init sub_824E18D0 after the -1 words; sig 0.66/0.23
-BANJO_RENUT_HOOK(sub_824E11A0, D3D_InitializeApiState_hook);  // D3D_InitializeApiState  // katamari-nx: N&B sub_82641BC8, D3D_InitializeApiState: called by the device init; reads PresentInterval +13572 and BehaviorFlags +22264; sig 0.58/0.25
-BANJO_RENUT_HOOK(sub_824E1408, D3D_InitializePresentationParameters_hook);  // D3D_InitializePresentationParameters  // katamari-nx: N&B sub_82641EA8, D3D_InitializePresentationParameters: makes the auto surfaces (+14800..14808) with CreateTexture / CreateSurface; sig 0.65/0.27
-BANJO_RENUT_HOOK(sub_824E1B50, D3D_CDevice_Uninitialize_hook);  // D3D_CDevice_Uninitialize  // katamari-nx: N&B sub_82642568, D3D_CDevice_Uninitialize: VdShutdownEngines, VdSetGraphicsInterruptCallback; sig 0.40/0.26
-BANJO_RENUT_HOOK(sub_824E0298, KickOff_hook);  // D3D_CDevice_KickOff  // katamari-nx: N&B sub_821DFFF0, signature 0.80 (next 0.41)
-BANJO_RENUT_HOOK(sub_824E0110, KickOffSegment_hook);  // D3D_CDevice_KickOffSegment  // katamari-nx: N&B sub_821DFC08, D3D_CDevice_KickOffSegment: sig 0.71/0.31; CommandBuffer +13492, InKickOff +13216 as the zones say
-BANJO_RENUT_HOOK(sub_824E04B0, BeginRingBig_hook);  // D3D_CDevice_BeginRingBig  // katamari-nx: N&B sub_821C7360, D3D_CDevice_BeginRingBig: sig 0.67/0.32
-BANJO_RENUT_HOOK(sub_8255A200, BeginRingManual_hook);  // D3D_CDevice_BeginRingManual  // katamari-nx: N&B sub_82A6DD88, signature 1.00 (next 0.46)
-BANJO_RENUT_HOOK(sub_824DF3F0, RingBufferDeviceAllocate_hook);  // D3D_RingBufferDeviceAllocate  // katamari-nx: N&B sub_821FC4B8, D3D_RingBufferDeviceAllocate: sig 0.61/0.31
-BANJO_RENUT_UNHOOKED_HOOK(sub_821FC318, AllocateInlineData_hook);  // D3D_CDevice_AllocateInlineData  // katamari-nx: not hooked (signature too weak or ambiguous (sub_824DFF98 0.38, next 0.31))
-BANJO_RENUT_HOOK(sub_824E05E8, D3DDevice_SetRingBufferParameters_hook);  // D3DDevice_SetRingBufferParameters  // katamari-nx: N&B sub_82640090, D3DDevice_SetRingBufferParameters: the VdInitializeRingBuffer caller; sig 0.70/0.21
-BANJO_RENUT_HOOK(sub_824E8E90, D3DDevice_Swap_hook);  // D3DDevice_Swap  // katamari-nx: N&B sub_822554F8, D3DDevice_Swap: the only VdSwap caller; sig 0.53/0.26
-BANJO_RENUT_UNHOOKED_HOOK_SHARED(sub_82640818, D3DDevice_BeginCommandBuffer_hook);  // D3DDevice_BeginCommandBuffer  // katamari-nx: not hooked (D3DDevice_BeginCommandBuffer: no clear counterpart (sig 0.27); census first)
-BANJO_RENUT_UNHOOKED_HOOK(sub_82640DE8, D3DDevice_EndCommandBuffer_hook);  // D3DDevice_EndCommandBuffer  // katamari-nx: not hooked (D3DDevice_EndCommandBuffer: no clear counterpart (sig 0.49/0.48))
-BANJO_RENUT_UNHOOKED_HOOK_SHARED(sub_821F1A78, D3DDevice_RunCommandBuffer_hook);  // D3DDevice_RunCommandBuffer  // katamari-nx: not hooked (D3DDevice_RunCommandBuffer: no clear counterpart (sig 0.50/0.48))
-BANJO_RENUT_HOOK(sub_824DFC48, BlockOnFence_hook);  // D3D_CDevice_BlockOnFence  // katamari-nx: N&B sub_8225D370, D3D_CDevice_BlockOnFence: sig 0.55/0.32
-BANJO_RENUT_HOOK(sub_824D0290, CBlocker_Check_hook);  // D3D_CBlocker_Check  // katamari-nx: N&B sub_82634740, D3D_CBlocker_Check: sig 0.66/0.26
-BANJO_RENUT_HOOK(sub_824E03D0, IsFencePending_hook);  // D3DDevice_IsFencePending  // katamari-nx: N&B sub_8225D468, D3DDevice_IsFencePending: sig 0.71/0.47
+BANJO_RENUT_UNHOOKED_HOOK(sub_824E0590, D3DDevice_InsertCallback_hook);  // D3DDevice_InsertCallback  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_HOOK(sub_82B9C1E8, D3DDevice_AddRef_hook);  // D3DDevice_AddRef  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(sub_82B9C258, D3DDevice_AcquireThreadOwnership_hook);  // D3DDevice_AcquireThreadOwnership  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(sub_82B9C298, D3DDevice_ReleaseThreadOwnership_hook);  // D3DDevice_ReleaseThreadOwnership  // fable2-nx: fable2-nx's table
+BANJO_RENUT_UNHOOKED_HOOK(sub_824E6410, D3DDevice_GetDeviceCaps_hook);  // D3DDevice_GetDeviceCaps  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_UNHOOKED_HOOK(sub_82641498, D3DDevice_GetDisplayMode_hook);  // D3DDevice_GetDisplayMode  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_HOOK(sub_82B9B9F0, D3DDevice_BlockOnFence_hook);  // D3DDevice_BlockOnFence  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1258_82B9C7F8, D3D_SynchronizeToPresentationInterval_hook);  // D3D_SynchronizeToPresentationInterval  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(sub_82B986E8, D3DResource_GetDevice_hook);  // D3DResource_GetDevice  // fable2-nx: fable2-nx's table
+BANJO_RENUT_UNHOOKED_HOOK(sub_82BC8078, D3D_IsFusion_hook);  // D3D_IsFusion  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_UNHOOKED_HOOK(sub_824DE218, D3DDevice_SetGammaRamp_hook);  // D3DDevice_SetGammaRamp  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_UNHOOKED_HOOK(sub_824DE2F8, D3DDevice_SetPWLGamma_hook);  // D3DDevice_SetPWLGamma  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_UNHOOKED_HOOK(sub_824D0598, Direct3D_CreateDevice_hook);  // Direct3D_CreateDevice  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+// fable2-nx (2026-11-09, third console run: "Call to invalid or unregistered function at guest address 0x0" as the
+// intro video ended): D3DDevice_QueryBufferSpace(device, DWORD *pUsed, DWORD *pRemaining), which N&B never calls (so
+// reNut has no hook for it). On a no-hardware device (byte 10940 bit 0x80, which reNut sets on its devices) the
+// original asks the command buffer being recorded (device+13516) through its callback (+180): reNut records none, so
+// it called a null pointer. reNut has no ring to run out of: nothing used, plenty left (4 MB, the original's default
+// ring size).
+BANJO_RENUT_HOOK_RAW(ProcessAndProcessAndProcess1436_8217ECD8) {
+  if (auto *used = GuestPtr<be_u32>(ctx.r4.u32))
+    *used = 0u;
+  if (auto *remaining = GuestPtr<be_u32>(ctx.r5.u32))
+    *remaining = 0x400000u;
+}
+
+// fable2-nx (2026-11-10, fifth console run: black gameplay, the "3D Engine" thread at 100% CPU and no hook called,
+// the stack samples in sub_8220BDD8 -> sub_8220BE78): IDirect3DQuery9::GetData(query, pData, size, flags) =
+// sub_8220BE78, which N&B never calls (so reNut has no hook for it), and Fable's occlusion test sub_8220BDD8 spins on it
+// until it returns S_OK. The original reads the query's end fence (+24) against the device's fence words, then the
+// counts the GPU wrote at the query's result memory (+28). reNut runs no guest command buffer: the GPU writes nothing
+// there, and a fence issued without a hooked KickOff never completes while the caller spins (it kicks only when its
+// fence is the current one). So the answers come from here at once:
+//   occlusion (type 9): every sample passed (out[0]; with 16 bytes asked, out[1] of out[3] pixels visible, 100%), so
+//     Fable draws everything it tested (correct, at most slower);
+//   event (8): done (TRUE);
+//   screen extent (10): the whole screen (x0, y0, x1, y1 in pixels, then z min / max as floats 0 and 1).
+// A query not issued yet (flags +20 without 0x40) and any other type: the original (an error code or S_OK with
+// nothing written, no wait).
+namespace {
+constexpr u32 kQueryTypeEvent = 8;
+constexpr u32 kQueryTypeOcclusion = 9;
+constexpr u32 kQueryTypeScreenExtent = 10;
+constexpr u32 kQueryOcclusionSamples = 0x10000;
+}  // namespace
+
+BANJO_RENUT_HOOK_RAW(sub_8220BE78) {
+  const u32 query = ctx.r3.u32;
+  const u32 out = ctx.r4.u32;
+  const u32 size = ctx.r5.u32;
+  const u8 *flags = query ? GuestPtr<u8>(query + 20) : nullptr;
+  const u32 type = query ? LoadGuestU32(query + 4) : 0;
+  if (!flags || !(*flags & 0x40) || !out ||
+      (type != kQueryTypeEvent && type != kQueryTypeOcclusion && type != kQueryTypeScreenExtent)) {
+    __imp__sub_8220BE78(ctx, base);
+    return;
+  }
+  static std::atomic<u32> logged{0};
+  if (!(logged.fetch_or(1u << type) & (1u << type)))
+    REXLOG_INFO("[renut] D3DQuery_GetData: Fable's first type {} query answered at once (no GPU results under "
+                "reNut; caller {:08X})", type, u32(ctx.lr));
+  auto put = [&](u32 offset, u32 value) {
+    if (offset + 4 <= size) *GuestPtr<be_u32>(out + offset) = value;
+  };
+  switch (type) {
+    case kQueryTypeEvent:
+      put(0, 1);
+      break;
+    case kQueryTypeOcclusion:
+      put(0, kQueryOcclusionSamples);
+      if (size >= 16) {
+        put(4, kQueryOcclusionSamples);
+        put(8, 0);
+        put(12, kQueryOcclusionSamples);
+      }
+      break;
+    case kQueryTypeScreenExtent:
+      put(0, 0);
+      put(4, 0);
+      put(8, 1280);
+      put(12, 720);
+      put(16, std::bit_cast<u32>(0.0f));
+      put(20, std::bit_cast<u32>(1.0f));
+      break;
+  }
+  ctx.r3.u64 = 0;  // S_OK
+}
+
+// fable2-nx (2026-11-07, first console run: "Record heap used before Init", every reNut record null): Fable has no
+// Direct3D_CreateDevice of its own. Its engine (sub_82B69978) allocates the device itself (24,192 bytes, the original's
+// size), sets its behaviour flags (+23980) and calls CDevice::Initialize(device, present_parameters) = sub_82BA0220,
+// then keeps r31, the device, in its global (0x8336019C) and uses it from there. So reNut creates its own device where
+// CDevice::Initialize is called, as Direct3D_CreateDevice (title device, Fable's flags and present parameters), and
+// hands it back in r31 (the caller's register the device is in: it is stored right after a nonzero return). Fable's
+// own block is left unused (24 KB). Its no-hardware devices (sub_82A96DB0) are set up with the original code, whose
+// XenonGpu_Initialize and InitializeApiState reNut hooks.
+BANJO_RENUT_HOOK_RAW(sub_82BA0220) {
+  const u32 fable_block = ctx.r3.u32;
+  const u32 present_parameters = ctx.r4.u32;
+  const u32 behavior_flags = fable_block ? LoadGuestU32(fable_block + d3d::kDeviceOffsetBehaviorFlags) : 0;
+  ctx.r3.u64 = 0;                     // Adapter
+  ctx.r4.u64 = 1;                     // D3DDEVTYPE_HAL: the title device
+  ctx.r5.u64 = 0;
+  ctx.r6.u64 = behavior_flags;
+  ctx.r7.u64 = present_parameters;
+  ctx.r8.u64 = fable_block;           // the out pointer: the first word of Fable's unused block
+  ::rex::ppc::HostToGuestFunction<Direct3D_CreateDevice_hook>(ctx, base);
+  const u32 hr = ctx.r3.u32;
+  const u32 device = fable_block ? LoadGuestU32(fable_block) : 0;
+  if (hr == 0 && device) {
+    ctx.r31.u64 = device;
+    ctx.r3.u64 = 1;
+  } else {
+    RGPU_ERROR("fable2-nx: CDevice::Initialize: reNut's device was not created ({:#x})", hr);
+    ctx.r3.u64 = 0;
+  }
+}
+BANJO_RENUT_HOOK(sub_82B9C200, D3DDevice_Release_hook);  // D3DDevice_Release  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(sub_82B9F958, D3D_XenonGpu_Initialize_hook);  // D3D_XenonGpu_Initialize  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(sub_82B9FB28, D3D_InitializeApiState_hook);  // D3D_InitializeApiState  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(sub_82B9FD98, D3D_InitializePresentationParameters_hook);  // D3D_InitializePresentationParameters  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(sub_82BA04A8, D3D_CDevice_Uninitialize_hook);  // D3D_CDevice_Uninitialize  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(FastHelper_821E8D20, KickOff_hook);  // D3D_CDevice_KickOff  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess939_821E8B98, KickOffSegment_hook);  // D3D_CDevice_KickOffSegment  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess764_82213C10, BeginRingBig_hook);  // D3D_CDevice_BeginRingBig  // fable2-nx: fable2-nx's table
+BANJO_RENUT_UNHOOKED_HOOK(sub_8255A200, BeginRingManual_hook);  // D3D_CDevice_BeginRingManual  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess528_822065F0, RingBufferDeviceAllocate_hook);  // D3D_RingBufferDeviceAllocate  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess529_82206820, AllocateInlineData_hook);  // D3D_CDevice_AllocateInlineData  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(sub_82B9BA58, D3DDevice_SetRingBufferParameters_hook);  // D3DDevice_SetRingBufferParameters  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK_SHARED(MainRenderLoop_82B9CD68, D3DDevice_Swap_hook);  // D3DDevice_Swap  // fable2-nx: fable2-nx's table
+BANJO_RENUT_UNHOOKED_HOOK(sub_82640818, D3DDevice_BeginCommandBuffer_hook);  // D3DDevice_BeginCommandBuffer  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_UNHOOKED_HOOK(sub_82640DE8, D3DDevice_EndCommandBuffer_hook);  // D3DDevice_EndCommandBuffer  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_UNHOOKED_HOOK(sub_821F1A78, D3DDevice_RunCommandBuffer_hook);  // D3DDevice_RunCommandBuffer  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+BANJO_RENUT_HOOK_SHARED(FrameLimiterWait_82242628, BlockOnFence_hook);  // D3D_CDevice_BlockOnFence  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK_SHARED(GpuProgressCheck_82B9BF90, CBlocker_Check_hook);  // D3D_CBlocker_Check  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1320_821F6140, IsFencePending_hook);  // D3DDevice_IsFencePending  // fable2-nx: fable2-nx's table

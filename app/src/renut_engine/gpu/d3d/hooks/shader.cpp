@@ -457,6 +457,104 @@ void DestroyShaderRecord(ShaderRecord *shader) {
   DestroyRecord(shader);
 }
 
+// fable2-nx (2026-11-10, gameplay: ~90 % of the draws dropped at "Draw dropped: ... is not one the renderer knows",
+// the vertex shader or declaration being no record and no registered guest object). A guest object the draw binds
+// that neither a Create* hook nor XGRegister*Shader saw (set up or copied in place by the game): taken as the original
+// would read it, the first time a draw binds it.
+//   shader: Common's type (6 vertex, 7 pixel), the physical part's address (+0x20 vertex, +0x18 pixel) and the
+//     container after the object (+0x368 / +0x28), as XGRegister*Shader lays them out (RegisterGuestShader's checks);
+//   declaration: Common's type 5, the element count at +24 and the elements at +52 (D3D's CreateVertexDeclaration
+//     82B92EC0), kept per address and content; replaced ones are kept alive (draw memos may point at them).
+// nullptr when the bytes are not such an object. Render thread (State().mutex).
+ShaderRecord *AdoptGuestShaderLocked(u32 shader_va, bool pixel) {
+  const auto *words = shader_va ? GuestPtr<const be_u32>(shader_va) : nullptr;
+  if (!words || (u32(words[0]) & 0xFu) != (pixel ? 7u : 6u))
+    return nullptr;
+  const u32 physical_va = pixel ? u32(words[6]) : u32(words[kVertexShaderPhysical / 4]);
+  const auto *header =
+      GuestPtr<const d3d::ShaderContainer>(shader_va + (pixel ? kPixelShaderContainer : kVertexShaderContainer));
+  const u8 *physical = physical_va < 0x20000000u ? GuestPhysicalPtr<const u8>(physical_va)
+                                                 : GuestPtr<const u8>(physical_va);
+  if (!header || !physical)
+    return nullptr;
+  const u32 flags = header->flags;
+  const u32 virtual_size = header->virtualSize;
+  const u32 physical_size = header->physicalSize;
+  if ((flags & 0xFFFFFF00u) != 0x102A1100u || ((flags & 1) != 0) == pixel ||
+      virtual_size < sizeof(d3d::ShaderContainer) || virtual_size > 0x10000 || physical_size == 0 ||
+      physical_size > 0x100000)
+    return nullptr;
+  std::vector<uint8_t> container(size_t(virtual_size) + physical_size);
+  std::memcpy(container.data(), header, virtual_size);
+  std::memcpy(container.data() + virtual_size, physical, physical_size);
+  const uint64_t hash = HashShaderContainer(container.data());
+  const RecordKind kind = pixel ? RecordKind::PixelShader : RecordKind::VertexShader;
+  auto &shader = g_guest_shaders[shader_va];
+  if (!shader || shader->hash != hash || shader->kind != kind) {
+    if (shader) {
+      InvalidateFastDrawForRecordLocked(shader.get());
+      std::lock_guard shader_lock(shader->host_mutex);
+      ReleaseHostShader(shader.get());
+    }
+    const ShaderCacheEntry *entry = FindShaderEntry(hash);
+    if (!entry)
+      CaptureMissingShader(container.data(), pixel, hash);
+    NoteShaderSortKey(shader_va, hash, ShaderSortableByHash(hash, entry, pixel));
+    shader = std::make_unique<ShaderRecord>();
+    shader->kind = kind;
+    shader->self_va = shader_va;
+    shader->hash = hash;
+    shader->entry = entry;
+    PipelineShaderLoaded(entry);
+  }
+  ForgetShader(shader_va);  // FindShaderLocked's memo held "none" for it
+  static uint32_t adopted = 0;
+  if (adopted < 32) {
+    ++adopted;
+    RGPU_WARN("[renut] guest {} shader {:08X} adopted at its first draw (no Create/XGRegister seen; hash {:016X}{})",
+              pixel ? "pixel" : "vertex", shader_va, hash, shader->entry ? "" : ", not in the shader cache");
+  }
+  return shader.get();
+}
+
+const VertexDeclarationRecord *AdoptGuestDeclarationLocked(u32 declaration_va) {
+  const auto *bytes = declaration_va ? GuestPtr<const u8>(declaration_va) : nullptr;
+  if (!bytes)
+    return nullptr;
+  auto load = [bytes](u32 offset) { return u32(*reinterpret_cast<const be_u32 *>(bytes + offset)); };
+  const u32 count = load(24);
+  if ((load(0) & 0xFu) != 5u || count == 0 || count > 64)
+    return nullptr;
+  const auto *elements = reinterpret_cast<const GuestVertexElement *>(bytes + 52);
+  uint64_t hash = 0xCBF29CE484222325ull;
+  for (u32 i = 0; i < count * sizeof(GuestVertexElement); ++i)
+    hash = (hash ^ bytes[52 + i]) * 0x100000001B3ull;
+  for (u32 i = 0; i < count; ++i) {
+    if (u32(elements[i].Stream) >= kMaxVertexStreams || u32(elements[i].Type) == kDeclTypeUnused)
+      return nullptr;
+  }
+  struct Adopted {
+    uint64_t hash;
+    VertexDeclarationRecord *record;
+  };
+  static std::unordered_map<u32, Adopted> &adopted = *new std::unordered_map<u32, Adopted>();
+  Adopted &slot = adopted[declaration_va];
+  if (slot.record && slot.hash == hash)
+    return slot.record;
+  auto *record = new VertexDeclarationRecord();  // never freed: draw memos may hold an older one
+  record->self_va = declaration_va;
+  record->elements.assign(elements, elements + count);
+  BuildDeclarationLayout(*record);
+  slot = {hash, record};
+  static uint32_t logged = 0;
+  if (logged < 32) {
+    ++logged;
+    RGPU_WARN("[renut] guest vertex declaration {:08X} adopted at its first draw ({} elements; no Create seen)",
+              declaration_va, count);
+  }
+  return record;
+}
+
 // halo3-nx (2026-11-03, banjo_renut_recorded_binds): a shader's binds, each kept once, by id (index + 1).
 namespace {
 struct RecordedBinding {
@@ -762,6 +860,22 @@ u32 D3DDevice_CreateVertexDeclaration_hook(rex::MappedPtr<GuestVertexElement> el
   for (u32 i = 0; i < 64 && u32(element[i].Type) != kDeclTypeUnused; ++i)
     declaration->elements.push_back(element[i]);
   BuildDeclarationLayout(*declaration);
+  // fable2-nx: the original's guest-visible fields (VertexDeclarationRecord::guest_count), which Fable's code reads.
+  {
+    const u32 count = u32(declaration->elements.size());
+    u32 max_stream = 0;
+    std::memset(declaration->guest_streams, 0, sizeof(declaration->guest_streams));
+    for (u32 i = 0; i < count; ++i) {
+      const u32 stream = declaration->elements[i].Stream;
+      max_stream = std::max(max_stream, stream);
+      if (stream < 16)
+        declaration->guest_streams[stream] = 0xFF;
+      declaration->guest_elements[i] = declaration->elements[i];
+    }
+    declaration->guest_count = count;
+    declaration->guest_max_stream = max_stream;
+    declaration->guest_48 = 0u;
+  }
   return declaration->self_va;
 }
 
@@ -796,9 +910,33 @@ void D3DVertexShader_Bind_hook(u32 shader_va, u32 declaration_va, mapped_u32 str
 
 } // namespace
 
-BANJO_RENUT_HOOK(sub_824D6120, D3DDevice_CreateVertexShader_hook);  // D3DDevice_CreateVertexShader  // katamari-nx: N&B sub_826377C0, signature 0.85 (next 0.55)
-BANJO_RENUT_HOOK(sub_824D6010, D3DDevice_CreatePixelShader_hook);  // D3DDevice_CreatePixelShader  // katamari-nx: N&B sub_826375D8, D3DDevice_CreatePixelShader: CreateVertexShader takes sub_824D6120 (0.85); this one's next best, 0.66
-BANJO_RENUT_HOOK(sub_824D4C50, D3DDevice_CreateVertexDeclaration_hook);  // D3DDevice_CreateVertexDeclaration  // katamari-nx: N&B sub_826379A0, signature 0.77 (next 0.47)
-BANJO_RENUT_UNHOOKED_HOOK(sub_8263FBD0, D3DVertexShader_Bind_hook);  // D3DVertexShader_Bind  // katamari-nx: not hooked (D3DVertexShader_Bind: no clear counterpart (sig 0.35/0.28))
-BANJO_RENUT_HOOK(sub_824D4838, XGRegisterVertexShader_hook);  // XGRegisterVertexShader  // katamari-nx: N&B sub_826376C8, signature 0.91 (next 0.32)
-BANJO_RENUT_UNHOOKED_HOOK(sub_826375A0, XGRegisterPixelShader_hook);  // XGRegisterPixelShader  // katamari-nx: not hooked (XGRegisterPixelShader: no counterpart (sig 0.26))
+BANJO_RENUT_HOOK(sub_82B92D48, D3DDevice_CreateVertexShader_hook);  // D3DDevice_CreateVertexShader  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(sub_82B92B40, D3DDevice_CreatePixelShader_hook);  // D3DDevice_CreatePixelShader  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess2276_82B92FB0, D3DDevice_CreateVertexDeclaration_hook);  // D3DDevice_CreateVertexDeclaration  // fable2-nx: fable2-nx's table
+
+// fable2-nx: Fable 2's XDK 2.0.7645 keeps the first release's form, D3DVertexShader_Bind(pShader, Flags, pDecl,
+// pStreamStrides, Index) (TU3's build dropped Flags and Index): its arguments moved to the TU3 form above.
+void D3DVertexShader_Bind_fable2_hook(u32 shader_va, u32 /*flags*/, u32 declaration_va, mapped_u32 stream_strides,
+                                      u32 /*index*/) {
+  D3DVertexShader_Bind_hook(shader_va, declaration_va, stream_strides);
+}
+
+BANJO_RENUT_HOOK(sub_82B9D980, D3DVertexShader_Bind_fable2_hook);  // D3DVertexShader_Bind  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess2610_82B92C50, XGRegisterVertexShader_hook);  // XGRegisterVertexShader  // fable2-nx: fable2-nx's table
+BANJO_RENUT_UNHOOKED_HOOK(sub_826375A0, XGRegisterPixelShader_hook);  // XGRegisterPixelShader  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+
+// fable2-nx: Fable sets its bank's pixel shaders up in a function of its own, XGRegisterPixelShader inlined (so the
+// hook map has no XGRegisterPixelShader): r3 = Fable's wrapper, r4 = the container. Its code is the original's (the
+// header words, the physical part at +0x18), so the original runs, then the host side as XGRegisterPixelShader_hook's:
+// the object at wrapper+8, its physical part at wrapper+4 (docs/nx/renut-import.md, step 4). The vertex shaders'
+// counterpart (ProcessAndProcessAndProcess2609_82B843F8) calls XGRegisterVertexShader, hooked above.
+BANJO_RENUT_HOOK_RAW(ProcessAndProcessAndProcess2536_82B84550) {
+  const u32 wrapper = ctx.r3.u32;
+  __imp__ProcessAndProcessAndProcess2536_82B84550(ctx, base);
+  const auto *words = GuestPtr<const be_u32>(wrapper);
+  if (!words)
+    return;
+  const u32 shader = u32(words[2]), physical = u32(words[1]);
+  if (shader && physical)
+    RegisterGuestShader(shader, physical, true);
+}

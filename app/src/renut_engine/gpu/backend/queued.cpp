@@ -22,6 +22,7 @@
 #include "renut_engine/gpu/guest/callbacks.h"
 #include "renut_engine/gpu/guest/command_buffers.h"
 #include "renut_engine/gpu/d3d/d3d.h"
+#include "renut_engine/gpu/d3d/d3d_native.h"  // fable2-nx: ApplyRingRegisters
 #include "renut_engine/gpu/guest/guest_memory.h"
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/render/surfaces.h"  // blur-nx (2026-11-10, port 76; its key 215): StackHeaderSet
@@ -290,6 +291,9 @@ struct DeferredDraw {
   DrawCapture *capture = nullptr;  // owned (g_capture_pool)
   const u8 *scratch = nullptr;
   u32 bytes = 0;
+  // fable2-nx: BeginIndexedVertices' indices, copied with the vertices at the flush.
+  const u8 *index_scratch = nullptr;
+  u32 index_bytes = 0;
 };
 std::mutex g_deferred_mutex;
 std::unordered_map<u32, DeferredDraw> g_deferred;
@@ -648,6 +652,7 @@ DrawCapture *Capture(u32 device_va, const DrawCall &call) {
   auto *device = GuestPtr<d3d::Device>(device_va);
   if (!device)
     return nullptr;
+  native::ApplyRingRegisters(device_va);  // fable2-nx (2026-11-12): the ring's constant registers, before the device is read
   ClearPending(device);
   DrawCapture *capture = g_capture_pool.Take();
   // assign() keeps a pooled capture's storage (Snapshot() made a new vector each time).
@@ -668,6 +673,7 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
   auto *device = GuestPtr<d3d::Device>(device_va);
   if (!device)
     return nullptr;
+  native::ApplyRingRegisters(device_va);  // fable2-nx (2026-11-12): the ring's constant registers, before the device is read
   DeltaChain &c = g_delta;
   DrawCapture *capture = g_capture_pool.Take(true);
   capture->call = call;
@@ -862,7 +868,8 @@ void QueueDraw(u32 device_va, const DrawCall &call, u32 up_vertex_bytes, u32 up_
   QueueCapture(capture);
 }
 
-void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u32 bytes) {
+void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u32 bytes, const u8 *index_scratch,
+                       u32 index_bytes) {
   FlushDeferredVertices(device_va);
   RunReadyCallbacks();
   // banjo-nx (2026-10-20, from futari-nx, banjo_renut_deferred_chain): a Begin*Vertices draw of the chain too. Made under
@@ -888,7 +895,7 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
     if (!capture)
       return;
     std::lock_guard lock(g_deferred_mutex);
-    g_deferred[device_va] = {capture, scratch, bytes};
+    g_deferred[device_va] = {capture, scratch, bytes, index_scratch, index_bytes};
     g_deferred_count.store(g_deferred.size(), std::memory_order_release);
     return;
   }
@@ -912,7 +919,7 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
   std::lock_guard lock(g_deferred_mutex);
   DeferredDraw &slot = g_deferred[device_va];
   g_capture_pool.Give(slot.capture);  // one not flushed (the original replaced it the same way)
-  slot = {capture, scratch, bytes};
+  slot = {capture, scratch, bytes, index_scratch, index_bytes};
   g_deferred_count.store(g_deferred.size(), std::memory_order_release);
 }
 
@@ -936,6 +943,8 @@ void FlushDeferredVertices(u32 device_va) {
     g_deferred_count.store(g_deferred.size(), std::memory_order_release);
   }
   deferred.capture->vertices.assign(deferred.scratch, deferred.scratch + deferred.bytes);
+  if (deferred.index_scratch)  // fable2-nx: BeginIndexedVertices
+    deferred.capture->indices.assign(deferred.index_scratch, deferred.index_scratch + deferred.index_bytes);
   QueueCapture(deferred.capture);
 }
 
