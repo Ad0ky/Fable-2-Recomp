@@ -68,20 +68,37 @@ if [ "${CODEGEN:-0}" = 1 ] || [ ! -f app/generated/sources.cmake ]; then
     rexglue="$(find "$hostbuild" "$root/sdk/out" -type f -name rexglue -perm -u+x 2>/dev/null | head -n1)"
     [ -n "$rexglue" ] || die "rexglue was not built"
     echo "rexglue: $rexglue"
+    mkdir -p out/audit
+    gen() {  # gen <manifest> <log>
+        (cd app && REXGLUE_DUMP_IMAGE="$root/out/renut_image.bin" "$rexglue" codegen "$1") > "$2" 2>&1 \
+            || { tail -n 60 "$2"; die "codegen failed ($2)"; }
+        tail -n 4 "$2"
+    }
     log "Code generation (rexglue codegen app/renut_manifest.toml)"
-    mkdir -p out
-    (cd app && REXGLUE_DUMP_IMAGE="$root/out/renut_image.bin" "$rexglue" codegen renut_manifest.toml) \
-        > out/codegen.log 2>&1 || { tail -n 60 out/codegen.log; die "codegen failed (out/codegen.log)"; }
-    tail -n 6 out/codegen.log
+    gen renut_manifest.toml out/codegen.log
     [ -f app/generated/sources.cmake ] || die "codegen wrote no app/generated/sources.cmake"
+    # The base's register-diet audits, written into the config (tools/nx/codegen_lists.py), then the code again.
+    log "Register audits: non_argument_as_local (a code generation without it -> out/audit/gen_noarg)"
+    gen audit_noarg_manifest.toml out/audit/codegen_noarg.log
+    keep_out="$(python3 tools/nx/codegen_lists.py keep out/audit/gen_noarg)"; echo "$keep_out"
+    rm -rf out/audit/gen_noarg
+    for round in 1 2 3; do
+        log "Register audits: non_volatile_as_local (round $round)"
+        share_out="$(python3 tools/nx/codegen_lists.py share app/generated)"; echo "$share_out"
+        if [ "$round" = 1 ] && ! echo "$keep_out" | grep -q "NEW 0$"; then :; elif echo "$share_out" | grep -q "NEW 0$"; then break; fi
+        log "Code generation again with the lists"
+        gen renut_manifest.toml out/codegen.log
+    done
+    log "Register audits on the final code (tools/nx/codegen-audit.sh raw)"
+    bash tools/nx/codegen-audit.sh raw
     POSTCODEGEN=1
 fi
 if [ "${POSTCODEGEN:-0}" = 1 ]; then
     log "Post-codegen passes (tools/post_codegen.py)"
     REXSDK_DIR="$root/sdk" python3 tools/post_codegen.py 2>&1 | tee out/post_codegen.log | tail -n 40
     [ "${PIPESTATUS[0]}" = 0 ] || die "post_codegen.py failed (out/post_codegen.log)"
-    log "Per-game audits (tools/nx/codegen-audit.sh)"
-    bash tools/nx/codegen-audit.sh
+    log "Calling-convention census (tools/nx/codegen-audit.sh final)"
+    bash tools/nx/codegen-audit.sh final
 fi
 touch app/generated/codegen.build.stamp
 
@@ -97,10 +114,20 @@ if [ -f "$build/CMakeCache.txt" ] && [ "$(cat "$build/.toolchain-sha" 2>/dev/nul
     rm -f "$build/CMakeCache.txt"
 fi
 mkdir -p "$build" && echo "$tcsum" > "$build/.toolchain-sha"
+# Mesa's NVK SDK (portlibs/switch): not linked (REXGLUE_SWITCH_NVK OFF, deko3d only), but plume takes the Vulkan headers
+# from it and checks its libvulkan.a is there.
+if [ -z "${NVK_LIBRARY:-}" ]; then
+    NVK_LIBRARY="$(find "$DEVKITPRO" -name libvulkan.a -path '*switch*' 2>/dev/null | head -n1 || true)"
+fi
+[ -n "$NVK_LIBRARY" ] && [ -f "$NVK_LIBRARY" ] || die "mesa-switch libvulkan.a not found under $DEVKITPRO; set NVK_LIBRARY"
+NVK_SDK="$(dirname "$(dirname "$NVK_LIBRARY")")"
+echo "NVK SDK (headers only): $NVK_SDK"
 log "Configure"
-if [ ! -f "$build/CMakeCache.txt" ]; then
+# Every time, with every option (a first configure that stopped leaves a cache without them).
+if true; then
     # shellcheck disable=SC2086
     cmake -S app -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DREXGLUE_SWITCH_NVK_SDK="$NVK_SDK" \
         -DCMAKE_TOOLCHAIN_FILE="$root/tools/switch/cmake/switch-devkitA64.cmake" \
         -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
         -DDEVKITPRO="$DEVKITPRO" -DREXSDK_DIR="$root/sdk" -DREXGLUE_SWITCH_NVK=OFF \
@@ -108,8 +135,6 @@ if [ ! -f "$build/CMakeCache.txt" ]; then
         -DBANJO_DEKO3D_UAM="$root/out/deko3d_tools/uam-build/uam" \
         -DBANJO_GLSLANG_VALIDATOR="$root/out/glslang-linux/StandAlone/glslangValidator" \
         -DPYTHON_EXECUTABLE="$(command -v python3)" -DPython3_EXECUTABLE="$(command -v python3)" ${CMAKE_EXTRA:-}
-else
-    cmake "$build" > /dev/null
 fi
 
 log "Build ($JOBS jobs)"

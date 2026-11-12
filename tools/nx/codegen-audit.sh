@@ -19,8 +19,13 @@ run() {
     echo "(exit $?)" >> "out/audit/$name.txt"
     tail -n 25 "out/audit/$name.txt"
 }
-run cc_entry_census tools/cc_entry_census.py --gen "$gen" --image out/renut_image.bin
-run cc_exit_census tools/cc_exit_census.py --gen "$gen" --image out/renut_image.bin
-run read_before_write tools/read_before_write.py "$gen" --noreturn=82CA9260
-run non_argument_audit tools/non_argument_audit.py "$gen" --with-option --noreturn=82CA9260
+# raw: on the code as generated (before tools/post_codegen.py, whose rewrites these two do not parse);
+# final: after it (tools/reg_liveness.py's view, as docs/building.md runs them).
+if [ "${1:-final}" = raw ]; then
+    run read_before_write tools/read_before_write.py "$gen" --noreturn=82CA9260
+    run non_argument_audit tools/non_argument_audit.py "$gen" --with-option --noreturn=82CA9260
+else
+    run cc_entry_census tools/cc_entry_census.py --gen "$gen" --image out/renut_image.bin
+    run cc_exit_census tools/cc_exit_census.py --gen "$gen" --image out/renut_image.bin
+fi
 exit 0
