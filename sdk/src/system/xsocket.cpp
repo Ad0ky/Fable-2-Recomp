@@ -148,8 +148,13 @@ X_STATUS XSocket::Close() {
     incoming_cv_.notify_all();  // a thread blocked in RecvFrom returns
     return X_STATUS_SUCCESS;
   }
+  // fable2-nx (the himdo fork): a second Close of a native socket does nothing.
+  if (native_handle_ == uint64_t(-1)) {
+    return X_STATUS_SUCCESS;
+  }
 
   int ret = rex::net::socket_close(native_handle_);
+  native_handle_ = -1;
   if (ret != 0) {
     return X_STATUS_UNSUCCESSFUL;
   }

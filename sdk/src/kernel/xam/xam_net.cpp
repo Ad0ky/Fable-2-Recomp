@@ -380,7 +380,7 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
 }
 
 u32 NetDll_WSACreateEvent_entry() {
-  XEvent* ev = new XEvent(REX_KERNEL_STATE());
+  auto ev = object_ref<XEvent>(new XEvent(REX_KERNEL_STATE()));
   ev->Initialize(true, false);
   return ev->handle();
 }
@@ -594,13 +594,13 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
     XThread::SetLastError(0x2742);  // WSAENETDOWN
     return uint32_t(-1);
   }
-  XSocket* socket = new XSocket(REX_KERNEL_STATE());
+  auto socket = object_ref<XSocket>(new XSocket(REX_KERNEL_STATE()));
   X_STATUS result =
       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
                          XSocket::Protocol((uint32_t)protocol));
 
   if (XFAILED(result)) {
-    socket->Release();
+    socket->ReleaseHandle();
 
     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
     XThread::SetLastError(error);
@@ -778,7 +778,10 @@ struct host_set {
       }
       // Convert from Xenia -> native
       auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
-      assert_not_null(socket);
+      if (!socket) {
+        this->count = i;
+        break;
+      }
       this->sockets[i] = socket;
     }
   }

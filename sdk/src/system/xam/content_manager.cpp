@@ -337,7 +337,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
       continue;
     }
 
-    XCONTENT_AGGREGATE_DATA content_data;
+    XCONTENT_AGGREGATE_DATA content_data{};  // fable2-nx: the himdo fork's zeroed record
     // mk9-nx (2026-10-28; port 56): == X_ERROR_SUCCESS, not XSUCCEEDED: its Win32 errors (X_ERROR_FILE_NOT_FOUND is 2)
     // pass XSUCCEEDED, so a package without a header file (DLC put in place by hand) was listed from an uninitialised
     // record (no name, type 5A000000) and the game could not open it.
@@ -600,7 +600,8 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
   auto package_path = ResolvePackagePath(xuid, data);
   std::error_code ec;
   auto dir_removed = std::filesystem::remove_all(package_path, ec);
-  if (ec) {
+  if (ec ||
+      std::filesystem::status(package_path, ec).type() != std::filesystem::file_type::not_found) {
     return X_ERROR_ACCESS_DENIED;
   }
 
@@ -652,7 +653,8 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
 
   std::error_code ec;
   auto dir_removed = std::filesystem::remove_all(package_path, ec);
-  if (ec) {
+  if (ec ||
+      std::filesystem::status(package_path, ec).type() != std::filesystem::file_type::not_found) {
     return X_ERROR_ACCESS_DENIED;
   }
 

@@ -116,8 +116,10 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
 
 namespace std::chrono {
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || (defined(__GLIBCXX__) && (!defined(__cpp_lib_chrono) || __cpp_lib_chrono < 201907L))
 // Apple libc++ does not expose clock_time_conversion or clock_cast.
+// Fable 2 NX: nor does libstdc++ before GCC 14 (__cpp_lib_chrono < 201907): Debian 12's, which the Docker image's
+// host Clang builds the code generator with. devkitA64's GCC 15 has them.
 template <class, class>
 struct clock_time_conversion {};
 

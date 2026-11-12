@@ -20,6 +20,7 @@
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/host_path_file.h>
+#include <rex/kernel/xboxkrnl/load_profile.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -585,6 +586,8 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       // Where the read starts. If no offset is given, the game reads from the file position.
       const uint64_t displacement =
           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : file->position();
+      const bool profile = load_profile::ReadsTracked();
+      const uint64_t profile_start = profile ? load_profile::NowUs() : 0;
       const uint64_t io_us_start = NowUs();
       result = file->Read(buffer.guest_address(), buffer_length,
                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
@@ -595,6 +598,9 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       const uint64_t io_us_end = NowUs();
       NoteRead(io_us_end - io_us_start, bytes_read, file->path(), displacement);
       MaybeSummaryIo(io_us_end);
+      if (profile) {
+        load_profile::AddRead(bytes_read, load_profile::NowUs() - profile_start);
+      }
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
@@ -695,9 +701,14 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
+      const bool profile = load_profile::ReadsTracked();
+      const uint64_t profile_start = profile ? load_profile::NowUs() : 0;
       result = file->ReadScatter(segment_array.guest_address(), length,
                                  byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                                  &bytes_read, apc_context.guest_address());
+      if (profile) {
+        load_profile::AddRead(bytes_read, load_profile::NowUs() - profile_start);
+      }
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
@@ -834,7 +845,7 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
 
 u32 NtCreateIoCompletion_entry(mapped_u32 out_handle, u32 desired_access,
                                mapped_void object_attribs, u32 num_concurrent_threads) {
-  auto completion = new XIOCompletion(REX_KERNEL_STATE());
+  auto completion = object_ref<XIOCompletion>(new XIOCompletion(REX_KERNEL_STATE()));
   if (out_handle) {
     *out_handle = completion->handle();
   }
@@ -867,7 +878,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 
   auto port = REX_KERNEL_OBJECTS()->LookupObject<XIOCompletion>(handle);
   if (!port) {
-    status = X_STATUS_INVALID_HANDLE;
+    return X_STATUS_INVALID_HANDLE;
   }
 
   uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout)
