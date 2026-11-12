@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import deko3d_glsl  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SPIRV_CROSS = os.path.join(ROOT, 'out', 'deko3d_tools', 'spirv-cross-build', 'spirv-cross.exe')
-UAM = os.path.join(ROOT, 'out', 'deko3d_tools', 'uam-build', 'uam.exe')
+SPIRV_CROSS = os.path.join(os.environ.get('DEKO3D_TOOLS') or os.path.join(ROOT, 'out', 'deko3d_tools'), 'spirv-cross-build', 'spirv-cross' + ('.exe' if os.name == 'nt' else ''))  # fable2-nx: Linux too (the Docker build)
+UAM = os.path.join(os.environ.get('DEKO3D_TOOLS') or os.path.join(ROOT, 'out', 'deko3d_tools'), 'uam-build', 'uam' + ('.exe' if os.name == 'nt' else ''))
 NO_UAM = False
 
 

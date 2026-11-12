@@ -29,12 +29,17 @@
 #include "renut_engine/gpu/banjo_renut_capture.h"
 #endif
 #include "cpu/banjo_enhancements.h"
-#if defined(KATAMARI_BUILTIN_CONFIG)
-#include "katamari_builtin_config.h"  // generated from app/katamari_switch_defaults.toml and katamari_switch.toml (CMake)
+#if defined(FABLE2_BUILTIN_CONFIG)
+#include "fable2_builtin_config.h"  // generated from app/fable2_switch_defaults.toml and fable2_switch.toml (CMake)
 #endif
-namespace katamari::stage_diag {
-void Start();  // src/cpu/katamari_stage_diag.cpp
-}
+// fable2-nx (2026-11-12): Fable 2's game layer (src/fable2, from fable2-nx's Fable2App): its config, data patches, the
+// address-scan and mouse-look hooks' memory, the data folder's index heal, and the MSAA patch.
+#include "fable2_config.h"
+#include "fable2_patches.h"
+#include "fable2_address_scan.h"
+#include "mouse_look.h"
+#include "dir_manifest_heal.h"
+#include "fable2_disable_msaa.h"
 #include "native/nfsmw_nativo_captura.h"
 #if !REX_PLATFORM_SWITCH
 #include "profiler/nfsmw_perfil_pc.h"
@@ -70,22 +75,23 @@ public:
     static std::unique_ptr<rex::ui::WindowedApp> Create(
         rex::ui::WindowedAppContext& ctx) {
         // katamari-nx: banjo-nx's name, so its config is renut.toml (the built-in config's build: OnConfigurePaths).
+        // fable2-nx: the same ("renut": the generated project, renut_recomp, the tools).
         return std::unique_ptr<RenutApp>(new RenutApp(ctx, "renut", PPCImageConfig));
     }
 
     // katamari-nx (2026-11-02, sa2-nx's design): the Switch build's fixed settings, compiled in and applied before
     // katamari.toml, which holds only the player's options (a key added there still overrides these: test runs).
     std::string_view BuiltInConfig() const override {
-#if defined(KATAMARI_BUILTIN_CONFIG)
-        return kKatamariBuiltInConfig;
+#if defined(FABLE2_BUILTIN_CONFIG)
+        return kFable2BuiltInConfig;
 #else
         return {};
 #endif
     }
     // Without a katamari.toml next to the NRO, the player's default one is written there.
     std::string_view DefaultConfigFile() const override {
-#if defined(KATAMARI_BUILTIN_CONFIG)
-        return kKatamariPlayerConfig;
+#if defined(FABLE2_BUILTIN_CONFIG)
+        return kFable2PlayerConfig;
 #else
         return {};
 #endif
@@ -215,8 +221,6 @@ public:
         renut::dlc::InstallPackages(runtime());
         // One log line with every enhancement and whether it is active (src/cpu/banjo_enhancements.h).
         banjo::LogEnhancements();
-        // katamari-nx (2026-11-01): katamari_diag_game_state (off): the stage fields of the game state, as they change.
-        katamari::stage_diag::Start();
         // PC: function-level CPU profile (banjo_pc_profile_s = N seconds per report; 0 = off; from futari-nx).
         banjo::pc_profiler::Start();
         // Switch: per-thread CPU accounting, the optional sampler and the stall watchdog.
@@ -243,6 +247,26 @@ public:
         banjo::pgo::Start();
     }
 
+    // fable2-nx (2026-11-12, from fable2-nx's Fable2App): Fable 2's own settings file (fable2_config.toml next to the
+    // NRO, written with its defaults at the first start: the unlocks, the intro skip, the tick-rate patches, ...),
+    // after the SDK's logging so its problems are logged.
+    void OnPostInitLogging() override {
+        fable2::config::Load(rex::filesystem::GetExecutableFolder() / "fable2_config.toml");
+    }
+    // The data folder's index (data/dir.manifest): a file on disk the index lacks is a null to the game (a crash at
+    // the start). Files copied without it are added, before the game runs.
+    void OnLoadXexImage(std::string& xex_image) override {
+        (void)xex_image;
+        fable2::manifestheal::EnsureComplete(game_data_root());
+    }
+    // The data patches of fable2_config.toml's [patches] (src/fable2/fable2_patches.h), once the image is in guest
+    // memory; the memory for the address-scan and mouse-look hooks.
+    void OnPostLoadXexImage() override {
+        fable2::patches::ApplyAll(runtime()->memory(), PPCImageConfig);
+        fable2::addressscan::SetMemory(runtime()->memory());
+        fable2::mouselook::set_memory(runtime()->memory());
+    }
+
     // The PGO-instrumented build saves its counts when the game loses focus (HOME menu): it may be closed from there.
     void OnWindowFocusChanged(bool focused) override {
         if (!focused) banjo::pgo::DumpNow();
@@ -262,12 +286,12 @@ public:
     }
 
     // A game_root folder next to the executable is used when no path was given.
-    // On the Switch that is sdmc:/switch/katamari-nx/game_root (the extracted disc).
+    // On the Switch that is sdmc:/switch/fable2-nx/game_root (the extracted disc).
     void OnConfigurePaths(rex::PathConfig& paths) override {
-#if defined(KATAMARI_BUILTIN_CONFIG)
+#if defined(FABLE2_BUILTIN_CONFIG)
         // The player's settings file. Not renut.toml: the test builds' full one, left on an SD card, would override
-        // every built-in setting.
-        paths.config_path = rex::filesystem::GetExecutableFolder() / "katamari.toml";
+        // every built-in setting. fable2-nx: nor fable2-nx's fable_2.toml (its test keys would override the base's).
+        paths.config_path = rex::filesystem::GetExecutableFolder() / "fable2.toml";
 #endif
         if (paths.game_data_root.empty()) {
             const auto folder = rex::filesystem::GetExecutableFolder();

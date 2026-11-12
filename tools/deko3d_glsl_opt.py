@@ -3243,8 +3243,8 @@ def optimise(text, passes=DEFAULT, stage=None, name=None):
     return text
 
 
-UAM = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'out', 'deko3d_tools', 'uam-build',
-                   'uam.exe')
+UAM = os.path.join(os.environ.get('DEKO3D_TOOLS') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'out', 'deko3d_tools'), 'uam-build',
+                   'uam' + ('.exe' if os.name == 'nt' else ''))  # fable2-nx: Linux too (the Docker build)
 
 
 def check_one(item):

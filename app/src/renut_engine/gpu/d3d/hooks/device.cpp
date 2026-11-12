@@ -1584,7 +1584,7 @@ BANJO_RENUT_UNHOOKED_HOOK(sub_8255A200, BeginRingManual_hook);  // D3D_CDevice_B
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess528_822065F0, RingBufferDeviceAllocate_hook);  // D3D_RingBufferDeviceAllocate  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess529_82206820, AllocateInlineData_hook);  // D3D_CDevice_AllocateInlineData  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_82B9BA58, D3DDevice_SetRingBufferParameters_hook);  // D3DDevice_SetRingBufferParameters  // fable2-nx: fable2-nx's table
-BANJO_RENUT_HOOK_SHARED(MainRenderLoop_82B9CD68, D3DDevice_Swap_hook);  // D3DDevice_Swap  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(MainRenderLoop_82B9CD68, D3DDevice_Swap_hook);  // D3DDevice_Swap  // fable2-nx: fable2-nx's table (not SHARED: the base has no Fable override of it; fable2-nx's was its PC diagnostics, fps_meter.h)
 BANJO_RENUT_UNHOOKED_HOOK(sub_82640818, D3DDevice_BeginCommandBuffer_hook);  // D3DDevice_BeginCommandBuffer  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
 BANJO_RENUT_UNHOOKED_HOOK(sub_82640DE8, D3DDevice_EndCommandBuffer_hook);  // D3DDevice_EndCommandBuffer  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
 BANJO_RENUT_UNHOOKED_HOOK(sub_821F1A78, D3DDevice_RunCommandBuffer_hook);  // D3DDevice_RunCommandBuffer  // fable2-nx: not hooked: fable2-nx's table (unhooked there)

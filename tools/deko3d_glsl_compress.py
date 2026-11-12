@@ -22,7 +22,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ZSTD = r'C:\devkitPro\msys2\usr\bin\zstd.exe'
+ZSTD = os.environ.get('ZSTD') or (r'C:\devkitPro\msys2\usr\bin\zstd.exe' if os.name == 'nt' else 'zstd')  # fable2-nx: Linux too (the Docker build)
 
 
 def raw_frame_text(data, at, size):

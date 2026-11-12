@@ -112,10 +112,29 @@ function(renut_host_shader TARGET STEM PROFILE)
     if(BANJO_DEKO3D_HOST_SHADERS)
         set(out "${RENUT_GPU_GEN_DIR}/host_shaders/${STEM}.deko3d.h")
         set(tool "${CMAKE_SOURCE_DIR}/../tools/deko3d_host_shader.py")
+        # fable2-nx: on a Linux host DXC is "env LD_LIBRARY_PATH=<lib> dxc-linux" (RENUT_DXC), which a shell runs but
+        # --dxc cannot take: the variables go to cmake -E env, the tool alone to --dxc.
+        set(dxc_tool ${RENUT_DXC})
+        set(dxc_vars "")
+        while(dxc_tool)
+            list(GET dxc_tool 0 dxc_first)
+            if(dxc_first STREQUAL "env")
+                list(REMOVE_AT dxc_tool 0)
+            elseif(dxc_first MATCHES "^[A-Za-z_][A-Za-z0-9_]*=")
+                list(APPEND dxc_vars "${dxc_first}")
+                list(REMOVE_AT dxc_tool 0)
+            else()
+                break()
+            endif()
+        endwhile()
+        set(dxc_env "")
+        if(dxc_vars)
+            set(dxc_env ${CMAKE_COMMAND} -E env ${dxc_vars})
+        endif()
         add_custom_command(
             OUTPUT "${out}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${RENUT_GPU_GEN_DIR}/host_shaders"
-            COMMAND "${PYTHON_EXECUTABLE}" "${tool}" --dxc ${RENUT_DXC} --spirv-cross "${BANJO_DEKO3D_SPIRV_CROSS}"
+            COMMAND ${dxc_env} "${PYTHON_EXECUTABLE}" "${tool}" --dxc ${dxc_tool} --spirv-cross "${BANJO_DEKO3D_SPIRV_CROSS}"
                     --uam "${BANJO_DEKO3D_UAM}" --profile ${PROFILE} --stem ${STEM} --src "${src}" --out "${out}"
             DEPENDS "${src}" ${host_includes} "${tool}" "${CMAKE_SOURCE_DIR}/../tools/deko3d_glsl.py"
             COMMENT "Compiling host shader ${STEM}.hlsl (${PROFILE}, deko3d)"

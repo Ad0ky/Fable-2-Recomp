@@ -197,8 +197,13 @@ def main():
         run(tool('limiter_lazy_log10.py'), '--hot', os.path.join(gen, 'hot'))
     # cpu_aggressive C: the script interpreters' jump-table dispatch threaded into each handler (computed gotos, GCC
     # cross-jumping off for these functions only). Switch back: REX_SWITCH_THREAD_OFF / REX_SWITCH_GOTO_OFF.
-    run(tool('switch_goto.py'), '--gen', gen, '--thread', '--only',
-        'sub_8299D480,sub_829A75E8,sub_8299E2E8,sub_82C3D4E8,sub_829AA068')
+    # fable2-nx (2026-11-12): the interpreters' names from app/config/switch_goto_functions.txt (one per line; the base's
+    # list named Katamari's functions); none listed: the step is left out.
+    goto_list = os.path.join(APP, 'config', 'switch_goto_functions.txt')
+    goto_names = [l.split('#')[0].strip() for l in open(goto_list, encoding='utf-8')] if os.path.isfile(goto_list) else []
+    goto_names = [n for n in goto_names if n]
+    if goto_names:
+        run(tool('switch_goto.py'), '--gen', gen, '--thread', '--only', ','.join(goto_names))
     # cpu_aggressive D: proven link-register write-backs (the value ctx.lr already holds) compile to nothing on the
     # Switch; REX_LR_WRITE_SAME_CHECK (PC verify) tests every one. Before r1_local.py (its patterns name ctx.r1).
     proofs = os.path.join(ROOT, 'out', 'cpu_aggressive_proofs')

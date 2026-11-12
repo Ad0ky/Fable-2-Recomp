@@ -1,0 +1,2 @@
+# fable2-nx: the script interpreters whose jump-table dispatch tools/switch_goto.py threads (one generated name a
+# line). Empty until a console profile shows Fable 2's (its Lua VM's luaV_execute is the candidate).

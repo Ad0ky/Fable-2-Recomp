@@ -137,8 +137,13 @@ set(RENUT_SOURCES
     src/cpu/banjo_forms_selfcheck.cpp
     # blur-nx (2026-11-11, port 90): timings of a few processor forms at boot (blur_microbench, off).
     src/cpu/blur_microbench.cpp
-    # katamari-nx (2026-11-01): diagnostic of the game state's stage fields (katamari_diag_game_state, off).
-    src/cpu/katamari_stage_diag.cpp
+    # fable2-nx (2026-11-12): Fable 2's game layer, from fable2-nx (himdo's Fable-2-Recomp): its config
+    # (fable2_config.toml), data patches, mid-asm hook functions (renut_config.toml's midasm hooks), the address-scan
+    # skip, and its hand-written hot functions (src/fable2/hotfunc, below).
+    src/fable2/fable2_config.cpp
+    src/fable2/fable2_patches.cpp
+    src/fable2/fable2_hooks.cpp
+    src/fable2/fable2_address_scan.cpp
     # katamari-nx: the native copies of hot game functions (banjo_hot_guest.cpp and its shards), from this game's PC
     # profile (docs/katamari-notes.md, "Hot functions"): src/cpu/hot/localized.txt and hand.txt.
     src/cpu/banjo_hot_guest.cpp
@@ -158,6 +163,10 @@ set(RENUT_SOURCES
     # PNG captures of the presented game image (nfsmw_captura_cada_s), from nfsmw-nx: for testing.
     src/native/nfsmw_nativo_captura.cpp
 )
+
+# fable2-nx: himdo's hand-written natives of Fable 2's hot functions (each overrides its generated function).
+file(GLOB_RECURSE FABLE2_HOTFUNC_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/fable2/hotfunc/*.cpp")
+list(APPEND RENUT_SOURCES ${FABLE2_HOTFUNC_SOURCES})
 
 # Keyboard + mouse needs a desktop window; the Switch gets no-op hooks instead.
 if(REXGLUE_PLATFORM_SWITCH)
@@ -191,7 +200,7 @@ rexglue_setup_target(renut GPU_PLUGINS xenos)
 # banjo-nx (2026-10-17): Ryujinx starts NROs without argv[0]; the SDK then takes the NRO's usual place on the SD
 # (sdk/src/core/filesystem_posix.cpp). A console's hbloader always passes the path, so nothing changes there.
 if(REXGLUE_PLATFORM_SWITCH AND TARGET rexcore)
-    target_compile_definitions(rexcore PRIVATE REX_SWITCH_FALLBACK_EXE="/switch/katamari-nx/katamari-nx.nro")
+    target_compile_definitions(rexcore PRIVATE REX_SWITCH_FALLBACK_EXE="/switch/fable2-nx/fable2-nx.nro")
 endif()
 
 # banjo-nx (2026-10-16): Renut's Direct3D-level renderer as a second renderer, chosen at boot (banjo_renderer = "renut";
@@ -746,6 +755,10 @@ foreach(_shader masseffect_edram_7e3_to_rgba8 masseffect_edram_rgba8_to_7e3 mass
 endforeach()
 add_custom_target(banjo_edram_shaders DEPENDS ${BANJO_EDRAM_SHADER_INCLUDES})
 add_dependencies(renut banjo_edram_shaders)
+# fable2-nx: the game layer's headers are included by bare name (fable2-nx's layout).
+target_include_directories(renut PRIVATE src/fable2)
+# Native zlib-ng for the game's inflate (src/fable2/hotfunc/zlib/NativeInflate.cpp), fetched at configure time.
+include(src/fable2/hotfunc/zlib/native_inflate.cmake)
 target_include_directories(renut PRIVATE
     "${BANJO_GENERATED_SHADER_DIR}"
     src/me
@@ -764,7 +777,7 @@ target_sources(renut PRIVATE
 # image into the presenter output with it.
 target_include_directories(renut PRIVATE "${REXSDK_DIR}/src/ui/shaders")
 
-foreach(_dep imgui xxhash renderdoc)
+foreach(_dep imgui xxhash renderdoc tomlplusplus)  # fable2-nx: tomlplusplus for src/fable2/fable2_config.cpp
     if(TARGET ${_dep})
         target_include_directories(renut PRIVATE
             $<TARGET_PROPERTY:${_dep},INTERFACE_INCLUDE_DIRECTORIES>)
@@ -778,31 +791,30 @@ if(REXGLUE_PLATFORM_SWITCH)
     # (tools/switch-cpu-profile.py). It must come from the same build as the NRO that was profiled.
     target_link_options(renut PRIVATE "LINKER:-Map=${CMAKE_BINARY_DIR}/renut.map")
     # katamari-nx (2026-11-02, the user: only these settings in the toml, the rest hardcoded; sa2-nx's design): the fixed
-    # settings compiled in (src/renut_app.h BuiltInConfig), and the player's katamari.toml, written next to the NRO when
-    # it is missing (DefaultConfigFile). KATAMARI_BUILTIN_CONFIG=OFF: test builds that read a full renut.toml.
-    option(KATAMARI_BUILTIN_CONFIG "Switch: the fixed settings compiled in, the player's options in katamari.toml" ON)
-    if(KATAMARI_BUILTIN_CONFIG)
-        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/katamari_switch_defaults.toml" KATAMARI_BUILTIN_TEXT)
-        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/katamari_switch.toml" KATAMARI_PLAYER_TEXT)
-        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/katamari_builtin_config.h.in"
-                       "${CMAKE_CURRENT_BINARY_DIR}/builtin_config/katamari_builtin_config.h" @ONLY)
+    # settings compiled in (src/renut_app.h BuiltInConfig), and the player's fable2.toml, written next to the NRO when
+    # it is missing (DefaultConfigFile). FABLE2_BUILTIN_CONFIG=OFF: test builds that read a full renut.toml.
+    option(FABLE2_BUILTIN_CONFIG "Switch: the fixed settings compiled in, the player's options in fable2.toml" ON)
+    if(FABLE2_BUILTIN_CONFIG)
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/fable2_switch_defaults.toml" FABLE2_BUILTIN_TEXT)
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/fable2_switch.toml" FABLE2_PLAYER_TEXT)
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/fable2_builtin_config.h.in"
+                       "${CMAKE_CURRENT_BINARY_DIR}/builtin_config/fable2_builtin_config.h" @ONLY)
         target_include_directories(renut PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/builtin_config")
-        target_compile_definitions(renut PRIVATE KATAMARI_BUILTIN_CONFIG=1)
+        target_compile_definitions(renut PRIVATE FABLE2_BUILTIN_CONFIG=1)
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-                     "${CMAKE_CURRENT_SOURCE_DIR}/katamari_switch_defaults.toml"
-                     "${CMAKE_CURRENT_SOURCE_DIR}/katamari_switch.toml")
+                     "${CMAKE_CURRENT_SOURCE_DIR}/fable2_switch_defaults.toml"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/fable2_switch.toml")
     endif()
-    set(RENUT_ICON "${CMAKE_CURRENT_SOURCE_DIR}/../tools/switch/icon/katamari_icon.jpg")
+    set(RENUT_ICON "${CMAKE_CURRENT_SOURCE_DIR}/../tools/switch/icon/fable2_icon.jpg")
     set(RENUT_ICON_ARG)
     if(EXISTS "${RENUT_ICON}")
         set(RENUT_ICON_ARG ICON "${RENUT_ICON}")
     endif()
-    # katamari-nx (2026-11-02, the user's request): author ChanseyIsTheBest, the user's icon (the cover art).
-    # 2026-11-05: version 1.0.1, the game's memory and the NRO's code on 2 MB blocks, and the boot's cvars.
+    # fable2-nx (2026-11-12): Fable II on renut_nx_ultimate_base; the icon from fable2-nx (assets/switch-icon.jpg).
     rexglue_switch_add_nro(renut
-        NAME "Beautiful Katamari"
-        AUTHOR "ChanseyIsTheBest"
-        VERSION "1.0.1"
+        NAME "Fable II"
+        AUTHOR "Ad0ky"
+        VERSION "1.5.0"
         ${RENUT_ICON_ARG})
 endif()
 
