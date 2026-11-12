@@ -41,7 +41,6 @@ non_volatile_as_local = true
 # read zeros as locals; about 40 functions name a register above v31, so keeping the range costs almost nothing).
 non_volatile_as_local_keep = ["v64-v127"]
 elide_lr_stores = true
-skip_lr = true  # himdo's manifest
 non_argument_as_local = true
 # Functions whose r0/r2/r11/r12/f0/v32-v63 cross a call (tools/non_argument_audit.py ENTRY / RET): config/fable2_audit.toml.
 

@@ -666,16 +666,6 @@ BANJO_RENUT_HOOK_RAW(ProcessAndProcessAndProcess576_82217EE8) {
   StoreU32(pp_vertex, vertex_data);
   ctx.r3.u64 = 0;  // S_OK
 }
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess919_821E2BA0, D3DDevice_ClearF_hook);  // D3DDevice_ClearF
-BANJO_RENUT_HOOK(sub_821E2708, D3DDevice_Clear_hook);  // D3DDevice_Clear
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess806_822069C0, D3DDevice_Resolve_hook);  // D3DDevice_Resolve
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1500_822A5F80, D3DDevice_BeginTiling_hook);  // D3DDevice_BeginTiling
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1482_8227F0B0, D3DDevice_EndTiling_hook);  // D3DDevice_EndTiling  // fable2-nx (2026-11-07): placed by context (docs/nx/renut-import.md, first console run): 0.823 with a 0.43 lead
-BANJO_RENUT_UNHOOKED_HOOK(sub_82269618, D3DDevice_BeginExport_hook);  // D3DDevice_BeginExport
-BANJO_RENUT_HOOK(sub_821969E0, D3DDevice_EndExport_hook);  // D3DDevice_EndExport
-BANJO_RENUT_UNHOOKED_HOOK(sub_82654778, D3DDevice_Present_hook);  // D3DDevice_Present
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess657_822324E0, D3DDevice_SetVertexShader_hook);  // D3DDevice_SetVertexShader
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess644_82208CE8, D3DDevice_SetPixelShader_hook);  // D3DDevice_SetPixelShader
 
 // fable2-nx (2026-11-10, gameplay drawn without vertex shaders: ~85 % of the draws, from Fable's mesh loop
 // sub_8221BCC8): D3DDevice_GpuLoadShaders(device, D3DVertexShader*, D3DPixelShader*, flow control) = sub_82221978,
