@@ -114,7 +114,7 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 		// stfsx f1,r10,r11
 		ctx.fpscr.disableFlushMode();
 		temp.f32 = float(ctx.f1.f64);
-		REX_STORE_U32(ctx.r10.u32 + ctx.r11.u32, temp.u32);
+		REX_STORE_U32_C(ctx.r10.u32 + ctx.r11.u32, temp.u32);
 		// lwz r9,36(r3)
 		ctx.r9.u64 = REX_LOAD_U32(ctx.r3.u32 + 36);
 		// lwz r11,40(r3)
@@ -122,7 +122,7 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 		// addi r11,r11,1
 		ctx.r11.s64 = ctx.r11.s64 + 1;
 		// stw r11,40(r3)
-		REX_STORE_U32(ctx.r3.u32 + 40, ctx.r11.u32);
+		REX_STORE_U32_C(ctx.r3.u32 + 40, ctx.r11.u32);
 		// cmpw cr6,r11,r9
 		ctx.cr6.compare<int32_t>(ctx.r11.s32, ctx.r9.s32, ctx.xer);
 		// blt cr6,0x82c62720
@@ -130,7 +130,7 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 			// li r11,0
 			ctx.r11.s64 = 0;
 			// stw r11,40(r3)
-			REX_STORE_U32(ctx.r3.u32 + 40, ctx.r11.u32);
+			REX_STORE_U32_C(ctx.r3.u32 + 40, ctx.r11.u32);
 		}
 		// lwz r11,16(r3)
 		ctx.r11.u64 = REX_LOAD_U32(ctx.r3.u32 + 16);
@@ -184,7 +184,7 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 			ctx.f10.f64 = double(float(ctx.f13.f64 + ctx.f12.f64));
 			// stfs f10,0(r8)
 			temp.f32 = float(ctx.f10.f64);
-			REX_STORE_U32(ctx.r8.u32 + 0, temp.u32);
+			REX_STORE_U32_C(ctx.r8.u32 + 0, temp.u32);
 			// lwz r4,36(r3)
 			ctx.r4.u64 = REX_LOAD_U32(ctx.r3.u32 + 36);
 			// fmadds f0,f11,f12,f0
@@ -237,7 +237,7 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 			ctx.f10.f64 = double(float(ctx.f13.f64 + ctx.f12.f64));
 			// stfs f10,0(r9)
 			temp.f32 = float(ctx.f10.f64);
-			REX_STORE_U32(ctx.r9.u32 + 0, temp.u32);
+			REX_STORE_U32_C(ctx.r9.u32 + 0, temp.u32);
 			// lwz r5,40(r3)
 			ctx.r5.u64 = REX_LOAD_U32(ctx.r3.u32 + 40);
 			// fmadds f0,f11,f12,f0
@@ -260,7 +260,7 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 	// stfsx f1,r9,r10
 	ctx.fpscr.disableFlushMode();
 	temp.f32 = float(ctx.f1.f64);
-	REX_STORE_U32(ctx.r9.u32 + ctx.r10.u32, temp.u32);
+	REX_STORE_U32_C(ctx.r9.u32 + ctx.r10.u32, temp.u32);
 	// lwz r8,36(r3)
 	ctx.r8.u64 = REX_LOAD_U32(ctx.r3.u32 + 36);
 	// lwz r11,40(r3)
@@ -268,7 +268,7 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 	// addi r11,r11,1
 	ctx.r11.s64 = ctx.r11.s64 + 1;
 	// stw r11,40(r3)
-	REX_STORE_U32(ctx.r3.u32 + 40, ctx.r11.u32);
+	REX_STORE_U32_C(ctx.r3.u32 + 40, ctx.r11.u32);
 	// cmpw cr6,r11,r8
 	ctx.cr6.compare<int32_t>(ctx.r11.s32, ctx.r8.s32, ctx.xer);
 	// blt cr6,0x82c62640
@@ -276,7 +276,7 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 		// li r11,0
 		ctx.r11.s64 = 0;
 		// stw r11,40(r3)
-		REX_STORE_U32(ctx.r3.u32 + 40, ctx.r11.u32);
+		REX_STORE_U32_C(ctx.r3.u32 + 40, ctx.r11.u32);
 	}
 	// lwz r11,16(r3)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r3.u32 + 16);
@@ -295,13 +295,13 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 	ctx.f11.f64 = double(float(ctx.f12.f64 + ctx.f13.f64));
 	// stfs f11,0(r11)
 	temp.f32 = float(ctx.f11.f64);
-	REX_STORE_U32(ctx.r11.u32 + 0, temp.u32);
+	REX_STORE_U32_C(ctx.r11.u32 + 0, temp.u32);
 	// lwz r11,8(r3)
 	ctx.r11.u64 = REX_LOAD_U32(ctx.r3.u32 + 8);
 	// addi r9,r11,-1
 	ctx.r9.s64 = ctx.r11.s64 + -1;
 	// stw r9,8(r3)
-	REX_STORE_U32(ctx.r3.u32 + 8, ctx.r9.u32);
+	REX_STORE_U32_C(ctx.r3.u32 + 8, ctx.r9.u32);
 	// blr 
 	return;
 }

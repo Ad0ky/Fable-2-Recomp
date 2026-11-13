@@ -78,9 +78,9 @@ extern "C" void GpuProgressCheck_82B9BF90(PPCContext& __restrict ctx, uint8_t* b
 			// lwz r11,0(r11)
 			ctx.r11.u64 = REX_LOAD_U32(ctx.r11.u32 + 0);
 			// stw r30,12(r31)
-			REX_STORE_U32(ctx.r31.u32 + 12, ctx.r30.u32);
+			REX_STORE_U32_C(ctx.r31.u32 + 12, ctx.r30.u32);
 			// stw r11,8(r31)
-			REX_STORE_U32(ctx.r31.u32 + 8, ctx.r11.u32);
+			REX_STORE_U32_C(ctx.r31.u32 + 8, ctx.r11.u32);
 		}
 		// bl 0x8221ee38
 		ctx.lr = 0x82B9C010;
@@ -98,7 +98,7 @@ extern "C" void GpuProgressCheck_82B9BF90(PPCContext& __restrict ctx, uint8_t* b
 			// beq cr6,0x82b9c02c
 			if (!ctx.cr6.eq) {
 				// stw r30,12(r31)
-				REX_STORE_U32(ctx.r31.u32 + 12, ctx.r30.u32);
+				REX_STORE_U32_C(ctx.r31.u32 + 12, ctx.r30.u32);
 			}
 		}
 		// lwz r11,12(r31)
@@ -127,7 +127,7 @@ extern "C" void GpuProgressCheck_82B9BF90(PPCContext& __restrict ctx, uint8_t* b
 			}
 			else {
 				// stw r30,12(r31)
-				REX_STORE_U32(ctx.r31.u32 + 12, ctx.r30.u32);
+				REX_STORE_U32_C(ctx.r31.u32 + 12, ctx.r30.u32);
 				// li r3,1
 				ctx.r3.s64 = 1;
 			}

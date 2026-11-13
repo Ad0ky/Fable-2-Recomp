@@ -185,7 +185,7 @@ extern "C" void FrameLimiterWait_82242628(PPCContext& __restrict ctx, uint8_t* b
   ctx.lr = kRetSaveGpr;
   __savegprlr_29(ctx, base);
   const uint32_t frame = ctx.r1.u32 - kFrameSize;
-  REX_STORE_U32(frame, ctx.r1.u32);
+  REX_STORE_U32_C(frame, ctx.r1.u32);
   ctx.r1.u32 = frame;
   ctx.r31.u64 = ctx.r3.u64;  // limit
   ctx.r30.u64 = ctx.r4.u64;  // now
