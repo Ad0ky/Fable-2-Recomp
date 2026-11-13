@@ -979,3 +979,11 @@ share_registers = true
 # sub_831D8F60: r26 | cr6.compare<uint32_t>(r26.u32, 0, xer);
 share_registers = true
 
+[functions."0x82BA0220"]
+# fable2-nx (2026-11-13, by hand; the second console run: "Call to invalid or unregistered function at guest address
+# 0x00000000" 60 ms after the device): CDevice::Initialize, which Renut's raw hook replaces and which hands the device
+# back in r31 (d3d/hooks/device.cpp). With non_volatile_as_local the caller sub_82B69978 kept r31 in a local and stored
+# Fable's own, never initialised block in its device global (stw r31,412(r27) -> 0x8336019C). share_registers: the
+# caller copies r31 back from the context after the call.
+share_registers = true
+
