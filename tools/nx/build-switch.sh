@@ -74,18 +74,20 @@ if [ "${CODEGEN:-0}" = 1 ] || [ ! -f app/generated/sources.cmake ]; then
             || { tail -n 60 "$2"; die "codegen failed ($2)"; }
         tail -n 4 "$2"
     }
-    log "Code generation (rexglue codegen app/renut_manifest.toml)"
-    gen renut_manifest.toml out/codegen.log
-    [ -f app/generated/sources.cmake ] || die "codegen wrote no app/generated/sources.cmake"
-    # The base's register-diet audits, written into the config (tools/nx/codegen_lists.py), then the code again.
+    # The base's register-diet audits, written into the config (tools/nx/codegen_lists.py), then the code. The
+    # generation without non_argument_as_local comes first: every generation writes app/generated/rexglue.cmake (naming
+    # its own output folder), so the last one must be the real one.
     log "Register audits: non_argument_as_local (a code generation without it -> out/audit/gen_noarg)"
     gen audit_noarg_manifest.toml out/audit/codegen_noarg.log
     keep_out="$(python3 tools/nx/codegen_lists.py keep out/audit/gen_noarg)"; echo "$keep_out"
     rm -rf out/audit/gen_noarg
+    log "Code generation (rexglue codegen app/renut_manifest.toml)"
+    gen renut_manifest.toml out/codegen.log
+    [ -f app/generated/sources.cmake ] || die "codegen wrote no app/generated/sources.cmake"
     for round in 1 2 3; do
         log "Register audits: non_volatile_as_local (round $round)"
         share_out="$(python3 tools/nx/codegen_lists.py share app/generated)"; echo "$share_out"
-        if [ "$round" = 1 ] && ! echo "$keep_out" | grep -q "NEW 0$"; then :; elif echo "$share_out" | grep -q "NEW 0$"; then break; fi
+        if echo "$share_out" | grep -q "NEW 0$"; then break; fi
         log "Code generation again with the lists"
         gen renut_manifest.toml out/codegen.log
     done
@@ -101,6 +103,7 @@ if [ "${POSTCODEGEN:-0}" = 1 ]; then
     bash tools/nx/codegen-audit.sh final
 fi
 touch app/generated/codegen.build.stamp
+grep -q 'out/audit' app/generated/rexglue.cmake 2>/dev/null && die "app/generated/rexglue.cmake names the audit's folder: run with codegen"
 
 if [ ! -f app/out/renut_switch/shader_cache_switch.cpp ] || [ ! -f app/out/renut_switch/deko3d_glsl_switch.cpp ]; then
     log "Shaders (tools/nx/build-shaders.sh)"
