@@ -689,16 +689,20 @@ BANJO_RENUT_HOOK(ProcessAndProcessAndProcess876_822060A0, D3DDevice_BeginVertice
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess919_821E2BA0, D3DDevice_ClearF_hook);  // D3DDevice_ClearF  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_821E2708, D3DDevice_Clear_hook);  // D3DDevice_Clear  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess806_822069C0, D3DDevice_Resolve_hook);  // D3DDevice_Resolve  // fable2-nx: fable2-nx's table
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1500_822A5F80, D3DDevice_BeginTiling_hook);  // D3DDevice_BeginTiling: N&B's update form, see below  // fable2-nx: fable2-nx's table
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1482_8227F0B0, D3DDevice_EndTiling_hook);  // D3DDevice_EndTiling: N&B's update form, see below  // fable2-nx: fable2-nx's table
+BANJO_RENUT_UNHOOKED_HOOK_SHARED(sub_82246798, D3DDevice_BeginTiling_hook);  // D3DDevice_BeginTiling: TU3's form (Fable 2: the full form, below)
+BANJO_RENUT_UNHOOKED_HOOK(sub_821E17C0, D3DDevice_EndTiling_hook);  // D3DDevice_EndTiling: TU3's form (Fable 2: the full form, below)
 // katamari-nx (2026-10-30): XDK 2.0.5632's BeginTiling (sub_824EFBC8: it stores the count at TileCount +0x31C4 and
 // the targets at TilingSurfaces +0x31B0, where the zones put N&B's fields; the game calls it at 0x8271E62C) and
 // EndTiling (sub_824F0150: sig 0.66/0.36, resolves through Resolve sub_824F12B8; called at 0x8272F2E0..0x8272F384),
 // with their full arguments read from the registers (the float argument takes r8's place: ClearStencil is r9).
-BANJO_RENUT_UNHOOKED_HOOK_RAW(sub_824EFBC8) {  // fable2-nx: Katamari's function, not hooked
+// fable2-nx (2026-11-13): Fable 2's XDK 2.0.7645 (N&B's base game, as Katamari's 5632) keeps the full forms too
+// (fable2-nx's renderer: BeginTiling(device, Flags, Count, rects, colour, f1 ClearZ, r9 ClearStencil), EndTiling(device,
+// ResolveFlags, rects, dest, colour, f1 ClearZ, r9 ClearStencil, r10 parameters)): Fable's BeginTiling
+// ProcessAndProcessAndProcess1500_822A5F80 and EndTiling ProcessAndProcessAndProcess1482_8227F0B0 take these bodies.
+BANJO_RENUT_HOOK_RAW(ProcessAndProcessAndProcess1500_822A5F80) {
   BeginTilingImpl(ctx.r3.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r4.u32, float(ctx.f1.f64), ctx.r9.u32);
 }
-BANJO_RENUT_UNHOOKED_HOOK_RAW(sub_824F0150) {  // fable2-nx: Katamari's function, not hooked
+BANJO_RENUT_HOOK_RAW(ProcessAndProcessAndProcess1482_8227F0B0) {
   ctx.r3.u64 = EndTilingImpl(ctx.r3.u32, true, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, float(ctx.f1.f64),
                              ctx.r9.u32, ctx.r10.u32);
 }

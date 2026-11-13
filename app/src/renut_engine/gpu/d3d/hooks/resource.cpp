@@ -1713,16 +1713,34 @@ u32 AddRefResource(u32 resource) {
 
 } // namespace renut::gpu::native
 
+// fable2-nx (2026-11-13, the first console run: a memset of guest 0x00200000 from Fable's texture clear
+// sub_82B7BC00, right after the device was made): Fable 2's XDK (2.0.7645, N&B's base game) passes an unused 0 as the
+// second argument of these three; TU3's build, the base's form, dropped it, so every argument after it was read one
+// register early (the level as the slice, the out pointer as the level...). Their arguments moved to the base's form.
+// fable2-nx's renderer had them in this form (renut-nx at N&B's base game).
+void D3D_Lock2DSurface_fable2_hook(u32 texture, u32 /*unused*/, u32 slice, u32 level, mapped_u32 locked_rect,
+                                   mapped_u32 rect, u32 flags) {
+  D3D_Lock2DSurface_hook(texture, slice, level, locked_rect, rect, flags);
+}
+void D3D_LockSurface_fable2_hook(u32 texture, u32 /*unused*/, u32 slice, u32 level, u32 flags, mapped_u32 address,
+                                 mapped_u32 row_pitch, mapped_u32 slice_bytes, mapped_u32 tail_offset) {
+  D3D_LockSurface_hook(texture, slice, level, flags, address, row_pitch, slice_bytes, tail_offset);
+}
+u32 LockResource_fable2_hook(u32 resource, u32 /*unused*/, u32 type, u32 mip_lock, u32 base_address, u32 mip_address, u32 address, u32 size, u32 flags, u32 cache_flags) {
+  return LockResource_hook(resource, type, mip_lock, base_address, mip_address, address, size, flags, cache_flags);
+}
+
+
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess660_821F4D90, D3DDevice_CreateSurface_hook);  // D3DDevice_CreateSurface  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess659_821F6490, D3DResource_Destroy_hook);  // D3DResource_Destroy  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1251_822C2628, D3D_UnlockResource_hook);  // D3D_UnlockResource  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_82B98750, D3DVertexBuffer_Unlock_hook);  // D3DVertexBuffer_Unlock  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_82B925A0, D3DSurface_UnlockRect_hook);  // D3DSurface_UnlockRect  // fable2-nx: fable2-nx's table
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1250_821F61D0, LockResource_hook);  // D3D_LockResource  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1250_821F61D0, LockResource_fable2_hook);  // D3D_LockResource  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_8225F940, D3DVertexBuffer_Lock_hook);  // D3DVertexBuffer_Lock  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_82196C10, D3DIndexBuffer_Lock_hook);  // D3DIndexBuffer_Lock  // fable2-nx: fable2-nx's table
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1325_82277FF8, D3D_LockSurface_hook);  // D3D_LockSurface  // fable2-nx: fable2-nx's table
-BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1326_821AB648, D3D_Lock2DSurface_hook);  // D3D_Lock2DSurface  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1325_82277FF8, D3D_LockSurface_fable2_hook);  // D3D_LockSurface  // fable2-nx: fable2-nx's table
+BANJO_RENUT_HOOK(ProcessAndProcessAndProcess1326_821AB648, D3D_Lock2DSurface_fable2_hook);  // D3D_Lock2DSurface  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_82B91F58, D3D_Lock3DSurface_hook);  // D3D_Lock3DSurface  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_82B92298, D3DArrayTexture_LockRect_hook);  // D3DArrayTexture_LockRect  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_82B921C0, D3DLineTexture_LockRect_hook);  // D3DLineTexture_LockRect  // fable2-nx: fable2-nx's table
