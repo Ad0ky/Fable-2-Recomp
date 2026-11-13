@@ -70,7 +70,9 @@ if [ "${CODEGEN:-0}" = 1 ] || [ ! -f app/generated/sources.cmake ]; then
     echo "rexglue: $rexglue"
     mkdir -p out/audit
     gen() {  # gen <manifest> <log>
-        (cd app && REXGLUE_DUMP_IMAGE="$root/out/renut_image.bin" "$rexglue" codegen "$1") > "$2" 2>&1 \
+        # --ignore-stamp: the generator skips a module whose inputs are unchanged (codegen.stamp), which would leave
+        # the post-codegen passes' tree in place for the audits below (they then read every rewritten prologue).
+        (cd app && REXGLUE_DUMP_IMAGE="$root/out/renut_image.bin" "$rexglue" codegen --ignore-stamp "$1") > "$2" 2>&1 \
             || { tail -n 60 "$2"; die "codegen failed ($2)"; }
         tail -n 4 "$2"
     }

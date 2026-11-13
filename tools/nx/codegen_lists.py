@@ -61,7 +61,19 @@ def existing(path, pattern):
     return {int(x, 16) for x in re.findall(pattern, open(path, encoding='utf-8').read())}
 
 
+def processed(gen):
+    """True when the tree has been through tools/post_codegen.py (the audits read only the generator's own text)."""
+    import glob
+    for f in sorted(glob.glob(os.path.join(gen, '*_recomp.*.cpp')))[:3]:
+        text = open(f, encoding='utf-8', errors='ignore').read()
+        if 'REX_DEAD_SAVE(' in text or 'REX_DEAD_DEF(' in text or 'REX_STORE_CARD' in text:
+            return True
+    return False
+
+
 def share(gen):
+    if processed(gen):
+        sys.exit(f'share: {gen} has been through the post-codegen passes; the audit needs a fresh code generation')
     by_name, by_addr = funcs_by_name()
     out = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'read_before_write.py'), gen, NORETURN],
                          capture_output=True, text=True, cwd=ROOT)
@@ -106,6 +118,8 @@ def share(gen):
 
 
 def keep(gen):
+    if processed(gen):
+        sys.exit(f'keep: {gen} has been through the post-codegen passes; the audit needs a fresh code generation')
     by_name, _ = funcs_by_name()
     out = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'non_argument_audit.py'), gen, NORETURN],
                          capture_output=True, text=True, cwd=ROOT)
