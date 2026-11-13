@@ -751,6 +751,31 @@ bool SameData(const u32 a[6], const u32 b[6]) {
   return a[1] == b[1] && a[2] == b[2] && (a[5] & kDimensionMask) == (b[5] & kDimensionMask);
 }
 
+// fable2-nx (2026-11-13, the logo flashes): a texture the GPU wrote, read through the _AS_16_16_16_16 twin of its format
+// (8_8_8_8 / 50, 2_10_10_10 / 54, 10_11_11 / 55, 11_11_10 / 56). The twin is the same memory layout, only filtered at 16
+// bits on the console. Fable 2 resolves its 280x180 bloom levels as 2_10_10_10 and samples them as
+// 2_10_10_10_AS_16_16_16_16: without this the resolve's texture was dropped at every fetch and remade from guest memory,
+// which the resolve never wrote (the white frames in the Lionhead logo, "[flash] ... dropped for a fetch of other data").
+// Only for GPU-written textures: its image holds the values (unorm) either format reads.
+u32 BaseOfTwin(u32 format) {
+  switch (format) {
+  case 50: return 6;
+  case 54: return 7;
+  case 55: return 16;
+  case 56: return 17;
+  default: return format;
+  }
+}
+
+bool SameDataOrTwin(const u32 a[6], const u32 b[6]) {
+  if (SameData(a, b))
+    return true;
+  constexpr u32 kFormatBits = 0x3Fu;
+  constexpr u32 kDimensionMask = 0x600u;
+  return ((a[1] ^ b[1]) & ~kFormatBits) == 0 && BaseOfTwin(a[1] & kFormatBits) == BaseOfTwin(b[1] & kFormatBits) &&
+         a[2] == b[2] && (a[5] & kDimensionMask) == (b[5] & kDimensionMask);
+}
+
 // sasrt-nx (2026-10-21, sasrt_renut_texture_keep_on_signs): two descriptions that differ only in the component signs (dword 0
 // bits 2-9), both or neither all signed (the only part of the signs Create uses: AllSigned).
 bool SignsOnly(const u32 a[6], const u32 b[6]) {
@@ -771,7 +796,7 @@ HostTexture *ResolvedAlias(u32 texture_va, const TextureFetch &fetch, const u32 
   HostTexture *resolved = it->second;
   if (resolved->guest_va == texture_va || !resolved->texture)
     return nullptr;
-  if (SameData(resolved->desc, desc))
+  if (SameDataOrTwin(resolved->desc, desc))  // fable2-nx: or its _AS_16_16_16_16 twin
     return resolved;
   // blur-nx (2026-11-10, port 76; its key 211: blur_renut_expand_alias): an EXPAND resolve sampled as its FLOAT twin, or
   // the other way (16_EXPAND / 16_FLOAT, 16_16_ / 16_16_FLOAT, 16_16_16_16_ / 16_16_16_16_FLOAT): the same memory, size,
@@ -1461,7 +1486,7 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
   // its header only in fields that leave the data alone (the mip range, say)
   // keeps what the resolve wrote.
   if (slot && std::memcmp(slot->desc, desc, sizeof(desc)) != 0 &&
-      !(slot->gpu_written && SameData(slot->desc, desc)) && !SignsOnly(slot->desc, desc)) {  // sasrt-nx: SignsOnly
+      !(slot->gpu_written && SameDataOrTwin(slot->desc, desc)) && !SignsOnly(slot->desc, desc)) {  // sasrt-nx: SignsOnly
     // banjo-nx (2026-10-18, the one-frame colour flashes): a texture only the GPU has the content of, thrown away for a
     // fetch constant that reads the memory otherwise; the new one is filled from guest memory, which the resolve never
     // wrote (zero: green through the game's colour encoding on deko3d; stale on Vulkan).
