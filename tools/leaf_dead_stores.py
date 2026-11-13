@@ -294,6 +294,17 @@ def parse_function(lines):
             for k, line in enumerate(chunk):
                 if k < skip_to:
                     continue
+                # fable2-nx (2026-11-13): the generator's setjmp / longjmp (ppc_setjmp / ppc_longjmp, keyed by the guest
+                # jmp_buf address in r3) read the registers but have no "(ctx, base)": the r3 write before a longjmp was
+                # left out as dead (Fable 2's Lua error throw, ProcessAndProcessAndProcess158_82BCCB88: abort() in
+                # ppc_longjmp at the first Lua error). They read everything; a longjmp does not come back.
+                if 'ppc_longjmp(' in line:
+                    node.use = ALL
+                    node.exit = True
+                    falls = False
+                    break
+                if 'ppc_setjmp(' in line:
+                    node.use = ALL
                 h = HOOK_CALL.match(line)
                 if h and h.group(1) in MID_ASM_HOOKS:
                     node.use |= regs(line[h.end():])  # the registers it takes by reference
