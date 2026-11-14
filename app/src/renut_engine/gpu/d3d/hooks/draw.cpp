@@ -161,6 +161,25 @@ void D3DDevice_DrawIndexedTessellatedVertices_hook(u32 device, u32 primitive, u3
     QueueDraw(device, call, 0, 0);
 }
 
+// fable2-nx (2026-11-15): void D3DDevice_DrawTessellatedVertices(D3DDevice*, D3DTESSPRIMITIVETYPE, UINT StartVertex,
+// UINT PatchCount) [Fable 2: sub_8221C9C8]: the non-indexed form. Its body writes VGT_INDX_OFFSET = StartVertex and
+// DRAW_INDX with auto-generated indices (initiator 0x192: quad patches, source select 2), PatchCount in its top half;
+// for the renderer the same draw as the indexed one's, the patches counted from StartVertex.
+void D3DDevice_DrawTessellatedVertices_hook(u32 device, u32 primitive, u32 start_vertex, u32 patch_count) {
+  if (!Active())
+    return;
+  DrawCall call;
+  call.primitive = primitive;
+  call.tessellation = true;
+  call.indexed = false;
+  call.base_vertex = i32(start_vertex);
+  call.count = patch_count;
+  if (IsRecordingCommandBuffer(device))
+    RecordDraw(device, call, 0, 0);
+  else
+    QueueDraw(device, call, 0, 0);
+}
+
 // void D3DDevice_DrawVerticesUP(D3DDevice*, D3DPRIMITIVETYPE, UINT VertexCount,
 //                               const void *pVertexStreamZeroData, UINT Stride) [0x821FD698]
 void D3DDevice_DrawVerticesUP_hook(u32 device, u32 primitive, u32 vertex_count, u32 data,
@@ -689,6 +708,10 @@ BANJO_RENUT_HOOK(sub_8221E0F0, D3DDevice_DrawIndexedVertices_hook);  // D3DDevic
 // census: reg2102 / op22 x15456 in 10 s of gameplay, ~240 draws a frame). Its one caller (sub_82A82F10) passes
 // r4 = 18 (quad patch), r5 = 0, r6 the start index, r7 the patch count: the hook's arguments.
 BANJO_RENUT_HOOK(sub_82207C30, D3DDevice_DrawIndexedTessellatedVertices_hook);  // D3DDevice_DrawIndexedTessellatedVertices
+// fable2-nx (2026-11-15, the black ground): the non-indexed tessellated draw, sub_8221C9C8 (one patch a call from
+// sub_8221FD60: r4 = 18, r5 the start, r6 = 1), the rest of the ring census' DRAW_INDX (op22 with 2 words, x10228 in
+// 10 s with the indexed one hooked, ~140 a frame).
+BANJO_RENUT_HOOK(sub_8221C9C8, D3DDevice_DrawTessellatedVertices_hook);  // D3DDevice_DrawTessellatedVertices
 BANJO_RENUT_HOOK(sub_82265C98, D3DDevice_DrawVerticesUP_hook);  // D3DDevice_DrawVerticesUP  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_8222E168, D3DDevice_DrawIndexedVerticesUP_hook);  // D3DDevice_DrawIndexedVerticesUP  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess876_822060A0, D3DDevice_BeginVertices_hook);  // D3DDevice_BeginVertices  // fable2-nx: fable2-nx's table
