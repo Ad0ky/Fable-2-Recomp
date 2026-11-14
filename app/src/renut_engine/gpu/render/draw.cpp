@@ -5114,6 +5114,11 @@ u32 ControlPointFetchMask(u32 mask, u32 tessellation[4]) {
   return mask | (1u << bit);
 }
 
+}  // namespace (fable2-nx: the cvar at file scope)
+REXCVAR_DEFINE_INT32(fable2_renut_tess_max_segments, 64, "Banjo/Enhancements",
+                     "Fable 2 NX: the most segments per patch edge a tessellated draw is drawn with (1-64; 64 = the "
+                     "hardware's)");
+namespace {
 bool PrepareTessellation(const GuestDevice &device, const DrawCall &call, Geometry &g,
                          u32 tessellation[4]) {
   g_cp_fetch = {};
@@ -5184,10 +5189,24 @@ bool PrepareTessellation(const GuestDevice &device, const DrawCall &call, Geomet
     return false;
   constexpr u32 kMaxTessellatedVertices = 1u << 22;
   u32 segments = std::clamp(u32(std::ceil(level)), 1u, 64u);
+  // fable2-nx (2026-11-15, the 4-second frames once its tessellated draws were hooked): a cap on the segments per edge
+  // (fable2_renut_tess_max_segments; 64 = the hardware's, as before).
+  segments = std::min(segments, u32(std::clamp(REXCVAR_GET(fable2_renut_tess_max_segments), 1, 64)));
   const u32 per_segment = triangles ? 3 : 6;  // vertices per segment^2
   while (segments > 1 &&
          uint64_t(patches) * segments * segments * per_segment > kMaxTessellatedVertices)
     --segments;
+  {  // fable2-nx (2026-11-15): what the patch draws ask for (the first 24, then one in 4096)
+    static uint64_t seen = 0;
+    if (seen < 24 || (seen & 4095) == 0)
+      RGPU_INFO("[tess] {} {}: {} patches from {}, mode {}, levels {} to {} -> {} segments, {} vertices a patch (vertex "
+                "shader {:08X}, pixel shader {:08X})", triangles ? "triangle" : "quad", call.indexed ? "indexed" : "auto",
+                patches, call.base_vertex, device.U32(d3d::kDeviceOffsetTessellationControl) & 3,
+                device.F32(d3d::kDeviceOffsetMinTessellationLevel), device.F32(d3d::kDeviceOffsetMaxTessellationLevel),
+                segments, segments * segments * per_segment, device.U32(d3d::kDeviceOffsetVertexShader),
+                device.U32(d3d::kDeviceOffsetPixelShader));
+    ++seen;
+  }
 
   g.vertex_count = segments * segments * per_segment;
   g.instance_count = patches;
