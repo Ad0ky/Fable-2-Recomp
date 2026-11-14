@@ -91,6 +91,7 @@ struct HostTexture {
   // interval its last deferred upload read the guest bytes in (a dynamic texture is not uploaded again while none
   // was written since).
   uint64_t last_hash = 0;
+  uint64_t lock_seen = 0;  // fable2-nx (2026-11-14): the last NoteTextureLockRange serial its check took in
   uint64_t hash_interval = UINT64_MAX;
   uint64_t read_interval = UINT64_MAX;
   uint64_t trace_frame = UINT64_MAX;  // banjo-nx: banjo_renut_diag_resolve_trace's frame
@@ -204,6 +205,13 @@ inline uint64_t TextureFrameLocked() { return g_texture_frame; }
 // D3D::UnlockResource: the CPU has written the resource at 'resource_va'. Any
 // thread; does not need State().mutex.
 void NoteTextureUnlocked(u32 resource_va);
+
+// fable2-nx (2026-11-14, the logo blinking): a CPU lock of a texture's memory (LockResource), by physical range. A tiled
+// texture whose guest extent a lock overlapped since its last check is hashed whole (ContentHash) instead of by
+// SampleHash's ends and eight probes, which missed the video decoder's new frames (most of the bright frames' texels
+// are the same white): the older frame was drawn again. Any thread.
+void NoteTextureLockRange(u32 resource, u32 guest_address, u32 size);
+void NoteTextureUnlockRange(u32 resource);  // the same range again at its unlock
 
 // Reads the guest data of uploads recorded with a deferred read (linear
 // textures) into their staging memory. Before the command list is submitted.

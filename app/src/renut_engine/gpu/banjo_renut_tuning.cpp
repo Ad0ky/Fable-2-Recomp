@@ -2246,18 +2246,33 @@ namespace {
 std::chrono::steady_clock::time_point g_trace_last{};
 }  // namespace
 
+// fable2-nx (2026-11-14, the logo blinking): the period and how many frames in a row are traced (30 s and 1 before), so
+// a bright and a dark frame of the blinking come out together.
+REXCVAR_DEFINE_INT32(banjo_renut_diag_resolve_trace_s, 30, "Banjo/Diagnostics",
+                     "With banjo_renut_diag_resolve_trace: seconds between traced frames")
+    .range(1, 3600);
+REXCVAR_DEFINE_INT32(banjo_renut_diag_resolve_trace_frames, 1, "Banjo/Diagnostics",
+                     "With banjo_renut_diag_resolve_trace: frames traced in a row each time")
+    .range(1, 16);
+
 void ResolveTraceFrameStart() {
+  static int left = 0;  // frames still to trace in this run
   if (!REXCVAR_GET(banjo_renut_diag_resolve_trace)) {
     g_trace_frame.store(false, std::memory_order_relaxed);
     return;
   }
   const auto now = std::chrono::steady_clock::now();
   if (g_trace_frame.load(std::memory_order_relaxed)) {
-    g_trace_frame.store(false, std::memory_order_relaxed);
     REXLOG_INFO("[trace] frame end");
+    if (--left > 0) {
+      REXLOG_INFO("[trace] frame start (next in a row)");
+      return;
+    }
+    g_trace_frame.store(false, std::memory_order_relaxed);
   } else if (g_trace_last == std::chrono::steady_clock::time_point{} ||
-             now - g_trace_last >= std::chrono::seconds(30)) {
+             now - g_trace_last >= std::chrono::seconds(REXCVAR_GET(banjo_renut_diag_resolve_trace_s))) {
     g_trace_last = now;
+    left = REXCVAR_GET(banjo_renut_diag_resolve_trace_frames);
     g_trace_frame.store(true, std::memory_order_relaxed);
     REXLOG_INFO("[trace] frame start");
   }

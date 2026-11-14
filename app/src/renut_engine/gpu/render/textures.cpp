@@ -310,10 +310,44 @@ bool ExtentClean(HostTexture &t, uint64_t proven) {
   return clean;
 }
 
+// fable2-nx (2026-11-14, NoteTextureLockRange): the last 64 texture locks' physical ranges, by serial.
+struct LockRange {
+  std::atomic<uint32_t> first{0}, end{0};  // physical bytes [first, end)
+  std::atomic<uint32_t> resource{0};       // the locked resource (its unlock notes the range again)
+  std::atomic<uint64_t> serial{0};
+};
+LockRange g_lock_ranges[64];
+std::atomic<uint64_t> g_lock_serial{0};
+
+// Whether a lock since the texture's last check overlapped its guest extent; takes the current serial.
+bool LockedSinceCheck(HostTexture &t) {
+  const uint64_t now = g_lock_serial.load(std::memory_order_acquire);
+  if (now == t.lock_seen)
+    return false;
+  const uint64_t seen = t.lock_seen;
+  t.lock_seen = now;
+  for (const LockRange &r : g_lock_ranges) {
+    const uint64_t serial = r.serial.load(std::memory_order_acquire);
+    if (serial <= seen || serial > now)
+      continue;
+    const uint32_t first = r.first.load(std::memory_order_relaxed), end = r.end.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < 2; ++i) {
+      const uint32_t a = t.sample_pages[i] << 12, n = t.sample_sizes[i];
+      if (n && a < end && first < a + n)
+        return true;
+    }
+  }
+  return false;
+}
+
 // The content check's hash (SampleHash of a tiled texture, ContentHash of a linear one), or the last one taken when
 // the cards prove the bytes unchanged since: then the bytes are those hashed, and so would the hash be.
 uint64_t CheckedHash(const TextureFetch &fetch, HostTexture &t, bool sampled) {
   KnowGuestExtent(fetch, t);
+  if (sampled && LockedSinceCheck(t)) [[unlikely]] {  // fable2-nx (2026-11-14): a CPU lock wrote it: the whole hash
+    sampled = false;
+    t.hash_interval = UINT64_MAX;  // no card proof for this check
+  }
   const bool cards = banjo::renut_gpu::StoreCardsOn();
   if (cards && ExtentClean(t, t.hash_interval)) {
     t.hash_interval = CardsInterval();
@@ -1272,7 +1306,38 @@ void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size) {
     ReleaseHostTextureLocked(va);
 }
 
+void NoteTextureLockRange(u32 resource, u32 guest_address, u32 size) {
+  if (!size)
+    return;
+  const uint32_t first = guest_address & 0x1FFFFFFFu;  // the physical address of any of its views
+  const uint64_t serial = g_lock_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+  LockRange &r = g_lock_ranges[serial & 63];
+  r.serial.store(0, std::memory_order_relaxed);
+  r.first.store(first, std::memory_order_relaxed);
+  r.end.store(first + size, std::memory_order_relaxed);
+  r.resource.store(resource, std::memory_order_relaxed);
+  r.serial.store(serial, std::memory_order_release);
+}
+
+// At the unlock the CPU is done writing: the range of the resource's latest lock is noted again, so a check that ran
+// between the lock and the end of the writes is followed by a whole hash of the finished data.
+void NoteTextureUnlockRange(u32 resource) {
+  uint64_t best = 0;
+  uint32_t first = 0, end = 0;
+  for (const LockRange &r : g_lock_ranges) {
+    const uint64_t serial = r.serial.load(std::memory_order_acquire);
+    if (serial > best && r.resource.load(std::memory_order_relaxed) == resource) {
+      best = serial;
+      first = r.first.load(std::memory_order_relaxed);
+      end = r.end.load(std::memory_order_relaxed);
+    }
+  }
+  if (best && end > first)
+    NoteTextureLockRange(resource, first, end - first);
+}
+
 void NoteTextureUnlocked(u32 resource_va) {
+  NoteTextureUnlockRange(resource_va);  // fable2-nx (2026-11-14)
   std::lock_guard lock(g_unlocked_mutex);
   g_unlocked.push_back(resource_va);
 }
