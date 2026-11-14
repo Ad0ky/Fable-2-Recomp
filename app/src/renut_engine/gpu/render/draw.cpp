@@ -13327,14 +13327,110 @@ std::vector<ResolveReadback> g_resolve_readbacks[kFramesInFlight];
 plume::RenderBuffer *g_resolve_readback_buffer[kFramesInFlight] = {};  // kept until exit
 uint64_t g_resolve_readbacks_done = 0;
 
-bool ReadbackDestination(const HostTexture *dest) {
+bool TexelReadbackDestination(const HostTexture *dest) {
   return banjo::renut_gpu::ResolveReadbackOn() && dest && dest->width == 1 && dest->height == 1 &&
          dest->host_format == plume::RenderFormat::R32_FLOAT;
+}
+
+// fable2-nx (2026-11-14, the logo blinking): a 2D texture of 32-bit texels the game's CPU locks read-only (textures.h
+// NoteTextureCpuRead), at the resolve's own scale: its resolve is copied whole to the slot's readback buffer and written to
+// its guest memory in the guest's layout (tiled or linear, the header's byte order) when the slot's fence is waited.
+// Fable 2's 280x180 32_FLOAT luminance, which its CPU reads for the exposure.
+constexpr uint64_t kSurfaceReadbackBytes = 4u << 20;  // a slot's buffer; 280x180 takes 202 KB
+struct SurfaceReadback {
+  u32 guest_pa, offset, width, height, row_texels, pitch_texels;
+  bool tiled;
+  u32 endian;
+};
+std::vector<SurfaceReadback> g_surface_readbacks[kFramesInFlight];
+plume::RenderBuffer *g_surface_readback_buffer[kFramesInFlight] = {};  // kept until exit
+uint64_t g_surface_readback_used[kFramesInFlight] = {};
+uint64_t g_surface_readbacks_done = 0;
+
+bool SurfaceReadbackDestination(const HostTexture *dest) {
+  if (!banjo::renut_gpu::ResolveReadbackOn() || !dest || !dest->guest_va || TexelReadbackDestination(dest))
+    return false;
+  const bool four_bytes = dest->host_format == plume::RenderFormat::R32_FLOAT ||
+                          dest->host_format == plume::RenderFormat::R32_UINT ||
+                          dest->host_format == plume::RenderFormat::R8G8B8A8_UNORM;
+  return four_bytes && dest->dimension == TextureDimension::Tex2D && !dest->stacked && dest->scale.code == 0 &&
+         dest->width && dest->height && TextureCpuRead(dest->guest_va);
+}
+
+bool ReadbackDestination(const HostTexture *dest) {
+  return TexelReadbackDestination(dest) || SurfaceReadbackDestination(dest);
+}
+
+void QueueSurfaceReadbackLocked(VideoState &s, HostTexture *dest) {
+  const u32 w = dest->width, h = dest->height;
+  const u32 row_texels = (w + 63) & ~63u;  // 256-byte rows
+  const uint64_t bytes = uint64_t(row_texels) * h * 4;
+  uint64_t &used = g_surface_readback_used[s.frame];
+  if (g_surface_readbacks[s.frame].empty())
+    used = 0;
+  if (used + bytes > kSurfaceReadbackBytes)
+    return;
+  plume::RenderBuffer *&buffer = g_surface_readback_buffer[s.frame];
+  if (!buffer)
+    buffer = s.device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(kSurfaceReadbackBytes)).release();
+  if (!buffer)
+    return;
+  const u32 offset = u32(used);
+  used += (bytes + 511) & ~uint64_t(511);
+  TransitionTextureLocked(dest, plume::RenderTextureLayout::COPY_SOURCE);
+  const plume::RenderBox box(0, 0, w, h);
+  s.command_list->copyTextureRegion(
+      plume::RenderTextureCopyLocation::PlacedFootprint(buffer, dest->host_format, w, h, 1, row_texels, offset),
+      plume::RenderTextureCopyLocation::Subresource(dest->texture.get()), 0, 0, 0, &box);
+  TransitionTextureLocked(dest, plume::RenderTextureLayout::SHADER_READ);
+  const u32 pitch = ((dest->desc[0] >> 22) & 0x1FFu) << 5;
+  g_surface_readbacks[s.frame].push_back({dest->base_page << 12, offset, w, h, row_texels, pitch ? pitch : (w + 31) & ~31u,
+                                          (dest->desc[0] >> 31) != 0, (dest->desc[1] >> 6) & 3u});
+  g_bound.framebuffer = nullptr;  // the copy ends any render pass
+}
+
+void CompleteSurfaceReadbacksLocked(uint32_t slot) {
+  std::vector<SurfaceReadback> &list = g_surface_readbacks[slot];
+  if (list.empty())
+    return;
+  plume::RenderBuffer *buffer = g_surface_readback_buffer[slot];
+  const plume::RenderRange range(0, kSurfaceReadbackBytes);
+  if (const auto *data = buffer ? static_cast<const u8 *>(buffer->map(0, &range)) : nullptr) {
+    for (const SurfaceReadback &r : list) {
+      u8 *guest = GuestPhysicalPtr<u8>(r.guest_pa);
+      if (!guest)
+        continue;
+      for (u32 y = 0; y < r.height; ++y) {
+        const u8 *row = data + r.offset + uint64_t(y) * r.row_texels * 4;
+        for (u32 x = 0; x < r.width; ++x) {
+          u32 v;
+          std::memcpy(&v, row + x * 4, 4);
+          switch (r.endian) {
+          case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;  // 8in16
+          case 2: v = __builtin_bswap32(v); break;                                // 8in32
+          case 3: v = (v << 16) | (v >> 16); break;                               // 16in32
+          default: break;
+          }
+          const u32 at = r.tiled ? TiledOffset2D(x, y, r.pitch_texels, 2) : (y * r.pitch_texels + x) * 4;
+          std::memcpy(guest + at, &v, 4);
+        }
+      }
+      if (g_surface_readbacks_done++ < 4 || (g_surface_readbacks_done & 0x3FF) == 0)
+        RGPU_INFO("[renut] surface readback {}: {}x{} to guest {:08X} ({}, endian {}; fable2-nx resolve readback)",
+                  g_surface_readbacks_done, r.width, r.height, r.guest_pa, r.tiled ? "tiled" : "linear", r.endian);
+    }
+    buffer->unmap();
+  }
+  list.clear();
 }
 
 void QueueResolveReadbackLocked(VideoState &s, HostTexture *dest, uint32_t slice, uint32_t z, u32 level) {
   if (!ReadbackDestination(dest) || !dest->texture || slice || z || level || !dest->base_page)
     return;
+  if (SurfaceReadbackDestination(dest)) {  // fable2-nx (2026-11-14)
+    QueueSurfaceReadbackLocked(s, dest);
+    return;
+  }
   std::vector<ResolveReadback> &list = g_resolve_readbacks[s.frame];
   if (list.size() >= kReadbackCount)
     return;
@@ -13398,6 +13494,7 @@ void QueueResolveReadbackLocked(VideoState &s, HostTexture *dest, uint32_t slice
 }
 
 void CompleteResolveReadbacksLocked(uint32_t slot) {
+  CompleteSurfaceReadbacksLocked(slot);  // fable2-nx (2026-11-14)
   std::vector<ResolveReadback> &list = g_resolve_readbacks[slot];
   if (list.empty())
     return;

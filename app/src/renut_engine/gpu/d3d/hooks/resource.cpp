@@ -655,7 +655,9 @@ u32 LockResource(u32 resource, u32 mip_lock, u32 base_address, u32 mip_address, 
                 common & 0xF, address, size, flags);
   }
   if ((common & 0xF) == 3 || (common & 0xF) == 4)
-    NoteTextureLockRange(resource, address, size);  // fable2-nx (2026-11-14): a tiled texture it overlaps is hashed whole
+    NoteTextureLockRange(resource, address, size);
+  if ((common & 0xF) == 3 && (flags & 0x10))
+    NoteTextureCpuRead(resource);  // fable2-nx (2026-11-14): its resolves are written back (render/draw.cpp)  // fable2-nx (2026-11-14): a tiled texture it overlaps is hashed whole
   u32 fenced = resource;
   if ((common & 0xF) == 4 && (common & 0x40000000u) && u32(r[6]))
     fenced = r[6];  // a texture level: its texture

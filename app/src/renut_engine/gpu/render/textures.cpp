@@ -1336,6 +1336,36 @@ void NoteTextureUnlockRange(u32 resource) {
     NoteTextureLockRange(resource, first, end - first);
 }
 
+namespace {
+std::atomic<uint32_t> g_cpu_read_textures[32];
+}  // namespace
+
+void NoteTextureCpuRead(u32 resource_va) {
+  if (!resource_va || TextureCpuRead(resource_va))
+    return;
+  for (std::atomic<uint32_t> &slot : g_cpu_read_textures) {
+    uint32_t expected = 0;
+    if (slot.compare_exchange_strong(expected, resource_va, std::memory_order_acq_rel)) {
+      RGPU_INFO("[renut] texture {:08X} is read by the CPU: its resolves are written back to guest memory "
+                "(fable2-nx resolve readback)", resource_va);
+      return;
+    }
+    if (expected == resource_va)
+      return;
+  }
+}
+
+bool TextureCpuRead(u32 resource_va) {
+  for (const std::atomic<uint32_t> &slot : g_cpu_read_textures) {
+    const uint32_t v = slot.load(std::memory_order_acquire);
+    if (v == resource_va)
+      return true;
+    if (!v)
+      return false;
+  }
+  return false;
+}
+
 void NoteTextureUnlocked(u32 resource_va) {
   NoteTextureUnlockRange(resource_va);  // fable2-nx (2026-11-14)
   std::lock_guard lock(g_unlocked_mutex);

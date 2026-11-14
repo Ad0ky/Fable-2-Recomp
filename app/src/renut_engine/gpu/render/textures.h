@@ -213,6 +213,14 @@ void NoteTextureUnlocked(u32 resource_va);
 void NoteTextureLockRange(u32 resource, u32 guest_address, u32 size);
 void NoteTextureUnlockRange(u32 resource);  // the same range again at its unlock
 
+// fable2-nx (2026-11-14, the logo blinking): textures the game's CPU locks read-only (LockResource, flag 0x10). Fable 2
+// resolves its 280x180 32_FLOAT scene luminance into two of them in turn and reads them back on the CPU for the
+// exposure; Renut wrote no resolve back to guest memory but sasrt-nx's 1x1 one, so the CPU read stale memory and the
+// exposure jumped from frame to frame. A resolve into such a texture is written back to it (render/draw.cpp,
+// QueueResolveReadbackLocked). Any thread.
+void NoteTextureCpuRead(u32 resource_va);
+bool TextureCpuRead(u32 resource_va);
+
 // Reads the guest data of uploads recorded with a deferred read (linear
 // textures) into their staging memory. Before the command list is submitted.
 void FlushTextureFillsLocked();
