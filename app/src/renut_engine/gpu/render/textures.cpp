@@ -1309,7 +1309,9 @@ void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size) {
 void NoteTextureLockRange(u32 resource, u32 guest_address, u32 size) {
   if (!size)
     return;
-  const uint32_t first = guest_address & 0x1FFFFFFFu;  // the physical address of any of its views
+  // The physical address of any of its views; the 0xE0000000 view is a page ahead (the store cards' 0xE0000 + page - 1:
+  // the game's F6856000 lock is physical 16857000, where its resolve readback lands).
+  const uint32_t first = guest_address >= 0xE0000000u ? guest_address - 0xE0000000u + 0x1000u : guest_address & 0x1FFFFFFFu;
   const uint64_t serial = g_lock_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
   LockRange &r = g_lock_ranges[serial & 63];
   r.serial.store(0, std::memory_order_relaxed);
