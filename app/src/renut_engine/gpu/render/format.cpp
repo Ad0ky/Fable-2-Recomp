@@ -9,6 +9,17 @@
 
 #include <cstring>
 
+#include <rex/cvar.h>
+
+// fable2-nx (2026-11-14, the sky): k_16_EXPAND, k_16_16_EXPAND and k_16_16_16_16_EXPAND read as half floats, as the SDK's
+// renderers read them (src/graphics/d3d12 and vulkan texture_cache.cpp: R16*_FLOAT). Renut read them as 16-bit unorm /
+// snorm: the half floats' bits as integers, garbage colours (Fable 2's 64x1 16_16_16_16_EXPAND ramp; the 'format 29 (?)'
+// line). Off: as before.
+REXCVAR_DEFINE_BOOL(fable2_renut_expand_as_half, true, "Banjo/Enhancements",
+                    "Fable 2 NX: the Xenos 16_EXPAND, 16_16_EXPAND and 16_16_16_16_EXPAND texture formats are read as "
+                    "half floats, as the reference renderers read them. Off: as 16-bit unorm / snorm (Renut before)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace renut::gpu {
 
 // sasrt-nx (2026-11-11, port 75; its formats batch, row 38 and the diagnostic): the 32-bit float formats the Xenos
@@ -30,6 +41,9 @@ const char *GpuTextureFormatName(u32 format) {
   case 23: return "24_8_FLOAT (D24FS8)";
   case 25: return "16_16";
   case 26: return "16_16_16_16";
+  case 27: return "16_EXPAND";
+  case 28: return "16_16_EXPAND";
+  case 29: return "16_16_16_16_EXPAND";
   case 31: return "16_16_FLOAT";
   case 32: return "16_16_16_16_FLOAT";
   case 36: return "32_FLOAT";
@@ -273,14 +287,23 @@ TextureFormatInfo GetTextureFormatInfo(GpuTextureFormat format, bool is_signed) 
   case T::Fmt24_8:
   case T::Fmt24_8_Float:
     return expand(F::R32_FLOAT, C::Depth24, 4, 4);
-  case T::Fmt16:
   case T::Fmt16_Expand:
+    if (REXCVAR_GET(fable2_renut_expand_as_half))  // fable2-nx (2026-11-14)
+      return plain(F::R16_FLOAT, 2);
+    [[fallthrough]];
+  case T::Fmt16:
     return plain(is_signed ? F::R16_SNORM : F::R16_UNORM, 2);
-  case T::Fmt16_16:
   case T::Fmt16_16_Expand:
+    if (REXCVAR_GET(fable2_renut_expand_as_half))
+      return plain(F::R16G16_FLOAT, 4);
+    [[fallthrough]];
+  case T::Fmt16_16:
     return plain(is_signed ? F::R16G16_SNORM : F::R16G16_UNORM, 4);
-  case T::Fmt16_16_16_16:
   case T::Fmt16_16_16_16_Expand:
+    if (REXCVAR_GET(fable2_renut_expand_as_half))
+      return plain(F::R16G16B16A16_FLOAT, 8);
+    [[fallthrough]];
+  case T::Fmt16_16_16_16:
     return plain(is_signed ? F::R16G16B16A16_SNORM : F::R16G16B16A16_UNORM, 8);
   case T::Fmt16_Float:
     return plain(F::R16_FLOAT, 2);
