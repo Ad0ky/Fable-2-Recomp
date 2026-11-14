@@ -682,7 +682,13 @@ BANJO_RENUT_HOOK_RAW(sub_82221978) {
 
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess841_8221C518, D3DDevice_DrawVertices_hook);  // D3DDevice_DrawVertices  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_8221E0F0, D3DDevice_DrawIndexedVertices_hook);  // D3DDevice_DrawIndexedVertices  // fable2-nx: fable2-nx's table
-BANJO_RENUT_UNHOOKED_HOOK(sub_824DA9C0, D3DDevice_DrawIndexedTessellatedVertices_hook);  // D3DDevice_DrawIndexedTessellatedVertices  // fable2-nx: not hooked: fable2-nx's table (unhooked there)
+// fable2-nx (2026-11-14, the missing ground and snow): Fable 2's D3DDevice_DrawIndexedTessellatedVertices is sub_82207C30
+// (fable2-nx's hook map had it at 0.79, too low to bind). Its body sets the tessellator words (+10612, +10632..+10656),
+// flushes the dirty register blocks and writes VGT_INDX_OFFSET (0x2102) and DRAW_INDX (0xC0032201, quad patches, in
+// 65535-patch chunks) into the ring: unhooked, every such draw went to the ring sink, which reNut never reads (the ring
+// census: reg2102 / op22 x15456 in 10 s of gameplay, ~240 draws a frame). Its one caller (sub_82A82F10) passes
+// r4 = 18 (quad patch), r5 = 0, r6 the start index, r7 the patch count: the hook's arguments.
+BANJO_RENUT_HOOK(sub_82207C30, D3DDevice_DrawIndexedTessellatedVertices_hook);  // D3DDevice_DrawIndexedTessellatedVertices
 BANJO_RENUT_HOOK(sub_82265C98, D3DDevice_DrawVerticesUP_hook);  // D3DDevice_DrawVerticesUP  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(sub_8222E168, D3DDevice_DrawIndexedVerticesUP_hook);  // D3DDevice_DrawIndexedVerticesUP  // fable2-nx: fable2-nx's table
 BANJO_RENUT_HOOK(ProcessAndProcessAndProcess876_822060A0, D3DDevice_BeginVertices_hook);  // D3DDevice_BeginVertices  // fable2-nx: fable2-nx's table
