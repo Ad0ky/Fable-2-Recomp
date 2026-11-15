@@ -9354,6 +9354,10 @@ void DrawLog(const DrawCall &call, const Geometry &geometry, const ShaderRecord 
             c0 ? int(c0->format) : -1, targets.color_count, targets.depth ? int(targets.depth->format) : -1,
             key.depth_control, key.blend_control[0], key.color_mask, key.alpha_to_coverage, sc.vertex_fetch_bytes,
             export_count);
+  if (call.primitive == kPointList)  // fable2-nx (2026-11-15, the big snowflakes): what point_sprite_gs sizes them by
+    RGPU_INFO("[drawlog]   points: width {} height {} min {} max {} (pixels), viewport {}x{}, resolution scale {}",
+              sc.point_state[0], sc.point_state[1], sc.point_state[2], sc.point_state[3], sc.viewport_size[0],
+              sc.viewport_size[1], sc.resolution_scale);
 }
 
 #if defined(PLUME_DEKO3D)
