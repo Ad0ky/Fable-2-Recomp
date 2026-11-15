@@ -88,6 +88,33 @@ REXCVAR_DEFINE_INT32(banjo_renut_diag_draw_log_s, 0, "Banjo/Renut",
                      "([drawlog]: shaders, counts, target, state; 0 = off)");
 REXCVAR_DEFINE_STRING(banjo_renut_diag_blend_skip_exclude, "", "Banjo/Renut",
                       "Diagnostic: pixel shader hashes (hex, comma separated) banjo_gpu_blend_skip leaves alone");
+// fable2-nx (2026-11-15, the slow cutscene): draws with these pixel shaders are not drawn, to see what the frame rate
+// does to the game's speed without them (Fable 2's snow, PS EF43ABE324F6E039, is ~32 of ~72 ms).
+REXCVAR_DEFINE_STRING(fable2_diag_skip_ps, "", "Banjo/Renut",
+                      "Diagnostic: pixel shader hashes (hex, comma separated) whose draws are not drawn");
+namespace {
+bool DiagSkipPs(uint64_t h) {
+  static const std::vector<uint64_t> list = [] {
+    std::vector<uint64_t> v;
+    const std::string text = REXCVAR_GET(fable2_diag_skip_ps);
+    size_t at = 0;
+    while (at < text.size()) {
+      size_t end = text.find(',', at);
+      if (end == std::string::npos)
+        end = text.size();
+      const std::string item = text.substr(at, end - at);
+      if (item.find_first_not_of(" \t") != std::string::npos)
+        v.push_back(std::stoull(item, nullptr, 16));
+      at = end + 1;
+    }
+    return v;
+  }();
+  for (const uint64_t x : list)
+    if (x == h)
+      return true;
+  return false;
+}
+}  // namespace
 
 // banjo-nx (2026-10-20, from sa2-nx): see DrawStateLocked.
 REXCVAR_DEFINE_BOOL(banjo_renut_chain_reuse, true, "Banjo/Enhancements",
@@ -10428,6 +10455,8 @@ int FastDrawLocked(const u8 *device_state, const DrawCall &call, const ReplayCon
       if (h == 0x2F36770769087F99ull || h == 0xC92BA80672FB9774ull || h == 0xB3C10F3D80EF61E2ull ||
           h == 0xD40EBF0336F89333ull)
         return FastMiss(kFastSpecial);  // the fur family: shells and skinning stay DrawStateLocked's
+      if (DiagSkipPs(h))
+        return FastMiss(kFastSpecial);  // fable2-nx (2026-11-15, fable2_diag_skip_ps): DrawStateLocked leaves it out
     }
   } else if (!f.shaders_fast) {
     return FastMiss(kFastSpecial);
@@ -12292,6 +12321,8 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   // show 00708734, 00700040 and 00700060 only.
   if (targets.depth && targets.color_count && targets.depth->scale != targets.scale)
     DropSmallerDepth(device, targets, vs->hash, ps ? ps->hash : 0);
+  if (ps && DiagSkipPs(ps->hash))  // fable2-nx (2026-11-15, fable2_diag_skip_ps)
+    return true;
   // banjo-nx (2026-10-20, NOT exact, banjo_renut_fur_shells = N > 1, the user's call): the fur family's meshes are drawn
   // once a shell, shell by shell (each shell draws every part of the body: RenderDoc of Ryujinx shows the same four
   // parts repeating); of each part's draws in a frame (the same shaders and index range) every Nth is drawn, the first
