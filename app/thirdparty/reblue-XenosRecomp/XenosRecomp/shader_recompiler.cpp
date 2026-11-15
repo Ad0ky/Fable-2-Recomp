@@ -2686,6 +2686,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         uint32_t target = 0;
     };
     std::vector<CfSummary> cfSummaries;
+    // fable2-nx (2026-11-15): each conditional jump's test (predicate or bool constant, and its sense), and the jumps
+    // whose test is known true where they stand (see below).
+    struct CfJumpTest
+    {
+        bool predicated = false;
+        uint32_t boolAddress = 0;
+        uint32_t condition = 0;
+    };
+    std::unordered_map<uint32_t, CfJumpTest> cfJumpTests;
+    std::set<uint32_t> knownTakenJumps;
+    std::set<uint32_t> cfWritesPredicate;  // exec blocks with an ALU instruction that writes p0 (SETP*)
     std::vector<uint32_t> loopStarts;
     std::unordered_map<uint32_t, uint32_t> loopEndFor;
     uint32_t cfIndex = 0;
@@ -2744,12 +2755,32 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 cfSummaries.push_back({
                     cfInstr.condJmp.isUnconditional ? CfKind::Uncond : CfKind::Cond,
                     uint32_t(cfInstr.condJmp.address) });
+                if (!cfInstr.condJmp.isUnconditional)
+                    cfJumpTests[cfIndex] = { bool(cfInstr.condJmp.isPredicated), uint32_t(cfInstr.condJmp.boolAddress),
+                                             uint32_t(cfInstr.condJmp.condition) };
                 break;
             }
             }
 
             if (cfSummaries.size() == cfIndex)
                 cfSummaries.push_back({});
+            if (address != 0)  // fable2-nx: an exec block; does it write the predicate?
+            {
+                const uint32_t execCount = cfInstr.exec.count, execSequence = cfInstr.exec.sequence;
+                for (uint32_t n = 0; n < execCount; ++n)
+                {
+                    if ((execSequence >> (2 * n)) & 1)
+                        continue;  // a fetch
+                    const be<uint32_t>* alu = code + (address + n) * 3;
+                    const uint32_t scalarOp = uint32_t(alu[0]) >> 26, vectorOp = (uint32_t(alu[2]) >> 24) & 31;
+                    if ((scalarOp >= uint32_t(AluScalarOpcode::SetpEq) && scalarOp <= uint32_t(AluScalarOpcode::SetpRstr)) ||
+                        (vectorOp >= uint32_t(AluVectorOpcode::SetpEqPush) && vectorOp <= uint32_t(AluVectorOpcode::SetpGePush)))
+                    {
+                        cfWritesPredicate.insert(cfIndex);
+                        break;
+                    }
+                }
+            }
 
             if (address != 0)
                 instrSize = std::min<uint32_t>(instrSize, address * 12);
@@ -2763,6 +2794,59 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     if (!loopStarts.empty())
         simpleControlFlow = false;
+
+    // fable2-nx (2026-11-15, Fable 2's 1 MB shaders): "i: cjmp !p0, j+1; [exec blocks]; j: cjmp p0, B": jump j is reached
+    // only through i's fall-through (no other jump lands in i+1..j), where p0 is known set unless an exec block between
+    // them writes it (SETP*), so j is an unconditional jump: the Xbox 360 compiler's form of "if (!p0) { .. }" when the
+    // then-block ends where the else would. The structurizer took j for a conditional jump out of its region and sent the
+    // whole shader to the switch(pc) state machine: 9 of Fable's 130 shaders, among them the terrain pixel shader
+    // 189401DA (26 control flow instructions, 44499 Maxwell instructions, 255 registers, 52 KB of scratch) and the
+    // 1.1 MB vertex shader C6F41EDC. The same for a bool constant tested with opposite senses (nothing writes those).
+    {
+        std::unordered_map<uint32_t, std::vector<uint32_t>> jumpsInto;
+        for (uint32_t k = 0; k < cfSummaries.size(); ++k)
+            if (cfSummaries[k].kind == CfKind::Cond || cfSummaries[k].kind == CfKind::Uncond)
+                jumpsInto[cfSummaries[k].target].push_back(k);
+        for (uint32_t j = 1; j < cfSummaries.size(); ++j)
+        {
+            const auto b = cfJumpTests.find(j);
+            if (cfSummaries[j].kind != CfKind::Cond || b == cfJumpTests.end())
+                continue;
+            int64_t i = int64_t(j) - 1;
+            bool clean = true;
+            while (i >= 0 && cfSummaries[size_t(i)].kind == CfKind::None)
+            {
+                if (b->second.predicated && cfWritesPredicate.count(uint32_t(i)))
+                {
+                    clean = false;
+                    break;
+                }
+                --i;
+            }
+            if (!clean || i < 0)
+                continue;
+            const auto a = cfJumpTests.find(uint32_t(i));
+            if (cfSummaries[size_t(i)].kind != CfKind::Cond || a == cfJumpTests.end() || cfSummaries[size_t(i)].target != j + 1)
+                continue;
+            const bool sameTest = a->second.predicated == b->second.predicated &&
+                                  (a->second.predicated || a->second.boolAddress == b->second.boolAddress);
+            if (!sameTest || a->second.condition == b->second.condition)
+                continue;
+            bool onlyFallThrough = true;
+            for (uint32_t t = uint32_t(i) + 1; t <= j && onlyFallThrough; ++t)
+            {
+                const auto in = jumpsInto.find(t);
+                if (in != jumpsInto.end())
+                    for (uint32_t from : in->second)
+                        if (from != uint32_t(i))
+                            onlyFallThrough = false;
+            }
+            if (!onlyFallThrough)
+                continue;
+            cfSummaries[j].kind = CfKind::Uncond;
+            knownTakenJumps.insert(j);
+        }
+    }
 
     if (simpleControlFlow)
     {
@@ -3130,7 +3214,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             case ControlFlowOpcode::CondJmp:
             {
-                if (cfInstr.condJmp.isUnconditional)
+#ifdef RENUT_RECOMP
+                const bool knownTaken = simpleControlFlow && knownTakenJumps.count(pc - 1) != 0;  // fable2-nx
+#else
+                const bool knownTaken = false;
+#endif
+                if (cfInstr.condJmp.isUnconditional || knownTaken)
                 {
                     // Structured mode: the then-branch exit jump was consumed by
                     // the "} else {" emitted at the next instruction.
