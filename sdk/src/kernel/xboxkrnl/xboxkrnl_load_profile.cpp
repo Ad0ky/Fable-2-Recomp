@@ -29,6 +29,32 @@
 #include <tlhelp32.h>
 #include <dbghelp.h>
 #endif
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+
+namespace {
+// fable2-nx (2026-11-15): std::thread::detach throws (ENOSYS, std::terminate) on the Switch: diag_load_profile's and
+// faster_loading's threads crashed the game at its first wait. A pthread there; std::thread elsewhere.
+void StartDetachedThread(void (*fn)()) {
+#ifdef _WIN32
+  std::thread(fn).detach();
+#else
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 256 * 1024);
+  pthread_t thread;
+  pthread_create(
+      &thread, &attr,
+      [](void *arg) -> void * {
+        reinterpret_cast<void (*)()>(arg)();
+        return nullptr;
+      },
+      reinterpret_cast<void *>(fn));
+  pthread_attr_destroy(&attr);
+#endif
+}
+}  // namespace
 
 REXCVAR_DEFINE_BOOL(faster_loading, false, "Kernel",
                     "EXPERIMENTAL, off by default. Shortens game loads by running the guest "
@@ -180,7 +206,7 @@ ThreadStats* Stats() {
     t_stats = stats;
     bool expected = false;
     if (g_reporter_started.compare_exchange_strong(expected, true)) {
-      std::thread(ReporterMain).detach();
+      StartDetachedThread(ReporterMain);
     }
   }
   return t_stats;
@@ -489,7 +515,7 @@ void ReporterMain() {
       if (ActiveNow()) {
         bool expected_monitor = false;
         if (g_monitor_started.compare_exchange_strong(expected_monitor, true)) {
-          std::thread(WaitMonitorMain).detach();
+          StartDetachedThread(WaitMonitorMain);
         }
       }
       continue;
@@ -568,7 +594,7 @@ void ReporterMain() {
 
     bool expected_monitor = false;
     if (g_monitor_started.compare_exchange_strong(expected_monitor, true)) {
-      std::thread(WaitMonitorMain).detach();
+      StartDetachedThread(WaitMonitorMain);
     }
     double guest_cpu_total = 0.0;
     for (const Row& row : rows) {
@@ -615,7 +641,7 @@ void ReporterMain() {
     }
     bool expected_sampler = false;
     if (g_sampler_started.compare_exchange_strong(expected_sampler, true)) {
-      std::thread(SamplerMain).detach();
+      StartDetachedThread(SamplerMain);
     }
     std::unordered_map<uint32_t, SampleBuckets> buckets;
     std::unordered_map<uint32_t, std::string> labels;
@@ -1231,7 +1257,7 @@ void StartControl() {
   bool expected = false;
   if (!g_control_started.load(std::memory_order_relaxed) &&
       g_control_started.compare_exchange_strong(expected, true)) {
-    std::thread(ControlMain).detach();
+    StartDetachedThread(ControlMain);
   }
 }
 
