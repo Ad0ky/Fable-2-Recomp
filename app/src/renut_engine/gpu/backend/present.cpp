@@ -652,8 +652,11 @@ void DiagHitchLocked() {
   const int64_t last = g_last_present_ns.exchange(now, std::memory_order_relaxed);
   const uint64_t n = g_presents.fetch_add(1, std::memory_order_relaxed) + 1;
 #if defined(PLUME_DEKO3D)
-  static std::once_flag watchdog;
-  std::call_once(watchdog, [] { std::thread(FreezeWatchdog).detach(); });
+  // fable2-nx (2026-11-15): std::thread::detach throws on the Switch (the first build hung at the start): the base's
+  // pthread helper starts it, once, from the render thread's first game present.
+  static std::atomic<bool> watchdog_started{false};
+  if (!watchdog_started.exchange(true, std::memory_order_relaxed))
+    banjo::renut_gpu::StartLongLivedThread(FreezeWatchdog, 64 * 1024);
   auto &st = plume::GetDeko3DStats();
   struct Snap {
     uint64_t compile_waits, compile_wait_ns, compiles, compile_ns, fence_waits, fence_wait_ns, draws, uploads, resolves,
@@ -681,7 +684,6 @@ void DiagHitchLocked() {
 }
 
 void PresentLocked(VideoState &s, const PresentImage *image) {
-  DiagHitchLocked();  // fable2-nx (2026-11-15, fable2_diag_hitch_ms)
   // Logs, once, why the GPU stopped if an earlier submission faulted.
   ReportDeviceLost(s.device.get());
   PresentImage diag_image;
@@ -851,6 +853,7 @@ void Video::Present(const PresentImage *image) {
   std::lock_guard lock(s.mutex);
   if (!s.host_ready || s.shutting_down.load(std::memory_order_acquire))
     return;
+  DiagHitchLocked();  // fable2-nx (2026-11-15, fable2_diag_hitch_ms): the game's presents only, not the overlay's
   PresentLocked(s, image);
   s.last_guest_present_ms.store(NowMs(), std::memory_order_release);
   detail::LatencyTrimLocked(s);  // banjo-nx (2026-10-20, input latency, banjo_deko3d_latency_trim)
