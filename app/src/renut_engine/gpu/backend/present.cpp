@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include <plume_render_interface.h>
 
@@ -35,6 +36,7 @@
 #include "renut_engine/gpu/banjo_renut_capture.h"
 #if defined(PLUME_DEKO3D)
 #include <plume_deko3d.h>  // banjo-nx: banjo_renut_capture_raw's format check
+#include <switch.h>  // fable2-nx (2026-11-15): armTicksToNs, the clock of plume's waitSinceNs (fable2_diag_hitch_ms)
 #endif
 
 // banjo-nx (2026-10-17, deko3d renderer tests): the captures copy the game's frame texture as it is (4-byte formats only,
@@ -587,7 +589,99 @@ bool DiagTextureImageLocked(PresentImage &out) {
 }
 
 // Records the back-buffer pass and presents. Caller holds s.mutex.
+// fable2-nx (2026-11-15, the title screen's and the cutscenes' stutter and freezes): with fable2_diag_hitch_ms above 0,
+// each present that comes that many ms or more after the previous one logs a [hitch] line: what the render thread waited
+// on since (draws that waited for a shader compile, compiles, command fence waits, each with its time) and the work it
+// did (draws, uploads, resolves). A watchdog thread logs a [freeze] line once 3 s pass without a present (and every 5 s
+// after), with what the render thread waits on at that moment: a shader compile, a command fence, or nothing (then the
+// game sends no frame: the SDK's diag_load_profile [stall] / [wait] lines say what its threads wait on).
+}  // namespace (fable2-nx: the cvar outside the anonymous namespace)
+REXCVAR_DEFINE_INT32(fable2_diag_hitch_ms, 0, "Banjo/Diagnostics",
+                     "Fable 2 NX, a diagnostic: a present this many ms or more after the previous one logs a [hitch] "
+                     "line (shader compile and fence waits, draws, uploads); 3 s without a present log [freeze] lines. "
+                     "0 = off")
+    .range(0, 10000);
+namespace {
+std::atomic<int64_t> g_last_present_ns{0};
+std::atomic<uint64_t> g_presents{0};
+
+int64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+#if defined(PLUME_DEKO3D)
+const char *WaitingOnName(uint32_t w) {
+  return w == 1 ? "a shader compile (a draw waits)" : w == 2 ? "a command fence (the GPU)" : "nothing";
+}
+
+void FreezeWatchdog() {
+  int64_t reported_for = 0, next_report = 0;
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const int64_t last = g_last_present_ns.load(std::memory_order_relaxed);
+    if (!last)
+      continue;
+    const int64_t gap = NowNs() - last;
+    if (gap < 3'000'000'000ll) {
+      reported_for = 0;
+      continue;
+    }
+    if (reported_for == last && NowNs() < next_report)
+      continue;
+    reported_for = last;
+    next_report = NowNs() + 5'000'000'000ll;
+    auto &st = plume::GetDeko3DStats();
+    const uint32_t w = st.waitingOn.load(std::memory_order_acquire);
+    const uint64_t since = st.waitSinceNs.load(std::memory_order_relaxed);
+    const double waited_ms = w ? double(armTicksToNs(armGetSystemTick()) - since) / 1e6 : 0.0;
+    RGPU_WARN("[freeze] no present for {:.1f} s (after {} presents); the render thread waits on {}{}; so far {} compile "
+              "waits ({:.0f} ms), {} fence waits ({:.0f} ms), {} shader compiles",
+              double(gap) / 1e9, g_presents.load(), WaitingOnName(w),
+              w ? fmt::format(" for {:.0f} ms", waited_ms) : std::string(), st.compileWaits.load(),
+              double(st.compileWaitNs.load()) / 1e6, st.fenceWaits.load(), double(st.fenceWaitNs.load()) / 1e6,
+              st.shaderCompiles.load());
+  }
+}
+#endif
+
+void DiagHitchLocked() {
+  static const int32_t threshold = REXCVAR_GET(fable2_diag_hitch_ms);
+  if (threshold <= 0)
+    return;
+  const int64_t now = NowNs();
+  const int64_t last = g_last_present_ns.exchange(now, std::memory_order_relaxed);
+  const uint64_t n = g_presents.fetch_add(1, std::memory_order_relaxed) + 1;
+#if defined(PLUME_DEKO3D)
+  static std::once_flag watchdog;
+  std::call_once(watchdog, [] { std::thread(FreezeWatchdog).detach(); });
+  auto &st = plume::GetDeko3DStats();
+  struct Snap {
+    uint64_t compile_waits, compile_wait_ns, compiles, compile_ns, fence_waits, fence_wait_ns, draws, uploads, resolves,
+        background;
+  };
+  const Snap cur{st.compileWaits.load(), st.compileWaitNs.load(), st.shaderCompiles.load(), st.shaderCompileNs.load(),
+                 st.fenceWaits.load(), st.fenceWaitNs.load(), st.draws.load(), st.copyUpload.load(),
+                 st.copyResolve.load(), st.variantBackground.load()};
+  static Snap prev = cur;
+  if (last && now - last >= int64_t(threshold) * 1'000'000) {
+    RGPU_WARN("[hitch] present {}: {:.1f} ms after the previous one; since: {} draws waited for a shader compile "
+              "({:.1f} ms), {} compiles ({:.1f} ms, {} in the background), {} fence waits ({:.1f} ms); {} draws, {} "
+              "uploads, {} resolves",
+              n, double(now - last) / 1e6, cur.compile_waits - prev.compile_waits,
+              double(cur.compile_wait_ns - prev.compile_wait_ns) / 1e6, cur.compiles - prev.compiles,
+              double(cur.compile_ns - prev.compile_ns) / 1e6, cur.background - prev.background,
+              cur.fence_waits - prev.fence_waits, double(cur.fence_wait_ns - prev.fence_wait_ns) / 1e6,
+              cur.draws - prev.draws, cur.uploads - prev.uploads, cur.resolves - prev.resolves);
+  }
+  prev = cur;
+#else
+  if (last && now - last >= int64_t(threshold) * 1'000'000)
+    RGPU_WARN("[hitch] present {}: {:.1f} ms after the previous one", n, double(now - last) / 1e6);
+#endif
+}
+
 void PresentLocked(VideoState &s, const PresentImage *image) {
+  DiagHitchLocked();  // fable2-nx (2026-11-15, fable2_diag_hitch_ms)
   // Logs, once, why the GPU stopped if an earlier submission faulted.
   ReportDeviceLost(s.device.get());
   PresentImage diag_image;

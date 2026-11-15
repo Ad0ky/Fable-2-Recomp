@@ -2228,6 +2228,10 @@ namespace plume {
         // Until it signals, or the queue has failed: memory the submission uses (command memory with its compute
         // launch descriptors, uploads) is reused once this returns, so giving up on a late fence made the GPU run
         // garbage (Ryujinx run 16: shaders decoded from data, then a lost device). Logged at 2, 4, 8, 16 ... s.
+        // fable2-nx (2026-11-15, fable2_diag_hitch_ms): timed and marked as what this thread waits on.
+        const uint64_t waitStart = armTicksToNs(armGetSystemTick());
+        g_deko3dStats.waitSinceNs.store(waitStart, std::memory_order_relaxed);
+        g_deko3dStats.waitingOn.store(2, std::memory_order_release);
         for (int waited = 1;; waited++) {
             const DkResult r = dkFenceWait(&f->fence, 2'000'000'000ll);
             if (r == DkResult_Success)
@@ -2239,6 +2243,9 @@ namespace plume {
             if (failed)
                 break;
         }
+        g_deko3dStats.waitingOn.store(0, std::memory_order_release);
+        g_deko3dStats.fenceWaits++;
+        g_deko3dStats.fenceWaitNs += armTicksToNs(armGetSystemTick()) - waitStart;
         f->pending = false;
     }
 

@@ -59,6 +59,11 @@ namespace plume {
         // waited, those a background thread (prebuild) waited for; boost mode during them (compileWaitBoost): times
         // and time; the uam thread's rests between background compiles (backgroundCompileShare).
         std::atomic<uint64_t> compileWaits{0}, compileWaitNs{0}, compileBackgroundWaits{0}, backgroundRestNs{0};
+        // fable2-nx (2026-11-15, fable2_diag_hitch_ms): the waits on command fences and their time, and what a thread
+        // waits on right now (0 nothing, 1 a shader compile a draw waits for, 2 a command fence) since waitSinceNs.
+        std::atomic<uint64_t> fenceWaits{0}, fenceWaitNs{0};
+        std::atomic<uint32_t> waitingOn{0};
+        std::atomic<uint64_t> waitSinceNs{0};
         std::atomic<uint64_t> fastCompiles{0};  // port 56: the drawWaits compiles made with fastFirstCompile
         std::atomic<uint64_t> compileBoosts{0}, compileBoostNs{0};
         std::atomic<uint64_t> imageBytes{0}, bufferBytes{0}, codeBytes{0}, commandBytes{0};

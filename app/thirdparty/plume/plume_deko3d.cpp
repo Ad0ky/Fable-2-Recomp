@@ -2027,8 +2027,14 @@ namespace plume {
         const bool boost = job.drawWaits && g_deko3dOptions.compileWaitBoost;
         if (boost)
             boostBegin();
+        if (job.drawWaits) {  // fable2-nx (2026-11-15, fable2_diag_hitch_ms)
+            g_deko3dStats.waitSinceNs.store(waitStart, std::memory_order_relaxed);
+            g_deko3dStats.waitingOn.store(1, std::memory_order_release);
+        }
         std::unique_lock<std::mutex> lock(compileMutex);
         compileDone.wait(lock, [&] { return job.done; });
+        if (job.drawWaits)
+            g_deko3dStats.waitingOn.store(0, std::memory_order_release);
         if (lend) {
             compileWaiters.erase(std::find(compileWaiters.begin(), compileWaiters.end(), waiterPriority));
             applyCompilePriority();
