@@ -2698,6 +2698,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     };
     std::unordered_map<uint32_t, CfJumpTest> cfJumpTests;
     std::set<uint32_t> knownTakenJumps;
+    std::vector<uint32_t> knownTakenCandidates;  // fable2-nx (2026-11-16): applied only when the structurizer needs them
     std::set<uint32_t> cfWritesPredicate;  // exec blocks with an ALU instruction that writes p0 (SETP*)
     std::vector<uint32_t> loopStarts;
     std::unordered_map<uint32_t, uint32_t> loopEndFor;
@@ -2845,8 +2846,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             }
             if (!onlyFallThrough)
                 continue;
-            cfSummaries[j].kind = CfKind::Uncond;
-            knownTakenJumps.insert(j);
+            // fable2-nx (2026-11-16): only a candidate. The rule is applied only to a shader the structurizer rejects
+            // without it (below): with it on every shader, the title screen stuttered and the idle demo froze, while
+            // the shaders it is for (the 9 giants) were all state-machine ones.
+            knownTakenCandidates.push_back(j);
         }
     }
 
@@ -2959,6 +2962,25 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         };
 
         simpleControlFlow = structure(0, instrCount, instrCount);
+    #ifdef RENUT_RECOMP
+        // fable2-nx (2026-11-16): a shader rejected as it stands gets its known-taken jumps (above) and a second try.
+        if (!simpleControlFlow && !knownTakenCandidates.empty())
+        {
+            ifEndLabels.clear();
+            elseLabels.clear();
+            for (const uint32_t j : knownTakenCandidates)
+            {
+                if (j < cfSummaries.size())
+                {
+                    cfSummaries[j].kind = CfKind::Uncond;
+                    knownTakenJumps.insert(j);
+                }
+            }
+            simpleControlFlow = structure(0, instrCount, instrCount);
+            if (!simpleControlFlow)
+                knownTakenJumps.clear();
+        }
+    #endif
     }
 
     if (!simpleControlFlow)
