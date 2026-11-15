@@ -13419,8 +13419,13 @@ void CompleteSurfaceReadbacksLocked(uint32_t slot) {
       u8 *guest = GuestPhysicalPtr<u8>(r.guest_pa);
       if (!guest)
         continue;
+      // fable2-nx (2026-11-15): one copy out of the readback memory (uncached for the CPU: the texel-by-texel reads below
+      // were 17% of the render thread in the profile's stack samples), then the tiling from the copy.
+      static thread_local std::vector<u8> local;
+      local.resize(size_t(r.row_texels) * r.height * 4);
+      std::memcpy(local.data(), data + r.offset, local.size());
       for (u32 y = 0; y < r.height; ++y) {
-        const u8 *row = data + r.offset + uint64_t(y) * r.row_texels * 4;
+        const u8 *row = local.data() + uint64_t(y) * r.row_texels * 4;
         for (u32 x = 0; x < r.width; ++x) {
           u32 v;
           std::memcpy(&v, row + x * 4, 4);
