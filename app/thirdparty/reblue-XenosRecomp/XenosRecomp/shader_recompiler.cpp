@@ -1154,6 +1154,8 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                 exportRegister = "oPts";
                 if (((instr.vectorWriteMask | instr.scalarWriteMask) & 0b100) != 0)
                     hasVertexKill = true;
+                if (((instr.vectorWriteMask | instr.scalarWriteMask) & 0b001) != 0)
+                    writesPointSize = true;  // fable2-nx (2026-11-15)
                 break;
             case ExportRegister::ExportAddress:
             {
@@ -3430,7 +3432,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         out += "\tif (g_DepthRemap.x != 0.0)\n\t\toPos.z = oPos.z * g_DepthRemap.x + oPos.w * g_DepthRemap.y;\n";
                         // For point_sprite_gs: the exported point size (0 when the shader exports
                         // none: the render state's), negative for a killed vertex.
-                        out += "\toPointSize = oPts.z != 0.0 ? -1.0 : oPts.x;\n";
+                        // fable2-nx (2026-11-15, Fable 2's snow): a size the shader writes counts even at zero or below: -2
+                        // tells point_sprite_gs to take the minimum (the render state's PA_SU_POINT_MINMAX), and to drop
+                        // the point if that is zero too, as Xenia does. Before, a written zero drew the render state's size.
+                        if (writesPointSize)
+                            out += "\toPointSize = oPts.z != 0.0 ? -1.0 : (oPts.x > 0.0 ? oPts.x : -2.0);\n";
+                        else
+                            out += "\toPointSize = oPts.z != 0.0 ? -1.0 : oPts.x;\n";
                         if (hasVertexKill)
                         {
                             // A negative cull distance at every vertex culls the primitive, as

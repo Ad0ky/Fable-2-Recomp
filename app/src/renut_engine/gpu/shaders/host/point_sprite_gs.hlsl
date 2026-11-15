@@ -70,14 +70,19 @@ static const float kUp = 1.0;
 void main(point Vertex input[1], inout TriangleStream<Vertex> output)
 {
     const Vertex v = input[0];
-    if (v.pointSize < 0.0)
+    // fable2-nx (2026-11-15): -2 is a size the vertex shader wrote as zero or below (XenosRecomp, writesPointSize): the
+    // minimum then, and no point if that is zero (Fable 2's snow writes zero sizes; the render state's size drew them big).
+    const bool written_zero = v.pointSize < -1.5;
+    if (v.pointSize < 0.0 && !written_zero)
         return;
 
     const float4 state = PointState();
-    float2 size = v.pointSize > 0.0 ? v.pointSize.xx : state.xy;
+    float2 size = written_zero ? float2(0.0, 0.0) : (v.pointSize > 0.0 ? v.pointSize.xx : state.xy);
     if (state.w > 0.0)
         size = min(size, state.w);
     size = max(size, state.z);
+    if (size.x <= 0.0 || size.y <= 0.0)
+        return;
 
     // Half the size in clip space: a pixel is 2 / viewport of the NDC range.
     const float2 half_size = size / ViewportState().xy * v.position.w;

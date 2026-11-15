@@ -103,6 +103,9 @@ struct ShaderRecompiler : StringBuffer
     // sets PA_CL_CLIP_CNTL.vtx_kill_or). The grass kills its blades where the density map is
     // below their threshold.
     bool hasVertexKill = false;
+    // fable2-nx (2026-11-15, the big snowflakes): the vertex shader writes the point size (oPts.x). Its size then counts
+    // even when it is zero (Xenia: "4D5307F1 has zero-size snowflakes, drop them"), not the render state's.
+    bool writesPointSize = false;
     bool userClipPlane = false;  // vivapinata-nx (from rr6-nx): set by the caller, this vertex shader writes SV_ClipDistance0 (renut-ultimate: every vertex shader, main.cpp)
     // vivapinata-nx (2026-11-03): the vertex shader fetches by r1.y or r1.z: a tessellated list's control points, which the
     // host gives it through renutControlPoints (shader_common.h).

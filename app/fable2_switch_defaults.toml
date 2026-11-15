@@ -163,6 +163,10 @@ banjo_deko3d_light_branch = false
 banjo_deko3d_skin_once = true
 banjo_deko3d_eager_kicks = true
 banjo_renut_smaa = true
+# fable2-nx (2026-11-15): Fable 2's final composite (the scene, its bloom and the colour table to the 1280x720 target,
+# PS 27890441DB0DEB15): SMAA and the internal resolution (banjo_renut_render_height_*) work on the frames that have it;
+# without it neither ran (the base's default names Nuts & Bolts' composite).
+banjo_renut_smaa_after_ps = "27890441DB0DEB15"
 banjo_renut_fur_shells_percent = 75
 banjo_renut_portrait_fur_shells_percent = 50
 banjo_renut_portrait_msaa_samples = 2
