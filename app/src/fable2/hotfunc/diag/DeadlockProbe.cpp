@@ -33,6 +33,8 @@
 extern "C" void __imp__ProcessAndProcessAndProcess503_8222AC38(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__ProcessAndProcessAndProcess543_822943E8(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__ProcessAndWaitMapStatus_82B49B50(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__SetEvent_SdkRuntime_822C9380(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_8236CBB8(PPCContext& __restrict ctx, uint8_t* base);
 
 namespace {
 
@@ -84,6 +86,42 @@ struct Release {
   std::atomic<uint32_t> thread{0};
 };
 Release g_releases[8];
+
+// fable2-nx (2026-11-16, second round): the game's SetEvent (SetEvent_SdkRuntime_822C9380, r3 the handle): per handle the
+// last call, its thread and the count, so a wait's report says when its event was last set. The first run showed the
+// 3D Engine thread waiting on its wake event (auto reset, not signalled) from 4 s before the freeze.
+struct SetRecord {
+  std::atomic<uint32_t> handle{0};
+  std::atomic<uint32_t> count{0};
+  std::atomic<uint32_t> thread{0};
+  std::atomic<int64_t> last{0};
+};
+constexpr int kSetRecords = 128;
+SetRecord g_sets[kSetRecords];
+
+SetRecord* SetRecordFor(uint32_t handle, bool create) {
+  const uint32_t start = (handle * 2654435761u) >> 25;  // 0-127
+  for (int i = 0; i < kSetRecords; ++i) {
+    SetRecord& r = g_sets[(start + i) % kSetRecords];
+    const uint32_t h = r.handle.load(std::memory_order_relaxed);
+    if (h == handle)
+      return &r;
+    if (h == 0) {
+      if (!create)
+        return nullptr;
+      uint32_t expected = 0;
+      if (r.handle.compare_exchange_strong(expected, handle, std::memory_order_relaxed) || expected == handle)
+        return &r;
+    }
+  }
+  return nullptr;
+}
+
+// sub_8236CBB8: sets the 3D Engine's wake event under a lock and waits for its answer (event at its object + 460).
+std::atomic<uint32_t> g_sync_thread{0};
+std::atomic<int64_t> g_sync_since{0};
+std::atomic<uint32_t> g_sync_count{0};
+std::atomic<int64_t> g_sync_last_end{0};
 
 uint32_t ReadU32(uint8_t* base, uint32_t address, bool& ok) {
   ok = false;
@@ -191,6 +229,24 @@ extern "C" void ProcessAndWaitMapStatus_82B49B50(PPCContext& __restrict ctx, uin
     s->kind.store(0, std::memory_order_release);
 }
 
+extern "C" void SetEvent_SdkRuntime_822C9380(PPCContext& __restrict ctx, uint8_t* base) {
+  if (SetRecord* r = SetRecordFor(ctx.r3.u32, true)) {
+    r->count.fetch_add(1, std::memory_order_relaxed);
+    r->thread.store(CurrentThreadId(), std::memory_order_relaxed);
+    r->last.store(NowMs(), std::memory_order_relaxed);
+  }
+  __imp__SetEvent_SdkRuntime_822C9380(ctx, base);
+}
+
+extern "C" void sub_8236CBB8(PPCContext& __restrict ctx, uint8_t* base) {
+  g_sync_count.fetch_add(1, std::memory_order_relaxed);
+  g_sync_since.store(NowMs(), std::memory_order_relaxed);
+  g_sync_thread.store(CurrentThreadId(), std::memory_order_release);
+  __imp__sub_8236CBB8(ctx, base);
+  g_sync_thread.store(0, std::memory_order_release);
+  g_sync_last_end.store(NowMs(), std::memory_order_relaxed);
+}
+
 extern "C" void Fable2DeadlockProbeReport() {
   uint8_t* base = g_base.load(std::memory_order_relaxed);
   const int64_t now = NowMs();
@@ -204,9 +260,24 @@ extern "C" void Fable2DeadlockProbeReport() {
       REXLOG_WARN("[probe] thread {:X} reserving {} bytes (alignment {}) in ring {:08X} for {:.1f} s:{}", thread,
                   s.a.load(), s.b.load(), object, secs, RingFields(base, object));
     else
-      REXLOG_WARN("[probe] thread {:X} waiting on object {:08X} (handle {:08X}: {}), timeout argument {:X}, for "
+    {
+      const uint32_t handle = s.a.load();
+      std::string set = "never set through SetEvent_SdkRuntime_822C9380";
+      if (SetRecord* r = SetRecordFor(handle, false))
+        set = fmt::format("set {} times through SetEvent_SdkRuntime_822C9380, the last {:.1f} s ago by thread {:X}",
+                          r->count.load(), double(now - r->last.load()) / 1000.0, r->thread.load());
+      REXLOG_WARN("[probe] thread {:X} waiting on object {:08X} (handle {:08X}: {}; {}), timeout argument {:X}, for "
                   "{:.1f} s",
-                  thread, object, s.a.load(), HandleState(s.a.load()), s.b.load(), secs);
+                  thread, object, handle, HandleState(handle), set, s.b.load(), secs);
+    }
+  }
+  {
+    const uint32_t t = g_sync_thread.load(std::memory_order_acquire);
+    REXLOG_WARN("[probe] sub_8236CBB8 (wake the 3D Engine and wait for its answer): {} calls; {}; the last ended {:.1f} s ago",
+                g_sync_count.load(),
+                t ? fmt::format("thread {:X} inside it for {:.1f} s", t, double(now - g_sync_since.load()) / 1000.0)
+                  : std::string("no thread inside it"),
+                g_sync_last_end.load() ? double(now - g_sync_last_end.load()) / 1000.0 : -1.0);
   }
   for (Release& r : g_releases) {
     const uint32_t ring = r.ring.load(std::memory_order_relaxed);
