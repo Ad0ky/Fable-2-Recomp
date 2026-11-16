@@ -44,6 +44,7 @@
 #include <rex/types.h>
 
 #include "renut_engine/perf/frame_stats.h"
+#include "profiler/profiler.h"  // fable2-nx (2026-11-16): the frame boundary at the swap
 #include "renut_engine/gpu/guest/callbacks.h"
 #include "renut_engine/gpu/guest/command_buffers.h"
 #include "renut_engine/gpu/d3d/d3d.h"
@@ -65,6 +66,7 @@
 extern "C" uint32_t RexSetGuestThreadCoreLayout(int main_core, uint32_t others_mask, int others_preferred);
 void renutFrameLimit();  // katamari_keys.cpp: the player's frame_cap
 
+extern std::atomic<uint64_t> g_banjo_game_frames;  // fable2-nx (2026-11-16): katamari_keys.cpp, frames presented
 // banjo-nx (2026-10-20, from sa2-nx's sa2_renut_core_layout): see D3DDevice_Swap_hook.
 REXCVAR_DEFINE_BOOL(banjo_renut_core_layout, false, "Banjo/Enhancements",
                     "Renut's renderer on the Switch: at the first Swap the guest main thread (N&B's drawing thread, the "
@@ -962,6 +964,11 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
     native::ResetAllState(native::DeviceAt(device_va));
   }
   renutFrameLimit();  // katamari-nx: the player's frame_cap; the game's frames end here (it never calls Present)
+  // fable2-nx (2026-11-16): the frame boundary (frame time, the Switch profiler's frame marks, the stall watchdog
+  // banjo_stall_watch_seconds) was only at D3DDevice_Present_hook, which Fable 2 never calls: the watchdog saw no frame
+  // and never dumped. Here at every swap now, and no longer at Present (it swaps through this hook: counted once).
+  g_banjo_game_frames.fetch_add(1, std::memory_order_relaxed);
+  banjo::profiler::FrameBoundary();
 }
 
 // void D3DDevice_InsertCallback(D3DDevice*, D3DCALLBACKTYPE, D3DCALLBACK pCallback,

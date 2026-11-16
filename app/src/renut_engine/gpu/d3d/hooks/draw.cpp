@@ -653,8 +653,7 @@ void D3DDevice_Present_hook(u32 device) {
   native::Swap(device, front_buffer, device + 0x3548);  // fable2-nx (N&B TU3->Fable 2): 0x3548->0x3548
   // katamari-nx: one game frame ends at Present (N&B's ended at its appMainDraw hook, renut_engine/FPS.cpp): frame
   // time, the Switch profiler's frame marks, the stall watchdog.
-  g_banjo_game_frames.fetch_add(1, std::memory_order_relaxed);
-  banjo::profiler::FrameBoundary();
+  // fable2-nx (2026-11-16): the frame count and the frame boundary moved to D3DDevice_Swap_hook (native::Swap above).
 }
 
 // void D3DDevice_SetVertexShader(D3DDevice*, D3DVertexShader*) [0x821F90D8]
