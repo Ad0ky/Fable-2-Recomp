@@ -40,6 +40,7 @@
 #include <switch.h>  // fable2-nx (2026-11-15): armTicksToNs, the clock of plume's waitSinceNs (fable2_diag_hitch_ms)
 #include <rex/system/kernel_state.h>  // fable2-nx (2026-11-16): the [freeze] dump of the guest threads
 #include <rex/system/xthread.h>
+#include <rex/memory/utils.h>  // fable2-nx (2026-11-16): QueryProtect
 #include <rex/system/thread_state.h>
 #include "renut_engine/gpu/guest/guest_memory.h"
 #endif
@@ -625,7 +626,16 @@ const char *WaitingOnName(uint32_t w) {
 // back-chain stores and the link register saves: BANJO_GEN_BACK_CHAIN_ELIDE and BANJO_GEN_LR_MOVES_ELIDE are off).
 // Read without stopping the threads: a frozen thread does not move; a running one may give a torn stack (marked by
 // the checks below, which also keep every read inside guest memory).
-bool GuestReadable(uint32_t a) { return a >= 0x40000000u && a < 0xA0000000u && (a & 3) == 0; }
+// fable2-nx (2026-11-16): and committed with read access: the first dump read 0x700E0000 (an uncommitted stack page
+// under a thread's stack) and the access ended the game. The memory's own page query, as its fault handler asks it.
+bool GuestReadable(uint32_t a) {
+  if (a < 0x40000000u || a >= 0xA0000000u || (a & 3) != 0)
+    return false;
+  size_t length = 4;
+  rex::memory::PageAccess access = rex::memory::PageAccess::kNoAccess;
+  return rex::memory::QueryProtect(GuestPtr<uint8_t>(a), length, access) &&
+         (int(access) & int(rex::memory::PageAccess::kReadOnly)) != 0;
+}
 uint32_t GuestWord(uint32_t a) {
   uint32_t v;
   std::memcpy(&v, GuestPtr<uint8_t>(a), 4);
@@ -650,7 +660,7 @@ void DumpGuestThreads() {
     uint32_t sp = r1;
     for (int depth = 0; depth < 24 && GuestReadable(sp); ++depth) {
       const uint32_t back = GuestWord(sp);
-      if (!GuestReadable(back) || back <= sp || back - sp > 0x100000)
+      if (!GuestReadable(back) || back <= sp || back - sp > 0x100000 || !GuestReadable(back - 8))
         break;
       const uint32_t lr = GuestWord(back - 8);
       stack += fmt::format(" {:08X}", lr);
