@@ -35,6 +35,7 @@ extern "C" void __imp__ProcessAndProcessAndProcess543_822943E8(PPCContext& __res
 extern "C" void __imp__ProcessAndWaitMapStatus_82B49B50(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__SetEvent_SdkRuntime_822C9380(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_8236CBB8(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_8236CB48(PPCContext& __restrict ctx, uint8_t* base);
 
 namespace {
 
@@ -123,6 +124,38 @@ std::atomic<int64_t> g_sync_since{0};
 std::atomic<uint32_t> g_sync_count{0};
 std::atomic<int64_t> g_sync_last_end{0};
 
+// fable2-nx (2026-11-16, third round): the 3D Engine stops only when asked: sub_8236CB48 sets its pause flag (+192) and
+// waits for its answer; it then waits on its wake event until sub_8236CBB8 (resume) sets it. The second run: paused
+// at the demo's start, never resumed, while the main thread went on filling the ring the paused 3D Engine reads. Here:
+// the pause's and the resume's calls (thread, time, the host code that called them: the generated caller), and while
+// paused, which generated functions call the ring reservation (host return addresses; banjo_profiler.log's
+// "module base" names them with fable2-nx.elf).
+std::atomic<uint32_t> g_pause_count{0}, g_pause_thread{0}, g_resume_count{0};
+std::atomic<int64_t> g_pause_last{0}, g_resume_last{0};
+std::atomic<uintptr_t> g_pause_caller{0}, g_resume_caller{0};
+std::atomic<bool> g_paused{false};
+struct CallerCount {
+  std::atomic<uintptr_t> address{0};
+  std::atomic<uint32_t> count{0};
+};
+CallerCount g_paused_reservers[16];
+void NotePausedReserver(uintptr_t address) {
+  for (CallerCount& c : g_paused_reservers) {
+    uintptr_t a = c.address.load(std::memory_order_relaxed);
+    if (a == address) {
+      c.count.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (a == 0) {
+      uintptr_t expected = 0;
+      if (c.address.compare_exchange_strong(expected, address, std::memory_order_relaxed) || expected == address) {
+        c.count.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+  }
+}
+
 uint32_t ReadU32(uint8_t* base, uint32_t address, bool& ok) {
   ok = false;
   if (!base || address < 0x40000000u || address >= 0xA0000000u || (address & 3))
@@ -176,6 +209,8 @@ std::string HandleState(uint32_t handle) {
 
 extern "C" void ProcessAndProcessAndProcess503_8222AC38(PPCContext& __restrict ctx, uint8_t* base) {
   g_base.store(base, std::memory_order_relaxed);
+  if (g_paused.load(std::memory_order_relaxed))
+    NotePausedReserver(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
   Slot* s = SlotForThisThread();
   if (s) {
     s->object.store(ctx.r3.u32, std::memory_order_relaxed);
@@ -238,7 +273,20 @@ extern "C" void SetEvent_SdkRuntime_822C9380(PPCContext& __restrict ctx, uint8_t
   __imp__SetEvent_SdkRuntime_822C9380(ctx, base);
 }
 
+extern "C" void sub_8236CB48(PPCContext& __restrict ctx, uint8_t* base) {
+  g_pause_caller.store(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), std::memory_order_relaxed);
+  g_pause_thread.store(CurrentThreadId(), std::memory_order_relaxed);
+  g_pause_count.fetch_add(1, std::memory_order_relaxed);
+  g_pause_last.store(NowMs(), std::memory_order_relaxed);
+  __imp__sub_8236CB48(ctx, base);
+  g_paused.store(true, std::memory_order_relaxed);
+}
+
 extern "C" void sub_8236CBB8(PPCContext& __restrict ctx, uint8_t* base) {
+  g_resume_caller.store(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), std::memory_order_relaxed);
+  g_resume_count.fetch_add(1, std::memory_order_relaxed);
+  g_resume_last.store(NowMs(), std::memory_order_relaxed);
+  g_paused.store(false, std::memory_order_relaxed);
   g_sync_count.fetch_add(1, std::memory_order_relaxed);
   g_sync_since.store(NowMs(), std::memory_order_relaxed);
   g_sync_thread.store(CurrentThreadId(), std::memory_order_release);
@@ -279,6 +327,16 @@ extern "C" void Fable2DeadlockProbeReport() {
                   : std::string("no thread inside it"),
                 g_sync_last_end.load() ? double(now - g_sync_last_end.load()) / 1000.0 : -1.0);
   }
+  REXLOG_WARN("[probe] 3D Engine pause (sub_8236CB48): {} calls, the last {:.1f} s ago by thread {:X} from host {:#x}; "
+              "resume (sub_8236CBB8): {} calls, the last {} from host {:#x}; paused now: {}",
+              g_pause_count.load(), g_pause_last.load() ? double(now - g_pause_last.load()) / 1000.0 : -1.0,
+              g_pause_thread.load(), g_pause_caller.load(), g_resume_count.load(),
+              g_resume_last.load() ? fmt::format("{:.1f} s ago", double(now - g_resume_last.load()) / 1000.0)
+                                   : std::string("never"),
+              g_resume_caller.load(), g_paused.load() ? "yes" : "no");
+  for (CallerCount& c : g_paused_reservers)
+    if (const uintptr_t a = c.address.load())
+      REXLOG_WARN("[probe]   while paused, the ring reservation was called {} times from host {:#x}", c.count.load(), a);
   for (Release& r : g_releases) {
     const uint32_t ring = r.ring.load(std::memory_order_relaxed);
     if (!ring)
