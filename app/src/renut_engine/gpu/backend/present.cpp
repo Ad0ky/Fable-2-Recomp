@@ -641,7 +641,7 @@ uint32_t GuestWord(uint32_t a) {
   std::memcpy(&v, GuestPtr<uint8_t>(a), 4);
   return __builtin_bswap32(v);
 }
-void DumpGuestThreads() {
+[[maybe_unused]] void DumpGuestThreads() {
   auto *kernel = rex::system::kernel_state();
   if (!kernel)
     return;
@@ -673,6 +673,9 @@ void DumpGuestThreads() {
   }
 }
 
+}  // namespace
+extern "C" void Fable2DeadlockProbeReport();  // fable2-nx: src/fable2/hotfunc/diag/DeadlockProbe.cpp
+namespace {
 void FreezeWatchdog() {
   int64_t reported_for = 0, next_report = 0;
   for (;;) {
@@ -700,8 +703,10 @@ void FreezeWatchdog() {
               double(st.compileWaitNs.load()) / 1e6, st.fenceWaits.load(), double(st.fenceWaitNs.load()) / 1e6,
               st.shaderCompiles.load());
     // fable2-nx (2026-11-16): the guest threads at the first report and once more 10 s later (what still waits).
+    // fable2-nx (2026-11-16): the guest threads' registers are not live here (DumpGuestThreads showed only stale
+    // ones); the probe of the ring the main thread waits on and of the waits (src/fable2/hotfunc/diag) instead.
     if (gap < 4'000'000'000ll || (gap >= 13'000'000'000ll && gap < 18'000'000'000ll))
-      DumpGuestThreads();
+      Fable2DeadlockProbeReport();
   }
 }
 #endif
