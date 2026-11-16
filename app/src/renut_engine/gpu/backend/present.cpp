@@ -11,6 +11,7 @@
 #include "renut_engine/gpu/sasrt_gpu_round.h"  // sasrt-nx (2026-11-08): the GPU round
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>  // fable2-nx (2026-11-16): DumpGuestThreads
 #include <mutex>
 #include <string>
 #include <thread>
@@ -37,6 +38,10 @@
 #if defined(PLUME_DEKO3D)
 #include <plume_deko3d.h>  // banjo-nx: banjo_renut_capture_raw's format check
 #include <switch.h>  // fable2-nx (2026-11-15): armTicksToNs, the clock of plume's waitSinceNs (fable2_diag_hitch_ms)
+#include <rex/system/kernel_state.h>  // fable2-nx (2026-11-16): the [freeze] dump of the guest threads
+#include <rex/system/xthread.h>
+#include <rex/system/thread_state.h>
+#include "renut_engine/gpu/guest/guest_memory.h"
 #endif
 
 // banjo-nx (2026-10-17, deko3d renderer tests): the captures copy the game's frame texture as it is (4-byte formats only,
@@ -614,6 +619,50 @@ const char *WaitingOnName(uint32_t w) {
   return w == 1 ? "a shader compile (a draw waits)" : w == 2 ? "a command fence (the GPU)" : "nothing";
 }
 
+// fable2-nx (2026-11-16): at a freeze, every guest thread: its link register and r1, r3-r6 (a wait's arguments as the
+// kernel call got them) and the 16 bytes at r3 when it is a guest pointer (a dispatcher header: type, signal state),
+// and its guest call stack from the back chain (each frame's saved link register at back - 8; the build keeps the
+// back-chain stores and the link register saves: BANJO_GEN_BACK_CHAIN_ELIDE and BANJO_GEN_LR_MOVES_ELIDE are off).
+// Read without stopping the threads: a frozen thread does not move; a running one may give a torn stack (marked by
+// the checks below, which also keep every read inside guest memory).
+bool GuestReadable(uint32_t a) { return a >= 0x40000000u && a < 0xA0000000u && (a & 3) == 0; }
+uint32_t GuestWord(uint32_t a) {
+  uint32_t v;
+  std::memcpy(&v, GuestPtr<uint8_t>(a), 4);
+  return __builtin_bswap32(v);
+}
+void DumpGuestThreads() {
+  auto *kernel = rex::system::kernel_state();
+  if (!kernel)
+    return;
+  for (auto &t : kernel->object_table()->GetObjectsByType<rex::system::XThread>()) {
+    if (!t || !t->is_guest_thread() || !t->thread_state())
+      continue;
+    const ::PPCContext *c = t->thread_state()->context();
+    if (!c)
+      continue;
+    const uint32_t r1 = uint32_t(c->r1.u64), r3 = uint32_t(c->r3.u64);
+    std::string header;
+    if (GuestReadable(r3) && GuestReadable(r3 + 12))
+      header = fmt::format(" [r3]: {:08X} {:08X} {:08X} {:08X}", GuestWord(r3), GuestWord(r3 + 4), GuestWord(r3 + 8),
+                           GuestWord(r3 + 12));
+    std::string stack;
+    uint32_t sp = r1;
+    for (int depth = 0; depth < 24 && GuestReadable(sp); ++depth) {
+      const uint32_t back = GuestWord(sp);
+      if (!GuestReadable(back) || back <= sp || back - sp > 0x100000)
+        break;
+      const uint32_t lr = GuestWord(back - 8);
+      stack += fmt::format(" {:08X}", lr);
+      sp = back;
+    }
+    RGPU_WARN("[freeze]   guest thread {:X} '{}': lr {:08X} r1 {:08X} r3 {:08X} r4 {:08X} r5 {:08X} r6 {:08X}{}; "
+              "stack:{}",
+              t->thread_id(), t->name(), uint32_t(c->lr), r1, r3, uint32_t(c->r4.u64), uint32_t(c->r5.u64),
+              uint32_t(c->r6.u64), header, stack);
+  }
+}
+
 void FreezeWatchdog() {
   int64_t reported_for = 0, next_report = 0;
   for (;;) {
@@ -640,6 +689,9 @@ void FreezeWatchdog() {
               w ? fmt::format(" for {:.0f} ms", waited_ms) : std::string(), st.compileWaits.load(),
               double(st.compileWaitNs.load()) / 1e6, st.fenceWaits.load(), double(st.fenceWaitNs.load()) / 1e6,
               st.shaderCompiles.load());
+    // fable2-nx (2026-11-16): the guest threads at the first report and once more 10 s later (what still waits).
+    if (gap < 4'000'000'000ll || (gap >= 13'000'000'000ll && gap < 18'000'000'000ll))
+      DumpGuestThreads();
   }
 }
 #endif
