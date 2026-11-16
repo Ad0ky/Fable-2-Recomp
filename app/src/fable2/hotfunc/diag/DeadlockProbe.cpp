@@ -17,6 +17,7 @@
 // SDK's fault; an unsignalled one means the game never signalled it.
 #include "renut_pch.h"  // fable2-nx: the generated project is "renut" (the base keeps its name)
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -36,6 +37,8 @@ extern "C" void __imp__ProcessAndWaitMapStatus_82B49B50(PPCContext& __restrict c
 extern "C" void __imp__SetEvent_SdkRuntime_822C9380(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_8236CBB8(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_8236CB48(PPCContext& __restrict ctx, uint8_t* base);
+
+extern std::atomic<uint64_t> g_banjo_game_frames;  // the game's frames (D3DDevice_Swap_hook; app/src/katamari_keys.cpp)
 
 namespace {
 
@@ -137,23 +140,45 @@ std::atomic<bool> g_paused{false};
 struct CallerCount {
   std::atomic<uintptr_t> address{0};
   std::atomic<uint32_t> count{0};
+  std::atomic<uint64_t> bytes{0};
 };
 CallerCount g_paused_reservers[16];
-void NotePausedReserver(uintptr_t address) {
+void NotePausedReserver(uintptr_t address, uint32_t bytes) {
   for (CallerCount& c : g_paused_reservers) {
     uintptr_t a = c.address.load(std::memory_order_relaxed);
-    if (a == address) {
-      c.count.fetch_add(1, std::memory_order_relaxed);
-      return;
-    }
     if (a == 0) {
       uintptr_t expected = 0;
-      if (c.address.compare_exchange_strong(expected, address, std::memory_order_relaxed) || expected == address) {
-        c.count.fetch_add(1, std::memory_order_relaxed);
-        return;
-      }
+      if (!c.address.compare_exchange_strong(expected, address, std::memory_order_relaxed) && expected != address)
+        continue;
+      a = address;
+    }
+    if (a == address) {
+      c.count.fetch_add(1, std::memory_order_relaxed);
+      c.bytes.fetch_add(bytes, std::memory_order_relaxed);
+      return;
     }
   }
+}
+
+// fable2-nx (2026-11-16, fourth round): the third run named the pause's caller: sub_8236CD68 builds the title screen's
+// transition object, which pauses the 3D Engine until the demo ends or a button is pressed (sub_826C61B8,
+// sub_826C67F8 and sub_82378868 set its + 244; sub_8236D0A8 then resumes). The main thread's frame loop
+// (sub_82355460) goes on writing into the ring meanwhile. Whether the ring was already nearly full when the pause came
+// (the 3D Engine behind) or the writes during the pause fill it decides the fix, so per pause: the main ring's fill at
+// its start, the frames, reservations and bytes until its resume; and the bytes per frame while not paused.
+struct Episode {
+  std::atomic<int64_t> start{0}, end{0};
+  std::atomic<uint32_t> ring{0}, write{0}, read{0}, reader{0}, mark{0}, capacity{0};
+  std::atomic<uint64_t> frames_at_start{0}, frames_at_end{0}, reservations{0}, bytes{0};
+};
+Episode g_episodes[8];
+std::atomic<uint32_t> g_episode_count{0};
+std::atomic<uint32_t> g_main_ring{0};  // the ring the pausing thread last reserved in
+std::atomic<uint64_t> g_unpaused_bytes{0}, g_unpaused_reservations{0};
+
+uint32_t& LastRingOfThisThread() {
+  thread_local uint32_t ring = 0;
+  return ring;
 }
 
 uint32_t ReadU32(uint8_t* base, uint32_t address, bool& ok) {
@@ -209,8 +234,19 @@ std::string HandleState(uint32_t handle) {
 
 extern "C" void ProcessAndProcessAndProcess503_8222AC38(PPCContext& __restrict ctx, uint8_t* base) {
   g_base.store(base, std::memory_order_relaxed);
-  if (g_paused.load(std::memory_order_relaxed))
-    NotePausedReserver(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+  LastRingOfThisThread() = ctx.r3.u32;
+  const uint32_t asked = ctx.r4.u32 + (ctx.r5.u32 ? ctx.r5.u32 - 1 : 0);
+  if (g_paused.load(std::memory_order_relaxed)) {
+    NotePausedReserver(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), ctx.r4.u32);
+    const uint32_t n = g_episode_count.load(std::memory_order_relaxed);
+    if (n && n <= 8 && ctx.r3.u32 == g_episodes[n - 1].ring.load(std::memory_order_relaxed)) {
+      g_episodes[n - 1].reservations.fetch_add(1, std::memory_order_relaxed);
+      g_episodes[n - 1].bytes.fetch_add(asked, std::memory_order_relaxed);
+    }
+  } else if (ctx.r3.u32 == g_main_ring.load(std::memory_order_relaxed)) {
+    g_unpaused_reservations.fetch_add(1, std::memory_order_relaxed);
+    g_unpaused_bytes.fetch_add(asked, std::memory_order_relaxed);
+  }
   Slot* s = SlotForThisThread();
   if (s) {
     s->object.store(ctx.r3.u32, std::memory_order_relaxed);
@@ -278,7 +314,25 @@ extern "C" void sub_8236CB48(PPCContext& __restrict ctx, uint8_t* base) {
   g_pause_thread.store(CurrentThreadId(), std::memory_order_relaxed);
   g_pause_count.fetch_add(1, std::memory_order_relaxed);
   g_pause_last.store(NowMs(), std::memory_order_relaxed);
+  // The main ring's positions as the pause begins (+8 size, +32 write, +36 read, +52 the wrap mark; see 8222AC38).
+  const uint32_t ring = LastRingOfThisThread();
+  g_main_ring.store(ring, std::memory_order_relaxed);
+  const uint32_t n = g_episode_count.load(std::memory_order_relaxed);
+  if (n < 8 && ring) {
+    Episode& e = g_episodes[n];
+    bool ok;
+    e.ring.store(ring);
+    e.capacity.store(ReadU32(base, ring + 8, ok));
+    e.write.store(ReadU32(base, ring + 32, ok));
+    e.read.store(ReadU32(base, ring + 36, ok));
+    e.mark.store(ReadU32(base, ring + 52, ok));
+    e.reader.store(ReadU32(base, ring + 64, ok));  // the 3D Engine's own position (822943E8), +36 is the writer's copy
+    e.start.store(NowMs());
+    e.frames_at_start.store(g_banjo_game_frames.load(std::memory_order_relaxed));
+  }
   __imp__sub_8236CB48(ctx, base);
+  if (n < 8 && ring)
+    g_episode_count.store(n + 1, std::memory_order_relaxed);
   g_paused.store(true, std::memory_order_relaxed);
 }
 
@@ -286,6 +340,13 @@ extern "C" void sub_8236CBB8(PPCContext& __restrict ctx, uint8_t* base) {
   g_resume_caller.store(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), std::memory_order_relaxed);
   g_resume_count.fetch_add(1, std::memory_order_relaxed);
   g_resume_last.store(NowMs(), std::memory_order_relaxed);
+  if (g_paused.load(std::memory_order_relaxed)) {
+    const uint32_t n = g_episode_count.load(std::memory_order_relaxed);
+    if (n && n <= 8 && !g_episodes[n - 1].end.load()) {
+      g_episodes[n - 1].end.store(NowMs());
+      g_episodes[n - 1].frames_at_end.store(g_banjo_game_frames.load(std::memory_order_relaxed));
+    }
+  }
   g_paused.store(false, std::memory_order_relaxed);
   g_sync_count.fetch_add(1, std::memory_order_relaxed);
   g_sync_since.store(NowMs(), std::memory_order_relaxed);
@@ -336,7 +397,34 @@ extern "C" void Fable2DeadlockProbeReport() {
               g_resume_caller.load(), g_paused.load() ? "yes" : "no");
   for (CallerCount& c : g_paused_reservers)
     if (const uintptr_t a = c.address.load())
-      REXLOG_WARN("[probe]   while paused, the ring reservation was called {} times from host {:#x}", c.count.load(), a);
+      REXLOG_WARN("[probe]   while paused, the ring reservation was called {} times ({} bytes) from host {:#x}",
+                  c.count.load(), c.bytes.load(), a);
+  {
+    const uint64_t frames = g_banjo_game_frames.load(std::memory_order_relaxed);
+    uint64_t paused_frames = 0;
+    const uint32_t n = std::min<uint32_t>(g_episode_count.load(), 8);
+    for (uint32_t i = 0; i < n; ++i) {
+      const Episode& e = g_episodes[i];
+      const int64_t end = e.end.load();
+      const uint64_t f_end = end ? e.frames_at_end.load() : frames;
+      const uint64_t f = f_end - e.frames_at_start.load();
+      paused_frames += f;
+      const uint32_t w = e.write.load(), r = e.reader.load() + 1, mark = e.mark.load(), cap = e.capacity.load();
+      // 8222AC38 waits while the write position is below the read position and the request does not fit before it.
+      const uint32_t used = w >= r ? w - r : (mark > r ? mark - r : 0) + w;
+      REXLOG_WARN("[probe] pause {}: {:.1f} s{}; ring {:08X} at its start: write {:X} read {:X} (its copy {:X}) wrap mark {:X} size {:X} "
+                  "(about {} KiB of {} KiB waiting for the 3D Engine); during it {} frames, {} reservations, {} KiB "
+                  "({} bytes a frame)",
+                  i + 1, double((end ? end : now) - e.start.load()) / 1000.0, end ? "" : " (not resumed)", e.ring.load(),
+                  w, r, e.read.load(), mark, cap, used / 1024, cap / 1024, f, e.reservations.load(), e.bytes.load() / 1024,
+                  f ? e.bytes.load() / f : 0);
+    }
+    const uint64_t first = n ? g_episodes[0].frames_at_start.load() : frames;
+    const uint64_t unpaused_frames = frames > first + paused_frames ? frames - first - paused_frames : 0;
+    REXLOG_WARN("[probe] not paused (from the first pause on): {} frames, {} reservations, {} KiB in ring {:08X} ({} bytes a frame)",
+                unpaused_frames, g_unpaused_reservations.load(), g_unpaused_bytes.load() / 1024, g_main_ring.load(),
+                unpaused_frames ? g_unpaused_bytes.load() / unpaused_frames : 0);
+  }
   for (Release& r : g_releases) {
     const uint32_t ring = r.ring.load(std::memory_order_relaxed);
     if (!ring)
