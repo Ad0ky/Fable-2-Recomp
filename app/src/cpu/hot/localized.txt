@@ -1,0 +1,2 @@
+# fable2-nx (2026-11-12): empty until Fable 2's console profiles (docs/hand-and-machine-optimising-guide.md);
+# Katamari's entries were at its own addresses.

@@ -1,56 +1,50 @@
-# --- Game content (ripped disc; see README "How to extract") ---------------
-default.xex
-/data/
-/nxeart/
-/$SystemUpdate/
-/Gamefiles/
-
-# --- Build artifacts --------------------------------------------------------
-out
-generated
-nul
-
-
-# --- AI Agent Stuff --------------------------------------------------------
-.pi
-pi-session-*.html
-.claude/*
-!.claude/skills/
-
-# --- Runtime logs written next to the exe (may land in the root when running
-#     with --game_data_root) ---------------------------------------------------
-fable2_func_trace.log
-fable2_func_trace_prev.log
-fable2_func_summary.log
-fable2_func_summary_prev.log
-fps_probe.log
-
-# --- SDK / runtime artifacts ------------------------------------------------
-.fable2_image.bin
-
-# --- Local scratch (old build logs, screenshots, session exports,
-#     stray runtime content folders) ------------------------------------------
-/scratch/
-
-# --- Manifest backup (pre-rename safety copy) --------------------------------
-fable_2_manifest.toml.bak
-
-# --- Scratch helpers in the repo root -----------------------------------------
-/*.ps1
-/*.py
-/*.sh
-/*.png
-build_*.log
-rebuild.log
-rebuild2.log
+# Game-derived content: never commit
+assets/
+app/assets/
+app/generated/*
+!app/generated/rexglue.cmake
+app/out/
+out/
+*.xex
+*.iso
+logs/
+# Build/temp
+*.log
 __pycache__/
 
-# --- Fetched/external toolchain deps (created by tools/setup_sdk*.cmd). -------
-# The tracked files in thirdparty/ (rexglue-sdk-local.patch,
-# rexglue-sdk-submodule-pins.txt, vulkan/, vk_video/) stay in the repo.
-thirdparty/rexglue-sdk-src/
-thirdparty/android-ndk/
-
-# --- Historical reference (pre-ReXGlue XenonRecomp configs) -------------------
-XenonRecomp
-TODO.md
+# 2026-10-19 (the private GitHub upload): built and game-derived files outside out/ and app/out/
+# The NRO holds the recompiled game code; shader libraries, pipeline caches and lists, DKSH caches, shader microcode
+# dumps and the game file index are made from the game's data.
+*.nro
+*.nso
+*.nacp
+*.elf
+*.mesp
+*.mesp.idx
+*.dksh
+*.ucode
+*.rgba
+*.mp4
+*.zip
+dist/switch/banjo-nx/*.bin
+dist/switch/banjo-nx/cache/
+dist/switch/banjo-nx/newlogs*/
+dist/switch/banjo-nx/capturas/
+deko3d_shaders*.bin
+pipeline_list*.bin
+vfs_index*.bin
+# Other ports' SDK and shader-tool copies this project started from (not built by it)
+sdk_nfsmw/
+shaders_nfsmw/
+# 2026-10-20: tools/difftest's working files (a translated game shader: dp.frag/dp.dksh/dp.bin) and shtool's build output
+tools/difftest/dp.*
+tools/difftest/shtool/obj/
+tools/difftest/shtool/bin/
+# 2026-10-21: the PGO profile (.gcda files merged from an instrumented run; tools/pgo_merge.py, docs/pgo-lto.md)
+pgo/*
+*.stream
+# ...except the PGO profile of the released NRO (counts of which code ran, no game code or data)
+!pgo/*.gcda
+# 2026-11-11 (port 81): the in-place copies' form has a profile of its own (CMake BANJO_PGO_DIR_IN_PLACE), kept the same way
+pgo-inplace/*
+!pgo-inplace/*.gcda

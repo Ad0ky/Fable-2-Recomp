@@ -1,0 +1,40 @@
+# banjo-nx (2026-10-19, banjo_deko3d_gpr32): pixel shaders that compile to 33-40 GPRs (tools/deko3d_shader_stats.py
+# over the package 34 / 35 lists); tools/deko3d_glsl_opt.py pass gpr32 gives them constant 910.
+13AD4CE9221F7D2C
+14A0D4C740686E7D
+1754EFF0142AD810
+2B313C7E821425A6
+2EC5B75DBC2E1B21
+2F36770769087F99
+2F3D4D66D642CA0A
+3F74E3E6E0C5096B
+54A01C80D41DA2BA
+6787A2DD180A8478
+6A048411BD40F88A
+8AB5E47DE71F3C89
+AACAD91A37311B7B
+AD7534D022009447
+B3C10F3D80EF61E2
+B48A0712BAC5DEB1
+BA23CE1D64163606
+BBE9EABBD7449C2E
+C92BA80672FB9774
+D40EBF0336F89333
+DC0661792CF3EAD2
+DC9896FB73A32F2A
+EA4C367F67309DCC
+EBDCD4E45414E36C
+F6EBD96A65CC9293
+# fable2-nx (2026-11-17, the console's GPU profile of the snowy gameplay): Fable 2's two heaviest pixel shaders with 33-40
+# GPRs: the world's (6.8 ms a frame, 512 draws, 40 GPRs) and 81B9 (4.9 ms, 78 draws, 37 GPRs).
+# 9A193FEBB26723F4  (measured, see below: not listed)
+# 81B999B2D4B08A8D  (measured, see below: not listed)
+# fable2-nx (2026-11-17): with a cap above 32 (the cap after the hash). The real variants on the PC uam
+# (UAM_BANJO_MAX_GPR): C472 (8.3 ms a frame, 78 GPRs, about 25 warps an SM) at 64: 32 warps, 28 local loads/stores,
+# 611 -> 639 instructions; B950 (3.5 ms, the point sprites' pixel shader, 49 GPRs, 36 warps) at 48: 42 warps, 2.
+# C472C3A411FD0A14 64  (measured, see below: not listed)
+# B950F34C5012D6F7 48  (measured, see below: not listed)
+# fable2-nx (2026-11-17, the console A/B, banjo_deko3d_gpr32 on / off in the same snowy gameplay, per-shader GPU ms a
+# frame): 9A193FEB at 32: 20.7 / 7.0 (the spills tripled it); 81B999B2 at 32: 6.5 / 5.1; C472 at 64: 8.07 / 8.01;
+# B950 at 48: 4.65 / 4.78. Frame 80 / 62 ms. Fable 2's heavy shaders wait on their texture reads, not on warp
+# slots: none of them is listed.

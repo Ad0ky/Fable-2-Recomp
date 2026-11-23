@@ -1,0 +1,13 @@
+# fable2-nx: the code generation tools/nx/codegen_lists.py keep audits: renut_config.toml without non_argument_as_local
+# (every use spelled ctx.X, tools/non_argument_audit.py's default mode), into out/audit/gen_noarg. Never built.
+[project]
+sdk_version = "0.10.0"
+name = "renut"
+
+[entrypoint]
+includes = [
+ "renut_config.toml"
+]
+file_path = "assets/default.xex"
+out_directory_path = "../out/audit/gen_noarg"
+non_argument_as_local = false
