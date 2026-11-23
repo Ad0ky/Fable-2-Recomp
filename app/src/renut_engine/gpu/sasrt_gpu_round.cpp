@@ -424,6 +424,18 @@ REXCVAR_DEFINE_BOOL(sasrt_image_best_fit, true, "SASRT/GPU",
                     "An image goes to the smallest free range it fits among the image heap's shared chunks (the first "
                     "that fit before): fewer holes, and chunks that empty go back to the GPU region")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// fable2-nx (2026-11-17, Fable 2's town: ~10% of the render thread making textures, most of it dkImageInitialize's GPU
+// mapping ioctl, for resolve destinations and render targets made again every frame): plume_deko3d.h, Deko3DSetImagePoolMb.
+// fable2-nx (2026-11-19, the GPU fault: deko3d's flush aborts with no word of what faulted): plume_deko3d.h,
+// Deko3DSetGpuCrumbs. Each draw, dispatch and copy leaves a breadcrumb the GPU writes when it is done; when the GPU
+// refuses a submission, deko3d.log gets the channel's error notification and the operations around where it stopped.
+REXCVAR_DEFINE_BOOL(fable2_gpu_crumbs, false, "Fable2",
+                    "Diagnostic: GPU breadcrumbs after every draw, dispatch and copy; on a GPU fault deko3d.log names "
+                    "the operations where the GPU stopped (a little GPU and CPU time)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(fable2_image_pool_mb, 64, "Fable2",
+                     "Retired GPU images kept (up to this many MB) and reused by new textures of the same layout, "
+                     "instead of new memory and a new GPU mapping each time; 0 = off");
 // sasrt-nx (2026-11-09; port 58): plume_deko3d.h, Deko3DSetDedicatedTargets.
 // sasrt-nx (2026-11-11, port 79; the stutter hunt, run slow2: 55 of the race's 60 frames over 60 ms followed a dynamic-resolution
 // step, each step ~33 dedicated blocks made in one frame and the old ones destroyed two frames later). plume_deko3d.h,
@@ -585,6 +597,8 @@ void ApplyPlume() {
   plume::g_deko3dOptions.preciseStencilWrite = REXCVAR_GET(sasrt_gpu_precise_stencil_write);
   plume::g_deko3dOptions.expSphStoreBits = uint32_t(REXCVAR_GET(sasrt_gpu_exp_sph_no_global_store));  // an experiment
   plume::Deko3DSetDedicatedTargets(REXCVAR_GET(sasrt_dedicated_targets));  // sasrt-nx (2026-11-09; port 58)
+  plume::Deko3DSetImagePoolMb(REXCVAR_GET(fable2_image_pool_mb) > 0 ? uint32_t(REXCVAR_GET(fable2_image_pool_mb)) : 0u);  // fable2-nx (2026-11-17)
+  plume::Deko3DSetGpuCrumbs(REXCVAR_GET(fable2_gpu_crumbs));  // fable2-nx (2026-11-19)
   plume::Deko3DSetTargetBlockCacheMb(uint32_t(REXCVAR_GET(sasrt_target_block_cache_mb)));  // sasrt-nx (2026-11-11)
   plume::Deko3DSetRegionBestFit(REXCVAR_GET(sasrt_region_best_fit));      // sasrt-nx (2026-11-09 night; port 58)
   plume::Deko3DSetImageBestFit(REXCVAR_GET(sasrt_image_best_fit));        // sasrt-nx (2026-11-09 night; port 58)

@@ -32,6 +32,9 @@ fp_copy_pairs = true
 fp_copy_forwarding = true
 div_inline = true
 fp_moves_modeless = true
+# fable2-nx (2026-11-20, from himdo/rexglue-sdk#38): vexptefp as the 360 gives it outside [-126, 128): 0, +inf, NaN
+# (Fable 2's exp2f/expf/powf helpers use it; without it those inputs gave garbage, ~0 or NaN)
+vmx_expte_range = true
 # The register "diet" keys, as the base has them. Fable 2's own manifest (himdo's, run on the PC and in fable2-nx on
 # the console) already had cr/ctr/xer/reserved_as_local, skip_msr, non_argument_as_local and non_volatile_as_local on
 # with no keep list. The base's audits run on every Docker build anyway (tools/nx/codegen-audit.sh: read_before_write.py,

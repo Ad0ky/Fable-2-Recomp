@@ -14,6 +14,8 @@ folder it is in (see below).
 | [nfsmw-nx](https://github.com/StevensND/nfsmw-nx) by StevensND | The Horizon (Switch) layer of the SDK, the profiling and PGO method, scripts and the toolchain file | GPL-3.0; the SDK parts BSD-3-Clause |
 | [NFSMW Recompiled](https://github.com/madelrandel-blip/NFSMW-Recompiled) by madelrandel-blip | The recompilation project the ports above started from | GPL-3.0 |
 | [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) by Tom Clay, with portions from [Xenia](https://xenia.jp) (Ben Vanik and the Xenia contributors) | `sdk/` | BSD-3-Clause (`sdk/LICENSE`) |
+| [himdo/rexglue-sdk](https://github.com/himdo/rexglue-sdk) (the PC Fable II port's SDK fork), by its contributors | The terrain tessellation pass on the CPU: `app/src/renut_engine/gpu/render/fable2_terrain_tess_vs.inc` (unchanged) and the code around it in `draw.cpp` (`fable2_cpu_tess`) | BSD-3-Clause (as the ReXGlue SDK) |
+| [itar3/Fable2RecompMac](https://github.com/itar3/Fable2RecompMac), by its contributors | Findings in its notes (docs/NATIVE_RENDERER.md) behind the occlusion queries on the GPU (`fable2_occlusion_queries`, `backend/queued.cpp`): the sun glare's queries, the hold of a visible answer; no code taken | MIT |
 | [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) by hedge-dev and contributors, with the changes of the ports above and this one | `shaders/`, `app/thirdparty/reblue-XenosRecomp` | MIT |
 
 The Horizon (Switch) layer added to `sdk/` is under the SDK's BSD-3-Clause license, and the changes in `shaders/` and

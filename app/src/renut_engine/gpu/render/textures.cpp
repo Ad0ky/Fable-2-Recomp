@@ -10,7 +10,10 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <string>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include <xxhash.h>
 
@@ -26,6 +29,7 @@
 #include <atomic>
 #include "renut_engine/gpu/render/draw.h"
 #include "renut_engine/gpu/render/graphics_options.h"
+#include "renut_engine/gpu/render/surfaces.h"  // fable2-nx (2026-11-20): the marker
 #include "renut_engine/gpu/backend/video.h"
 
 namespace renut::gpu {
@@ -1053,7 +1057,11 @@ namespace {
 // Marks the host textures of the resources unlocked since the last call.
 // Unlocks of anything else (vertex buffers, textures never bound) are dropped.
 void ApplyUnlocksLocked() {
-  std::vector<u32> unlocked;
+  // fable2-nx (2026-11-19): one spare kept (the render thread's), so the list the game's threads fill keeps its room: it
+  // was swapped for an empty one at each call and grew again from nothing (NoteTextureUnlocked: 24% of the 3D Engine
+  // thread's operator new, under the heap lock the render thread takes too).
+  static std::vector<u32> unlocked;
+  unlocked.clear();
   {
     std::lock_guard lock(g_unlocked_mutex);
     if (g_unlocked.empty())
@@ -1603,6 +1611,20 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
   // at the resolve's scale; guest data is at the guest size.
   HostTexture *depth_source = !(slot && slot->gpu_written) ? DepthWordsSource(fetch) : nullptr;
   if (depth_source) {
+    // fable2-nx (2026-11-23, the run of 2026-11-21: "depth resolves | 1024x1024 into 1024x1024 with words" 1.3 ms a frame,
+    // and no bind read the words): which fetch makes a depth resolve destination write its words at every resolve.
+    if (!depth_source->words_wanted) {
+      static uint32_t logged = 0;
+      if (logged < 16) {
+        ++logged;
+        RGPU_INFO("[depth words] destination {:08X} ({}x{}, {} resolves) wanted as words from now on: fetched by header "
+                  "{:08X}, base {:05X}000, {}x{} format {} (fetch words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X})",
+                  depth_source->guest_va, depth_source->width, depth_source->height, depth_source->resolves, texture_va,
+                  fetch.BasePage(), (fetch.dword[2] & 0x1FFFu) + 1, ((fetch.dword[2] >> 13) & 0x1FFFu) + 1,
+                  u32(fetch.Format()), fetch.dword[0], fetch.dword[1], fetch.dword[2], fetch.dword[3], fetch.dword[4],
+                  fetch.dword[5]);
+      }
+    }
     EnsureDepthWordsLocked(*depth_source);  // banjo-nx (banjo_renut_depth_words_lazy)
     if (fx)
       fx->depth_source = true;  // banjo-nx (2026-10-19, render-thread proposal 3)
@@ -2386,5 +2408,67 @@ uint32_t SamplerSlotUncached(const TextureFetch &fetch, RenderScale lod_scale) {
 }
 
 } // namespace
+
+// fable2-nx (2026-11-20, the marker's texture lines): what a marked draw's fetch slot samples, by the guest's side (the
+// fetch constant's address, size and format) and the host's (the texture or target behind the bound descriptor, how and
+// when its content was last made), so the two frames of a mark show a stale or wrong binding as a difference.
+std::string MarkerDescribeTextureLocked(u32 texture_va, const TextureFetch &fetch, u32 index_word) {
+  const u32 slot = index_word & ((1u << kResolutionScaleShift) - 1u);
+  const u32 w = (fetch.dword[2] & 0x1FFFu) + 1, h = ((fetch.dword[2] >> 13) & 0x1FFFu) + 1;
+  std::string out = fmt::format("header {:08X} base {:05X}000 {}x{} fmt {} dim {} mips {}-{}", texture_va,
+                                fetch.BasePage(), w, h, u32(fetch.Format()), u32(fetch.Dimension()),
+                                fetch.MinMipLevel(), fetch.MaxMipLevel());
+  auto describe = [&](const HostTexture &t, const char *how) {
+    out += fmt::format(" -> {} tex {:08X} {}x{} fmt {} host {}x{}{}{} resolves {} hash {:016X} checked f{} unlock f{} "
+                       "used f{}{}{}{}",
+                       how, t.guest_va, t.width, t.height, u32(t.guest_format), t.alloc_width, t.alloc_height,
+                       t.gpu_written ? " gpu" : "", t.render_target ? " rt" : "", t.resolves, t.content_hash,
+                       t.checked_frame, t.unlock_frame, t.used_frame, t.dynamic ? " dynamic" : "",
+                       t.lock_driven ? " lock" : "", t.handed_from ? " handed" : "");
+  };
+  if (slot == kNullTextureSlot || slot == kNullTexture3DSlot || slot == kNullTextureCubeSlot) {
+    out += " -> null texture";
+    return out;
+  }
+  auto owns = [&](const HostTexture &t) {
+    if (t.slot == slot || t.level0_slot == slot)
+      return true;
+    for (const auto &v : t.swizzle_views)
+      if (v.slot == slot)
+        return true;
+    for (const auto &v : t.words_views)
+      if (v.slot == slot)
+        return true;
+    return false;
+  };
+  auto own = g_textures.find(texture_va);
+  if (own != g_textures.end() && own->second && owns(*own->second)) {
+    describe(*own->second, "own");
+    return out;
+  }
+  for (const auto &[va, t] : g_textures) {
+    if (!t)
+      continue;
+    if (owns(*t)) {
+      describe(*t, "OTHER");
+      return out;
+    }
+    if (t->words && owns(*t->words)) {
+      describe(*t, "words of");
+      return out;
+    }
+  }
+  if (const HostSurface *surface = MarkerSurfaceForSlotLocked(slot)) {
+    out += fmt::format(" -> target image {:08X} {}x{} fmt {}{} gen {} writes {}", surface->guest_va, surface->width,
+                       surface->height, int(surface->format), surface->depth ? " depth" : "", surface->generation,
+                       surface->writes);
+    return out;
+  }
+  if (own != g_textures.end() && own->second)
+    describe(*own->second, "slot unknown; own is");
+  else
+    out += fmt::format(" -> slot {} of nothing known", slot);
+  return out;
+}
 
 } // namespace renut::gpu

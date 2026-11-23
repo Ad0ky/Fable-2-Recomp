@@ -29,6 +29,12 @@
 #include "renut_engine/gpu/backend/render_thread.h"
 #include "renut_engine/gpu/banjo_renut_tuning.h"
 #include "renut_engine/gpu/line_compare.h"
+#include "renut_engine/gpu/backend/video.h"  // fable2-nx (2026-11-23): occlusion queries
+#include "renut_engine/gpu/backend/backend.h"
+#include <plume_render_interface.h>
+#if defined(PLUME_DEKO3D)
+#include <plume_deko3d.h>
+#endif
 
 // banjo-nx (2026-10-20, from sa2-nx): see SnapshotKind below.
 REXCVAR_DEFINE_BOOL(banjo_renut_snapshot_deltas, true, "Banjo/Enhancements",
@@ -296,7 +302,54 @@ struct DeferredDraw {
   u32 index_bytes = 0;
 };
 std::mutex g_deferred_mutex;
-std::unordered_map<u32, DeferredDraw> g_deferred;
+// fable2-nx (2026-11-18, the 3D Engine thread waiting 24% of its time on newlib's heap lock): the deferred draws were an
+// unordered_map whose node was made and freed at every Begin*Vertices draw (56% of that thread's operator new, 62% of
+// its frees). The same map in fixed slots (a device has at most one waiting draw; Fable has one device): a slot is a
+// device's while it holds a capture. Under g_deferred_mutex, as before.
+struct DeferredSlots {
+  static constexpr size_t kSlots = 16;
+  struct Slot {
+    u32 device = 0;
+    DeferredDraw draw;
+  } slots[kSlots];
+  size_t live = 0;
+  // The device's waiting draw, or nullptr.
+  DeferredDraw *find(u32 device) {
+    for (Slot &s : slots)
+      if (s.draw.capture && s.device == device)
+        return &s.draw;
+    return nullptr;
+  }
+  // Sets the device's waiting draw (capture not null); one already waiting is the caller's to give back first.
+  void set(u32 device, const DeferredDraw &draw) {
+    if (DeferredDraw *d = find(device)) {
+      *d = draw;
+      return;
+    }
+    for (Slot &s : slots)
+      if (!s.draw.capture) {
+        s.device = device;
+        s.draw = draw;
+        ++live;
+        return;
+      }
+    // More devices than slots (not seen): the first slot's draw is dropped, as a replaced one was.
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      RGPU_ERROR("deferred draws: more than {} devices with a Begin*Vertices draw waiting", kSlots);
+    }
+    g_capture_pool.Give(slots[0].draw.capture);
+    slots[0].device = device;
+    slots[0].draw = draw;
+  }
+  void erase(DeferredDraw *d) {
+    *d = DeferredDraw{};
+    --live;
+  }
+  size_t size() const { return live; }
+};
+DeferredSlots g_deferred;
 // banjo-nx (2026-10-20, from sa2-nx, banjo_renut_callbacks_fast): g_deferred.size(), kept under g_deferred_mutex and read without it
 // (FlushDeferredVertices: every hook calls it first). A Begin*Vertices draw is flushed by the next hook of its device,
 // on the thread that made it, which sees the count in program order.
@@ -638,9 +691,11 @@ void QueueCapture(DrawCapture *capture) {
       // banjo-nx (from sa2-nx) (banjo_renut_snapshot_deltas_constants): every constant is the rebuilt device's (no running device).
       const ReplayConstants chain{nullptr, ~uint64_t(0), ~uint64_t(0), &g_chain_vs_dirty, &g_chain_ps_dirty,
                                   g_chain_id};
-      DrawStateLocked(device, call, &chain);
+      if (!DrawStateLocked(device, call, &chain))
+        OcclusionQueryDrawDroppedLocked();  // fable2-nx (2026-11-23)
     } else {
-      DrawStateLocked(device, call);
+      if (!DrawStateLocked(device, call))
+        OcclusionQueryDrawDroppedLocked();  // fable2-nx (2026-11-23)
     }
     g_chain_hint = {};  // banjo-nx (from sa2-nx): only for the draw itself
     SetReplayStackHeaders(nullptr);  // blur-nx (2026-11-10, port 76; its key 215)
@@ -881,11 +936,10 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
     std::unique_lock<std::mutex> chain(g_delta.mutex);
     {
       std::lock_guard lock(g_deferred_mutex);
-      auto it = g_deferred.find(device_va);
-      if (it != g_deferred.end()) {
+      if (DeferredDraw *it = g_deferred.find(device_va)) {
         // One not flushed (FlushDeferredVertices above queued it, so none is expected): dropped as the original
         // replaced it; its delta never reaches the render thread, so the chain rebases.
-        g_capture_pool.Give(it->second.capture);
+        g_capture_pool.Give(it->capture);
         g_deferred.erase(it);
         g_deferred_count.store(g_deferred.size(), std::memory_order_release);
         g_delta.device.store(nullptr, std::memory_order_relaxed);
@@ -895,7 +949,7 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
     if (!capture)
       return;
     std::lock_guard lock(g_deferred_mutex);
-    g_deferred[device_va] = {capture, scratch, bytes, index_scratch, index_bytes};
+    g_deferred.set(device_va, {capture, scratch, bytes, index_scratch, index_bytes});
     g_deferred_count.store(g_deferred.size(), std::memory_order_release);
     return;
   }
@@ -917,9 +971,9 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
     return;
   }
   std::lock_guard lock(g_deferred_mutex);
-  DeferredDraw &slot = g_deferred[device_va];
-  g_capture_pool.Give(slot.capture);  // one not flushed (the original replaced it the same way)
-  slot = {capture, scratch, bytes, index_scratch, index_bytes};
+  if (DeferredDraw *old = g_deferred.find(device_va))
+    g_capture_pool.Give(old->capture);  // one not flushed (the original replaced it the same way)
+  g_deferred.set(device_va, {capture, scratch, bytes, index_scratch, index_bytes});
   g_deferred_count.store(g_deferred.size(), std::memory_order_release);
 }
 
@@ -935,10 +989,10 @@ void FlushDeferredVertices(u32 device_va) {
   DeferredDraw deferred;
   {
     std::lock_guard lock(g_deferred_mutex);
-    auto it = g_deferred.find(device_va);
-    if (it == g_deferred.end())
+    DeferredDraw *it = g_deferred.find(device_va);
+    if (!it)
       return;
-    deferred = std::move(it->second);
+    deferred = *it;
     g_deferred.erase(it);
     g_deferred_count.store(g_deferred.size(), std::memory_order_release);
   }
@@ -1012,6 +1066,225 @@ void QueueResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 de
     SetReplayStackHeaders(nullptr);
     g_capture_pool.Give(args, true);
   });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// fable2-nx (2026-11-23): occlusion queries on the GPU (queued.h). Fable2RecompMac found (docs/NATIVE_RENDERER.md,
+// 2026-11-06 to 11-13) that answering every query "fully visible" draws everything the game would cull (town 2504 ->
+// 2230 draws a frame with real counts) and the sun glare at full strength behind walls and at night; with real counts,
+// a visible answer held for 2 frames, no popping.
+} // namespace renut::gpu
+
+REXCVAR_DEFINE_INT32(fable2_occlusion_queries, 2, "Fable2/GPU",
+                     "Occlusion queries: 0 every query answered fully visible (before); 1 measured on the GPU, the "
+                     "sun glare's queries answered with their counts, the rest visible; 2 every query answered with its "
+                     "count (the game culls what is hidden), a visible answer held for fable2_occlusion_hold counts")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(fable2_occlusion_hold, 2, "Fable2/GPU",
+                     "With fable2_occlusion_queries = 2: a query object counted visible within its last this many "
+                     "counts is answered visible (no popping when a count drops to 0 for a frame)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace renut::gpu {
+
+float g_occlusion_scale = 1.0f;
+
+int OcclusionQueriesMode() {
+  static const int mode = std::clamp(int(REXCVAR_GET(fable2_occlusion_queries)), 0, 2);
+  return mode;
+}
+
+namespace {
+constexpr u32 kQueryEntries = 4096;  // 16-byte counter reports, a ring
+constexpr uint64_t kQuerySentinel = ~uint64_t(0);
+struct OpenQuery {
+  u32 query = 0;
+  u32 begin = UINT32_MAX;  // UINT32_MAX: not measured (no command list, the ring full)
+  bool dropped = false;    // a draw inside it was dropped
+};
+struct EndedQuery {
+  u32 query = 0;
+  u32 begin = 0, end = 0;
+  bool failed = false;
+  float scale = 1.0f;
+};
+struct QueryResult {
+  u32 samples = 0;
+  u32 history = 0;  // bit 0: the newest count was not 0, bit 1 the one before, ...
+};
+std::unique_ptr<plume::RenderQueryPool> g_query_pool;
+u32 g_query_next = 0, g_query_in_use = 0;
+std::vector<OpenQuery> g_query_open;
+std::vector<EndedQuery> g_query_ended;
+std::mutex g_query_results_mutex;
+std::unordered_map<u32, QueryResult> g_query_results;
+// The 10 s line's counts.
+std::atomic<uint64_t> g_q_issued{0}, g_q_counted{0}, g_q_zero{0}, g_q_failed{0}, g_q_real{0}, g_q_visible{0},
+    g_q_held{0};
+
+volatile uint64_t *QueryWords() {
+#if defined(PLUME_DEKO3D)
+  return g_query_pool ? const_cast<volatile uint64_t *>(plume::Deko3DQueryPoolWords(g_query_pool.get())) : nullptr;
+#else
+  return nullptr;
+#endif
+}
+
+// A counter report of SamplesPassed (DkCounter 2) into a new entry, its value set to the sentinel first (the GPU's
+// report replaces it): UINT32_MAX when none can be made.
+u32 ReportSamplesLocked() {
+#if defined(PLUME_DEKO3D)
+  VideoState &s = State();
+  if (!IsDeko3D() || !Video::EnsureCommandListLocked())
+    return UINT32_MAX;
+  if (!g_query_pool) {
+    g_query_pool = s.device->createQueryPool(kQueryEntries);
+    if (!g_query_pool)
+      return UINT32_MAX;
+  }
+  volatile uint64_t *words = QueryWords();
+  if (!words || g_query_in_use + 2 > kQueryEntries - 64)
+    return UINT32_MAX;
+  const u32 e = g_query_next;
+  g_query_next = (g_query_next + 1) % kQueryEntries;
+  ++g_query_in_use;
+  words[e * 2] = kQuerySentinel;
+  plume::Deko3DReportCounter(Video::CommandListLocked(), g_query_pool.get(), e, 2);  // DkCounter_SamplesPassed
+  return e;
+#else
+  return UINT32_MAX;
+#endif
+}
+}  // namespace
+
+void QueueQueryBegin(u32 device_va, u32 query_va) {
+  if (!OcclusionQueriesMode() || !State().host_ready)
+    return;
+  FlushDeferredVertices(device_va);
+  ++g_q_issued;
+  render_thread::Queue([query_va] {
+    for (auto it = g_query_open.begin(); it != g_query_open.end(); ++it) {
+      if (it->query == query_va) {  // begun again without an end: the first is forgotten
+        if (it->begin != UINT32_MAX)
+          --g_query_in_use;
+        g_query_open.erase(it);
+        break;
+      }
+    }
+    g_query_open.push_back({query_va, ReportSamplesLocked(), false});
+  });
+}
+
+void QueueQueryEnd(u32 device_va, u32 query_va) {
+  if (!OcclusionQueriesMode() || !State().host_ready)
+    return;
+  FlushDeferredVertices(device_va);
+  render_thread::Queue([query_va] {
+    for (auto it = g_query_open.begin(); it != g_query_open.end(); ++it) {
+      if (it->query != query_va)
+        continue;
+      EndedQuery e{query_va, it->begin, UINT32_MAX, it->dropped || it->begin == UINT32_MAX, g_occlusion_scale};
+      if (!e.failed) {
+        e.end = ReportSamplesLocked();
+        if (e.end == UINT32_MAX)
+          e.failed = true;
+      }
+      if (e.failed) {
+        // its entries are free now (nothing will read them)
+        if (it->begin != UINT32_MAX)
+          --g_query_in_use;
+        if (e.end != UINT32_MAX)
+          --g_query_in_use;
+        e.begin = e.end = UINT32_MAX;
+      }
+      g_query_ended.push_back(e);
+      g_query_open.erase(it);
+      return;
+    }
+  });
+}
+
+bool OcclusionQueryActiveLocked() { return !g_query_open.empty(); }
+
+void OcclusionQueryDrawDroppedLocked() {
+  for (OpenQuery &q : g_query_open)
+    q.dropped = true;
+}
+
+void OcclusionQueriesCollectLocked() {
+  if (g_query_ended.empty())
+    return;
+  volatile uint64_t *words = QueryWords();
+  size_t kept = 0;
+  for (size_t i = 0; i < g_query_ended.size(); ++i) {
+    const EndedQuery &e = g_query_ended[i];
+    u32 samples = 0;
+    bool known = false;
+    if (e.failed) {
+      ++g_q_failed;
+    } else {
+      const uint64_t a = words ? words[e.begin * 2] : kQuerySentinel;
+      const uint64_t b = words ? words[e.end * 2] : kQuerySentinel;
+      if (a == kQuerySentinel || b == kQuerySentinel) {  // not run yet (a later list): kept for the next fence
+        g_query_ended[kept++] = e;
+        continue;
+      }
+      g_query_in_use -= 2;
+      // In guest samples: the host target is 'scale' times the guest's on each side; any passed sample counts 1.
+      const uint64_t host = b >= a ? b - a : 0;
+      const double s2 = double(e.scale) * double(e.scale);
+      samples = host ? u32(std::clamp<double>(double(host) / (s2 > 0.0 ? s2 : 1.0), 1.0, 0x7FFFFFFF)) : 0;
+      known = true;
+      ++g_q_counted;
+      if (!samples)
+        ++g_q_zero;
+    }
+    std::lock_guard lock(g_query_results_mutex);
+    QueryResult &r = g_query_results[e.query];
+    if (known) {
+      r.samples = samples;
+      r.history = (r.history << 1) | (samples ? 1u : 0u);
+    } else {
+      r.samples = 0x10000;  // not measured: visible, as before
+      r.history = (r.history << 1) | 1u;
+    }
+  }
+  g_query_ended.resize(kept);
+}
+
+bool OcclusionQueryAnswer(u32 query_va, bool sun, u32 &samples) {
+  const int mode = OcclusionQueriesMode();
+  if (!mode || (!sun && mode < 2))
+    return false;
+  static const u32 hold = u32(std::clamp(int(REXCVAR_GET(fable2_occlusion_hold)), 0, 16));
+  std::lock_guard lock(g_query_results_mutex);
+  const auto it = g_query_results.find(query_va);
+  if (it == g_query_results.end()) {
+    if (!sun) {
+      ++g_q_visible;
+      return false;
+    }
+    samples = 0;  // Fable2RecompMac: a sun query reads 0 until its first count is in
+    ++g_q_real;
+    return true;
+  }
+  const QueryResult &r = it->second;
+  if (!sun && !r.samples && hold && (r.history & (((1u << hold) - 1u) << 1))) {
+    ++g_q_held;
+    return false;
+  }
+  samples = r.samples;
+  ++g_q_real;
+  return true;
+}
+
+std::string OcclusionQueryReport() {
+  if (!OcclusionQueriesMode())
+    return {};
+  return fmt::format("; occlusion queries (fable2_occlusion_queries {}): {} issued, {} counted ({} of them 0), {} not "
+                     "measured; answers: {} counts, {} visible (no count yet), {} held visible",
+                     OcclusionQueriesMode(), g_q_issued.exchange(0), g_q_counted.exchange(0), g_q_zero.exchange(0),
+                     g_q_failed.exchange(0), g_q_real.exchange(0), g_q_visible.exchange(0), g_q_held.exchange(0));
 }
 
 } // namespace renut::gpu

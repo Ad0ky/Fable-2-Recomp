@@ -100,6 +100,10 @@ struct ShaderRecord {
     uint32_t bytes = 0;
     bool exports = false;
     bool bound_fetches = false;
+    // fable2-nx (2026-11-17): the first four inputs fetched by another index (their bound_fetch rows, ascending), for
+    // render/draw.cpp FetchSpecWords: a shader whose bound inputs are not 0-3 (Fable 2's skinned characters: 7-9) gets
+    // its fetch types specialised too. 0xFF: none.
+    uint8_t bound_index[4] = {0xFF, 0xFF, 0xFF, 0xFF};
     bool composite = false;  // banjo-nx (2026-10-23, batch 6): a pixel shader of the frame's final composite (CompositePs)
     bool skin_once = false;  // banjo-nx (2026-10-27): a vertex shader of banjo_deko3d_skin_once's (IsSkinOnceVs)
     bool known = false;

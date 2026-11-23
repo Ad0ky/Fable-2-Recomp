@@ -31,9 +31,17 @@ if not exist app\assets\default.xex (
   if not exist "%GAME_DIR%\default.xex" (echo RESULT: no default.xex in "%GAME_DIR%" - set GAME_DIR. >> switch-build.log & goto end)
   copy /y "%GAME_DIR%\default.xex" app\assets\default.xex >> switch-build.log
 )
+rem fable2-nx (2026-11-23): the game's shader banks, for the shaders build (tools/fable2_shader_bank.py): all 588 shaders.
+if not exist app\assets\shaders mkdir app\assets\shaders
+if exist "%GAME_DIR%\data\Shaders\*.sbk" xcopy /d /y /q "%GAME_DIR%\data\Shaders\*.sbk" app\assets\shaders\ >> switch-build.log 2>&1
 if not exist out\shader_capture mkdir out\shader_capture
 if exist "%~dp0..\fable2-nx\out\shader_capture" xcopy /d /y /q "%~dp0..\fable2-nx\out\shader_capture\*.bin" out\shader_capture\ >> switch-build.log 2>&1
 if exist "%SDCARD%\shader_capture" xcopy /d /y /q "%SDCARD%\shader_capture\*.bin" out\shader_capture\ >> switch-build.log 2>&1
+rem fable2-nx (2026-11-17): the console's pipeline list and its shader cache (with what it compiled while playing),
+rem for the shaders build: it compiles every listed pipeline's variants ahead and keeps the cache's own entries.
+if not exist out\console mkdir out\console
+if exist "%SDCARD%\pipeline_list.bin" copy /y "%SDCARD%\pipeline_list.bin" out\console\pipeline_list.bin >> switch-build.log
+if exist "%SDCARD%\deko3d_shaders.bin" copy /y "%SDCARD%\deko3d_shaders.bin" out\console\deko3d_shaders.bin >> switch-build.log
 docker image inspect lo-switch-dev > nul 2>&1
 if errorlevel 1 (
   echo Building the toolchain image lo-switch-dev, first run only - this takes a while...

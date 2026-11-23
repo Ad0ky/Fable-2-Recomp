@@ -46,7 +46,7 @@ std::atomic<size_t> g_waiting{0};
 
 } // namespace
 
-void InsertCallback(u32 function, u32 context) {
+void InsertCallback(u32 function, u32 context, bool flush_fills) {
   uint64_t seq;
   {
     std::lock_guard lock(g_mutex);
@@ -58,7 +58,8 @@ void InsertCallback(u32 function, u32 context) {
   // command list is submitted: after the callback the game may rewrite them
   // (the XMV player's frames).
   // banjo-nx (package 27c): the vertex fills too, for the same reason.
-  banjo::renut_gpu::checks::QueueKickFlush();
+  if (flush_fills)
+    banjo::renut_gpu::checks::QueueKickFlush();
   render_thread::QueueCallbackMarker(seq);
 }
 

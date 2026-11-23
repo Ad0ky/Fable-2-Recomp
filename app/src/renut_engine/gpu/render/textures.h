@@ -13,9 +13,11 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <plume_render_interface.h>
+#include <plume_recycled.h>  // fable2-nx (2026-11-20)
 
 #include <rex/types.h>
 
@@ -29,7 +31,8 @@ namespace renut::gpu {
 struct DepthImage;   // render/surfaces.h
 struct HostSurface;
 
-struct HostTexture {
+// fable2-nx (2026-11-20): Recycled (plume_recycled.h): resolve targets are made again every frame.
+struct HostTexture : plume::Recycled<HostTexture> {
   u32 guest_va = 0;
   u32 base_page = 0;  // banjo-nx (2026-10-27): its fetch constant's base page as made (BumpTextureBindings)
   u32 desc[6] = {};  // the header fetch constant bits that define the data
@@ -247,6 +250,8 @@ struct BindEffects {
 // the same texture epoch, with the same header and fetch words: its texture used this frame and, filled from guest
 // memory, the frame's content check (an upload if it changed). False for bindings it does not cover (the caller binds).
 bool RefreshBindingLocked(u32 texture_va, const TextureFetch &device_fetch, const BindEffects &fx);
+// fable2-nx (2026-11-20): the marker's line for a fetch slot (render/draw.cpp FillTextures).
+std::string MarkerDescribeTextureLocked(u32 texture_va, const TextureFetch &fetch, u32 index_word);
 // banjo-nx (2026-10-27, render thread night, A/B 35): what g_texture_epoch counts, by the fetch's base page and by the
 // header's address (hashed into 4,096 buckets each): a texture made or retired, a resolve destination or depth words
 // entry of a page, a depth hand-over's state. A memo entry of a binding that went through no depth words and no

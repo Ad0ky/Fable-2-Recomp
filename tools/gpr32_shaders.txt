@@ -25,3 +25,16 @@ DC9896FB73A32F2A
 EA4C367F67309DCC
 EBDCD4E45414E36C
 F6EBD96A65CC9293
+# fable2-nx (2026-11-17, the console's GPU profile of the snowy gameplay): Fable 2's two heaviest pixel shaders with 33-40
+# GPRs: the world's (6.8 ms a frame, 512 draws, 40 GPRs) and 81B9 (4.9 ms, 78 draws, 37 GPRs).
+# 9A193FEBB26723F4  (measured, see below: not listed)
+# 81B999B2D4B08A8D  (measured, see below: not listed)
+# fable2-nx (2026-11-17): with a cap above 32 (the cap after the hash). The real variants on the PC uam
+# (UAM_BANJO_MAX_GPR): C472 (8.3 ms a frame, 78 GPRs, about 25 warps an SM) at 64: 32 warps, 28 local loads/stores,
+# 611 -> 639 instructions; B950 (3.5 ms, the point sprites' pixel shader, 49 GPRs, 36 warps) at 48: 42 warps, 2.
+# C472C3A411FD0A14 64  (measured, see below: not listed)
+# B950F34C5012D6F7 48  (measured, see below: not listed)
+# fable2-nx (2026-11-17, the console A/B, banjo_deko3d_gpr32 on / off in the same snowy gameplay, per-shader GPU ms a
+# frame): 9A193FEB at 32: 20.7 / 7.0 (the spills tripled it); 81B999B2 at 32: 6.5 / 5.1; C472 at 64: 8.07 / 8.01;
+# B950 at 48: 4.65 / 4.78. Frame 80 / 62 ms. Fable 2's heavy shaders wait on their texture reads, not on warp
+# slots: none of them is listed.

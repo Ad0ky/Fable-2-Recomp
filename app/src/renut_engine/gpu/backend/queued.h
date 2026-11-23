@@ -51,4 +51,22 @@ void QueueResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 de
                   i32 dest_x, i32 dest_y, u32 dest_level, u32 dest_slice,
                   const float clear_color[4], float clear_depth, u32 clear_stencil);
 
+// fable2-nx (2026-11-23, from Fable2RecompMac's notes, docs/NATIVE_RENDERER.md "occlusion queries"): occlusion queries
+// measured on the GPU (fable2_occlusion_queries). D3DQuery_Issue (sub_822195E8) queues a begin / end; the render thread
+// reports deko3d's SamplesPassed counter at both, and once the GPU has run them the difference, in guest samples, is the
+// query object's newest count. D3DQuery_GetData (sub_8220BE78, which must answer at once: its callers spin) gives that
+// count, one or two frames late: OcclusionQueryAnswer false = no count to give (the caller answers "every sample").
+int OcclusionQueriesMode();
+void QueueQueryBegin(u32 device_va, u32 query_va);
+void QueueQueryEnd(u32 device_va, u32 query_va);
+// sun: a 4-byte GetData (the sun glare's two queries, sub_822792D0 and sub_821D8310); else the culling test's 16 bytes.
+bool OcclusionQueryAnswer(u32 query_va, bool sun, u32 &samples);
+// Render thread, State().mutex held: after a slot's fence (the counts the GPU has written), whether a query is open
+// (its draws are drawn even when they write nothing), a draw dropped inside one, and the 10 s line's part.
+void OcclusionQueriesCollectLocked();
+bool OcclusionQueryActiveLocked();
+void OcclusionQueryDrawDroppedLocked();
+extern float g_occlusion_scale;  // the last draw's render target scale (draw.cpp)
+std::string OcclusionQueryReport();
+
 } // namespace renut::gpu

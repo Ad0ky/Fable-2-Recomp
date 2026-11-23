@@ -16,6 +16,11 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xnotifylistener.h>
 #include <rex/system/xtypes.h>
+#include <rex/cvar.h>
+
+#include <atomic>
+
+REXCVAR_DECLARE(bool, input_diag_users);  // xam_input.cpp
 
 namespace rex {
 namespace kernel {
@@ -81,6 +86,13 @@ u32 XNotifyGetNext_entry(u32 handle, u32 match_id, mapped_u32 id_ptr, mapped_u32
   }
 
   *id_ptr = dequeued ? id : 0;
+  if (dequeued && REXCVAR_GET(input_diag_users)) {
+    // fable2-nx (2026-11-18): every notification the game takes (the first 300): a controller or sign-in change, or a
+    // system UI shown, can leave a game paused behind a screen it never draws.
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 300)
+      REXKRNL_INFO("[input] notification 0x{:08X} param 0x{:08X} (asked for 0x{:08X})", id, param, uint32_t(match_id));
+  }
   // param_ptr may be null - 555307F0 Demo explicitly passes nullptr in the
   // code.
   // https://github.com/xenia-project/xenia/pull/1577

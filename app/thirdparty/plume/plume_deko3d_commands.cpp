@@ -37,6 +37,351 @@ namespace plume {
     // Debug builds: the first operations of each kind, logged (what the frame is made of).
     static std::atomic<uint32_t> g_traceClears{0}, g_traceCopies{0}, g_traceTargets{0};
 
+    // fable2-nx (2026-11-19, the GPU fault: the queue's flush fails, deko3d aborts with DkResult_Fail, 2359-0001, with no
+    // word of what faulted). GPU breadcrumbs (Deko3DSetGpuCrumbs): after every draw, dispatch and copy the command list
+    // has the GPU write a timestamp into its own slot of a small buffer (dkCmdBufReportCounter: written once the work
+    // before it is done), and keeps on the CPU what that operation was (its kind, the shaders the renderer named for it,
+    // its counts and GPU addresses). When a submission is refused (the libnx kickoff wrapper, switch_perf.cpp,
+    // RexGpuKickoffFailedHook) the slots say how far the GPU got: the last operation it finished and the ones after it,
+    // logged with the channel's error notification, before deko3d aborts.
+    static constexpr uint32_t CrumbTextures = 12;
+    struct GpuCrumb {
+        uint64_t id = 0;
+        uint64_t vs = 0, ps = 0;     // the renderer's label (Deko3DCrumbLabel): the shaders' hashes, 0 for its own passes
+        uint64_t a[4] = {};          // addresses (see CrumbLine)
+        uint32_t n[6] = {};          // counts
+        char kind = 0;
+        char name[31] = {};          // the pipeline's name when there is no label
+        // fable2-nx (2026-11-19, the MMU fault): a draw's textures: the image descriptor set's block, and per texture its
+        // stage ('V', 'F', 'E' for Deko3DBindFragmentTextures'), its descriptor id and the GPU address its descriptor
+        // held when the draw was recorded (the GPU reads the descriptor when it runs the draw).
+        DkMemBlock imageBlock = nullptr;
+        uint32_t imageCount = 0;
+        uint8_t texCount = 0;
+        char texStage[CrumbTextures] = {};
+        uint32_t texId[CrumbTextures] = {};
+        uint64_t texAddr[CrumbTextures] = {};
+    };
+    static constexpr uint32_t CrumbSlots = 1u << 15;  // 32768: about ten frames of the town's draws
+    static std::atomic<bool> g_crumbsOn{false};
+    static std::atomic<uint64_t> g_crumbId{0}, g_crumbSubmitted{0};
+    static GpuCrumb *g_crumbs = nullptr;              // CrumbSlots records
+    static DkMemBlock g_crumbBlock = nullptr;         // CrumbSlots x 16 bytes the GPU writes
+    static volatile uint64_t *g_crumbCpu = nullptr;
+    static DkGpuAddr g_crumbGpu = 0;
+    static uint64_t g_labelVs = 0, g_labelPs = 0;
+    static std::atomic<bool> g_crumbReported{false};
+
+    extern "C" void (*g_rex_gpu_fault_hook)(uint32_t rc, const uint32_t *notification, int have_notification);
+    extern "C" int g_rex_gpu_crumbs_on;
+    extern "C" void PlumeDeko3DGpuFault(uint32_t rc, const uint32_t *notification, int have_notification);
+    void Deko3DSetGpuCrumbs(bool on) {
+        g_crumbsOn.store(on, std::memory_order_relaxed);
+        // The kickoff wrapper's report (always: a refused submission is logged with or without the breadcrumbs), and
+        // its check of the channel's error notification after each kickoff (with them).
+        g_rex_gpu_fault_hook = PlumeDeko3DGpuFault;
+        g_rex_gpu_crumbs_on = on ? 1 : 0;
+    }
+    extern "C" uint32_t g_rex_gpu_error_info[32];
+    extern "C" int g_rex_gpu_error_info_valid;
+    // Before a flush: a queue deko3d has marked failed is not flushed (deko3d's flush aborts on it); the report and the
+    // breadcrumbs were logged when deko3d found the error (the wrapped notification read). The picture stops instead.
+    // True: flush.
+    static bool crumbCheckBeforeFlush(DkQueue queue) {
+        if (!dkQueueIsInErrorState(queue))
+            return true;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            logf("gpu fault: the queue is in an error state; nothing is flushed or presented from here on (the picture "
+                 "stops: deko3d would abort)");
+            PlumeDeko3DGpuFault(0, nullptr, 0);  // the breadcrumbs, if not logged yet
+        }
+        return false;
+    }
+    uint64_t Deko3DCrumbNow() { return g_crumbId.load(std::memory_order_relaxed); }
+    uint64_t Deko3DCrumbSubmittedNow() { return g_crumbSubmitted.load(std::memory_order_relaxed); }
+
+    // A Maxwell texture header (DkImageDescriptor, 32 bytes): its address, word 1 (low) and word 2 bits 0-15 (high).
+    static uint64_t ticAddress(const volatile uint32_t *d) {
+        return uint64_t(d[1]) | (uint64_t(d[2] & 0xFFFFu) << 32);
+    }
+
+    // The draw's textures and where their addresses lie, now (the block table): the descriptor as recorded and as the
+    // descriptor set holds it now (what the GPU read when it ran the draw, the queue having stopped since).
+    static void crumbTextures(const GpuCrumb &c) {
+        if (!c.texCount) {
+            logf("    no textures recorded for #%llu (image set %s)", (unsigned long long)c.id, c.imageBlock ? "bound" : "none");
+            return;
+        }
+        uint32_t setSize = 0;
+        const volatile uint32_t *set = static_cast<const volatile uint32_t *>(Deko3DBlockCpuIfAlive(c.imageBlock, setSize));
+        char where[512];
+        for (uint32_t k = 0; k < c.texCount; k++) {
+            uint64_t now = 0;
+            const char *nowState = "its set is destroyed";
+            if (set) {
+                if ((c.texId[k] + 1) * 32u <= setSize) {
+                    now = ticAddress(set + c.texId[k] * 8);
+                    nowState = now == c.texAddr[k] ? "the same now" : "CHANGED since";
+                } else {
+                    nowState = "past its set's end";
+                }
+            }
+            Deko3DDescribeGpuAddr(c.texAddr[k], where, sizeof(where));
+            logf("    texture %c id %u (of %u): descriptor address %010llX at record (%s%s%010llX): %s", c.texStage[k],
+                 c.texId[k], c.imageCount, (unsigned long long)c.texAddr[k], nowState, now && now != c.texAddr[k] ? ": " : " ",
+                 (unsigned long long)now, where);
+            if (now && now != c.texAddr[k]) {
+                Deko3DDescribeGpuAddr(now, where, sizeof(where));
+                logf("      its address now %010llX: %s", (unsigned long long)now, where);
+            }
+        }
+    }
+
+    void Deko3DCrumbLabel(uint64_t vs, uint64_t ps) {
+        g_labelVs = vs;
+        g_labelPs = ps;
+    }
+
+    static void crumbLine(const char *what, const GpuCrumb &c) {
+        switch (c.kind) {
+        case 'D':
+        case 'I':
+            logf("gpu crumb %s #%llu: %s draw VS %016llX PS %016llX%s%s: count %u instances %u first %u base %d; index "
+                 "buffer %010llX, address window %010llX (%u bytes), vertex buffers %010llX (%u bytes) %010llX",
+                 what, (unsigned long long)c.id, c.kind == 'I' ? "indexed" : "plain", (unsigned long long)c.vs,
+                 (unsigned long long)c.ps, c.name[0] ? " pipeline " : "", c.name, c.n[0], c.n[1], c.n[2], int32_t(c.n[3]),
+                 (unsigned long long)c.a[0], (unsigned long long)c.a[1], c.n[4], (unsigned long long)c.a[2], c.n[5],
+                 (unsigned long long)c.a[3]);
+            break;
+        case 'X':
+            logf("gpu crumb %s #%llu: dispatch %u x %u x %u%s%s; address window %010llX", what, (unsigned long long)c.id,
+                 c.n[0], c.n[1], c.n[2], c.name[0] ? " pipeline " : "", c.name, (unsigned long long)c.a[1]);
+            break;
+        default:
+            logf("gpu crumb %s #%llu: copy '%c' from %010llX to %010llX, %u bytes (%u x %u)", what,
+                 (unsigned long long)c.id, c.kind, (unsigned long long)c.a[0], (unsigned long long)c.a[1], c.n[0], c.n[1],
+                 c.n[2]);
+            break;
+        }
+    }
+
+    // Called by the kickoff wrapper when the GPU refuses a submission (any thread; once).
+    extern "C" void PlumeDeko3DGpuFault(uint32_t rc, const uint32_t *notification, int have_notification) {
+        if (g_crumbReported.exchange(true))
+            return;
+        if (g_rex_gpu_error_info_valid) {
+            const uint32_t *e = g_rex_gpu_error_info;
+            logf("gpu fault: the channel's error info (nvGpuChannelGetErrorInfo): %08X %08X %08X %08X %08X %08X %08X %08X "
+                 "%08X %08X %08X %08X %08X %08X %08X %08X", e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9],
+                 e[10], e[11], e[12], e[13], e[14], e[15]);
+            // fable2-nx (2026-11-19): the words' layout is not documented; the run of 2026-11-19 gave 1, 0x100, 6,
+            // 0x499BF000, 1. Each reading of an address in them, looked up in the block table.
+            const uint64_t candidates[4] = {(uint64_t(e[4]) << 32) | e[3], (uint64_t(e[2]) << 32) | e[3],
+                                            (uint64_t(e[1]) << 32) | e[2], (uint64_t(e[3]) << 32) | e[4]};
+            char where[512];
+            for (uint64_t a : candidates) {
+                if (!a || a > 0xFFFFFFFFFFull)  // the GPU's addresses have 40 bits
+                    continue;
+                Deko3DDescribeGpuAddr(a, where, sizeof(where));
+                logf("gpu fault: if the fault address is %010llX: %s", (unsigned long long)a, where);
+            }
+        }
+        if (notification && have_notification) {
+            const uint32_t type = notification[2];
+            logf("gpu fault: notification type %u = %s", type,
+                 type == 31 ? "MMU fault (FifoErrorMmuErrFlt: the GPU used an address with no mapping, or one its "
+                              "access may not use)"
+                 : type == 8  ? "idle timeout (FifoErrorIdleTimeout: a hang)"
+                 : type == 13 ? "graphics exception (GrErrorSwNotify)"
+                 : type == 24 ? "semaphore timeout (GrSemaphoreTimeout)"
+                 : type == 25 ? "illegal notify (GrIllegalNotify)"
+                 : type == 32 ? "push buffer DMA error (PbdmaError)"
+                 : type == 43 ? "reset channel verify error"
+                 : type == 80 ? "push buffer CRC mismatch"
+                              : "unknown");
+        }
+        Deko3DLogGpuLayout();
+        if (!notification)
+            logf("gpu fault: found by the queue's error state");
+        else if (have_notification)
+            logf("gpu fault: %s (result 0x%X); the channel's error notification: timestamp "
+                 "%08X%08X, info32 0x%X, info16 0x%X, status 0x%X",
+                 rc ? "the GPU refused a submission" : "the channel's error notification says the GPU faulted", rc,
+                 notification[1], notification[0],
+                 notification[2], notification[3] & 0xFFFF, notification[3] >> 16);
+        else
+            logf("gpu fault: the GPU refused a submission (result 0x%X); no error notification", rc);
+        if (!g_crumbs || !g_crumbCpu) {
+            logf("gpu fault: no breadcrumbs (fable2_gpu_crumbs = true records where the GPU stopped)");
+            return;
+        }
+        const uint64_t newest = g_crumbId.load(std::memory_order_acquire);
+        const uint64_t submitted = g_crumbSubmitted.load(std::memory_order_acquire);
+        uint64_t done = 0;
+        for (uint64_t id = newest; id && id + CrumbSlots > newest; --id) {
+            const GpuCrumb &c = g_crumbs[id & (CrumbSlots - 1)];
+            const volatile uint64_t *slot = g_crumbCpu + (id & (CrumbSlots - 1)) * 2;
+            if (c.id == id && (slot[0] | slot[1])) {
+                done = id;
+                break;
+            }
+        }
+        logf("gpu fault: breadcrumbs: %llu recorded, %llu submitted, the GPU finished up to #%llu (%llu submitted after "
+             "it never finished)", (unsigned long long)newest, (unsigned long long)submitted, (unsigned long long)done,
+             (unsigned long long)(submitted > done ? submitted - done : 0));
+        const uint64_t from = done > 6 ? done - 6 : 1;
+        const uint64_t to = std::min<uint64_t>(newest, done + 24);
+        for (uint64_t id = from; id <= to; ++id) {
+            const GpuCrumb &c = g_crumbs[id & (CrumbSlots - 1)];
+            if (c.id != id)
+                continue;
+            crumbLine(id <= done ? "done" : (id <= submitted ? "NOT DONE (submitted)" : "not submitted"), c);
+            // fable2-nx (2026-11-19): the textures of the draws around where the GPU stopped (a breadcrumb is written
+            // when the front of the pipeline passes it; the faulting draw's pixels may still have been in flight).
+            if ((c.kind == 'D' || c.kind == 'I') && id + 3 >= done && id <= done + 3)
+                crumbTextures(c);
+        }
+    }
+
+    // After an operation of 'list': its record and the GPU's write of its slot.
+    static GpuCrumb *crumb(Deko3DCommandList *list, char kind, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                      uint32_t n0, uint32_t n1, uint32_t n2, uint32_t n3, uint32_t n4, uint32_t n5, const char *name) {
+        if (!g_crumbBlock) {
+            static std::mutex m;
+            std::lock_guard<std::mutex> lock(m);
+            if (!g_crumbBlock) {
+                g_crumbs = new GpuCrumb[CrumbSlots];
+                DkMemBlock b = list->device->makeBlock(CrumbSlots * 16, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
+                                                       "gpu breadcrumbs");
+                if (!b) {
+                    g_crumbsOn.store(false);
+                    return nullptr;
+                }
+                g_crumbCpu = static_cast<volatile uint64_t *>(dkMemBlockGetCpuAddr(b));
+                for (uint32_t i = 0; i < CrumbSlots * 2; i++)
+                    g_crumbCpu[i] = 0;
+                g_crumbGpu = dkMemBlockGetGpuAddr(b);
+                g_crumbBlock = b;
+                logf("gpu breadcrumbs on: %u slots", CrumbSlots);
+            }
+        }
+        const uint64_t id = g_crumbId.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const uint32_t slot = uint32_t(id & (CrumbSlots - 1));
+        g_crumbCpu[slot * 2] = 0;
+        g_crumbCpu[slot * 2 + 1] = 0;
+        GpuCrumb &c = g_crumbs[slot];
+        c.id = id;
+        c.kind = kind;
+        c.vs = g_labelVs;
+        c.ps = g_labelPs;
+        g_labelVs = g_labelPs = 0;
+        c.a[0] = a0, c.a[1] = a1, c.a[2] = a2, c.a[3] = a3;
+        c.n[0] = n0, c.n[1] = n1, c.n[2] = n2, c.n[3] = n3, c.n[4] = n4, c.n[5] = n5;
+        c.name[0] = 0;
+        if (name && !c.vs)
+            std::snprintf(c.name, sizeof(c.name), "%s", name);
+        c.texCount = 0;
+        c.imageBlock = nullptr;
+        c.imageCount = 0;
+        dkCmdBufReportCounter(list->cmd, DkCounter_Timestamp, g_crumbGpu + uint64_t(slot) * 16);
+        return &c;
+    }
+    static inline bool crumbsOn() { return g_crumbsOn.load(std::memory_order_relaxed); }
+    static void crumbDraw(Deko3DCommandList *l, bool indexed, uint32_t count, uint32_t instances, uint32_t first,
+                          int32_t base) {
+        const DkBufExtents &w = l->graphicsSsbo[AddressWindowSlot];
+        const bool window = (l->graphicsSsboValid >> AddressWindowSlot) & 1;
+        GpuCrumb *made = crumb(l, indexed ? 'I' : 'D', indexed ? l->indexAddress : 0, window ? w.addr : 0,
+              (l->boundVtxValid & 1) ? l->boundVtx[0].addr : 0, (l->boundVtxValid & 2) ? l->boundVtx[1].addr : 0, count,
+              instances, first, uint32_t(base), window ? w.size : 0, (l->boundVtxValid & 1) ? l->boundVtx[0].size : 0,
+              l->graphicsPipeline ? l->graphicsPipeline->name.c_str() : nullptr);
+        // fable2-nx (2026-11-19): its textures and their descriptors' addresses now.
+        if (!made)
+            return;
+        GpuCrumb &c = *made;
+        const Deko3DDescriptorSet *set = l->boundImageSetObj;
+        if (!set || !set->imageBlock)
+            return;
+        c.imageBlock = set->imageBlock;
+        c.imageCount = set->imageCount;
+        const volatile uint32_t *d = static_cast<const volatile uint32_t *>(dkMemBlockGetCpuAddr(set->imageBlock));
+        auto add = [&](char stage, uint32_t id) {
+            if (c.texCount >= CrumbTextures)
+                return;
+            c.texStage[c.texCount] = stage;
+            c.texId[c.texCount] = id;
+            c.texAddr[c.texCount] = id < set->imageCount ? ticAddress(d + id * 8) : 0;
+            c.texCount++;
+        };
+        for (uint32_t k = 0; k < l->boundTexCount[2] && k < 32; k++)
+            add('F', uint32_t(l->boundTex[2][k]) & 0xFFFFFu);
+        for (uint32_t k = 0; k < l->extraFragTexCount && k < 8; k++)
+            add('E', l->extraFragTex[k] & 0xFFFFFu);
+        for (uint32_t k = 0; k < l->boundTexCount[0] && k < 32; k++)
+            add('V', uint32_t(l->boundTex[0][k]) & 0xFFFFFu);
+    }
+
+    // fable2-nx (2026-11-19, the marker: L3 + R3, xam_input.cpp): the renderer's draw log of the marked frame names each
+    // draw before it is recorded (Deko3DDumpNextDraw); the draw's textures are logged here under the same mark and
+    // number: the descriptor slot, the texture's size, levels and format, and the GPU address its descriptor holds.
+    static bool g_dumpNext = false;
+    static uint32_t g_dumpMark = 0, g_dumpOrdinal = 0;
+    // The marked frame's lines, kept here and written by the renderer in one go (Deko3DMarkTake): a log line each took
+    // 3-4 ms (deko3d.log is flushed at every line), and 5,700 of them froze the game for 40 s (run of 2026-11-19 23:46).
+    static std::string g_markText;
+    void Deko3DMarkAppend(const char *line) {
+        g_markText += line;
+        g_markText += '\n';
+    }
+    std::string Deko3DMarkTake() {
+        std::string out;
+        out.swap(g_markText);
+        return out;
+    }
+    __attribute__((format(printf, 1, 2))) static void markf(const char *fmt, ...) {
+        char line[512];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(line, sizeof(line), fmt, ap);
+        va_end(ap);
+        Deko3DMarkAppend(line);
+    }
+    void Deko3DDumpNextDraw(uint32_t mark, uint32_t ordinal) {
+        g_dumpMark = mark;
+        g_dumpOrdinal = ordinal;
+        g_dumpNext = true;
+    }
+    static void dumpDrawTextures(Deko3DCommandList *l) {
+        g_dumpNext = false;
+        const Deko3DDescriptorSet *set = l->boundImageSetObj;
+        const volatile uint32_t *d = set && set->imageBlock
+                                         ? static_cast<const volatile uint32_t *>(dkMemBlockGetCpuAddr(set->imageBlock))
+                                         : nullptr;
+        uint32_t shown = 0;
+        auto one = [&](char stage, uint32_t id) {
+            ++shown;
+            const uint64_t addr = d && id < set->imageCount ? ticAddress(d + id * 8) : 0;
+            const Deko3DTexture *t = set && id < set->imageTextures.size() ? set->imageTextures[id] : nullptr;
+            if (t && t->valid)
+                markf("[mark %u] draw %u texture %c slot %u: %ux%u depth %u, %u levels, %u layers, format %d, at %010llX",
+                     g_dumpMark, g_dumpOrdinal, stage, id, t->desc.width, t->desc.height, t->desc.depth,
+                     t->desc.mipLevels, t->desc.arraySize, int(t->desc.format), (unsigned long long)addr);
+            else
+                markf("[mark %u] draw %u texture %c slot %u: NO TEXTURE in the slot (descriptor address %010llX)",
+                     g_dumpMark, g_dumpOrdinal, stage, id, (unsigned long long)addr);
+        };
+        for (uint32_t k = 0; k < l->boundTexCount[2] && k < 32; k++)
+            one('F', uint32_t(l->boundTex[2][k]) & 0xFFFFFu);
+        for (uint32_t k = 0; k < l->extraFragTexCount && k < 8; k++)
+            one('E', l->extraFragTex[k] & 0xFFFFFu);
+        for (uint32_t k = 0; k < l->boundTexCount[0] && k < 32; k++)
+            one('V', uint32_t(l->boundTex[0][k]) & 0xFFFFFu);
+        if (!shown)
+            markf("[mark %u] draw %u: no textures bound", g_dumpMark, g_dumpOrdinal);
+    }
+
     // ---- Deko3DCommandList
 
     static void addMemoryCallback(void *user, DkCmdBuf, size_t minimum) {
@@ -566,6 +911,9 @@ namespace plume {
         dispatchSinceIdle = true;  // sasrt-nx (2026-11-08, leanBarrierSkip)
         workSinceFragmentWait = true;  // sasrt-nx (2026-11-08, leanBarrierSkip)
         dkCmdBufDispatchCompute(cmd, x, y, z);
+        if (crumbsOn())
+            crumb(this, 'X', 0, ((computeSsboValid >> AddressWindowSlot) & 1) ? computeSsbo[AddressWindowSlot].addr : 0, 0, 0,
+                  x, y, z, 0, 0, 0, computePipeline ? computePipeline->name.c_str() : nullptr);
     }
 
     void Deko3DCommandList::traceRays(uint32_t, uint32_t, uint32_t, RenderBufferReference, const RenderShaderBindingGroupsInfo &) {}
@@ -814,6 +1162,10 @@ namespace plume {
         const DkPrimitive drawPrim = nextPrimitive ? DkPrimitive(nextPrimitive - 1) : graphicsPipeline->primitive;
         nextPrimitive = 0;
         dkCmdBufDraw(cmd, drawPrim, vertexCount, instanceCount, startVertex, startInstance);
+        if (crumbsOn())
+            crumbDraw(this, false, vertexCount, instanceCount, startVertex, 0);
+        if (g_dumpNext)
+            dumpDrawTextures(this);  // fable2-nx (2026-11-19, the marker)
         if (discard) {
             const uint32_t on = (4u << 29) | (1u << 16) | (0u << 13) | 0x0DFu;
             dkCmdBufReplayCmds(cmd, &on, 1);
@@ -854,6 +1206,10 @@ namespace plume {
         }
         workSinceFragmentWait = true;  // sasrt-nx (2026-11-08, leanBarrierSkip)
         dkCmdBufDrawIndexed(cmd, prim, indexCount, instanceCount, startIndex, baseVertex, startInstance);
+        if (crumbsOn())
+            crumbDraw(this, true, indexCount, instanceCount, startIndex, baseVertex);
+        if (g_dumpNext)
+            dumpDrawTextures(this);  // fable2-nx (2026-11-19, the marker)
         if (discard) {
             const uint32_t on = (4u << 29) | (1u << 16) | (0u << 13) | 0x0DFu;
             dkCmdBufReplayCmds(cmd, &on, 1);
@@ -1470,6 +1826,8 @@ namespace plume {
             Deko3DTraceToken("K");  // sasrt-nx (2026-11-08, the trace)
         workSinceFragmentWait = true;  // sasrt-nx (2026-11-08, leanBarrierSkip)
         dkCmdBufCopyBuffer(cmd, s->gpu + src.offset, d->gpu + dst.offset, uint32_t(size));
+        if (crumbsOn())
+            crumb(this, 'B', s->gpu + src.offset, d->gpu + dst.offset, 0, 0, uint32_t(size), 0, 0, 0, 0, 0, nullptr);
     }
 
     static DkImageView subresourceView(const Deko3DTexture *t, uint32_t mip, uint32_t layer) {
@@ -1553,6 +1911,8 @@ namespace plume {
                 Deko3DTraceToken("K");  // sasrt-nx (2026-11-08, the trace)
             workSinceFragmentWait = true;  // sasrt-nx (2026-11-08, leanBarrierSkip)
             dkCmdBufCopyBufferToImage(cmd, &src, &v, &rect, 0);
+            if (crumbsOn())
+                crumb(this, 'U', src.addr, uint64_t(uintptr_t(t)), 0, 0, 0, rect.width, rect.height, 0, 0, 0, nullptr);
             invalidateZcullAfterCopy(t);  // banjo-nx (2026-10-18): an upload into a depth target, the same as a copy
         }
         else if (dstLoc.type == RenderTextureCopyType::PLACED_FOOTPRINT && srcLoc.type == RenderTextureCopyType::SUBRESOURCE) {
@@ -1594,6 +1954,8 @@ namespace plume {
                 Deko3DTraceToken("K");  // sasrt-nx (2026-11-08, the trace)
             workSinceFragmentWait = true;  // sasrt-nx (2026-11-08, leanBarrierSkip)
             dkCmdBufCopyImageToBuffer(cmd, &v, &rect, &dst, 0);
+            if (crumbsOn())
+                crumb(this, 'R', 0, dst.addr, 0, 0, 0, rect.width, rect.height, 0, 0, 0, nullptr);
             if (merge) {
                 flushBarriers();
                 pendingBarrierMode = DkBarrier_Full;
@@ -1649,6 +2011,8 @@ namespace plume {
                 Deko3DTraceToken("K");  // sasrt-nx (2026-11-08, the trace)
             workSinceFragmentWait = true;  // sasrt-nx (2026-11-08, leanBarrierSkip)
             dkCmdBufCopyImage(cmd, &sv, &srect, &dv, &drect, 0);
+            if (crumbsOn())
+                crumb(this, 'T', 0, 0, 0, 0, 0, drect.width, drect.height, 0, 0, 0, nullptr);
             invalidateZcullAfterCopy(dt);
         }
     }
@@ -1788,6 +2152,8 @@ namespace plume {
             Deko3DTraceToken("K");  // sasrt-nx (2026-11-08, the trace)
         workSinceFragmentWait = true;  // sasrt-nx (2026-11-08, leanBarrierSkip)
         dkCmdBufCopyBuffer(cmd, s->gpu, d->gpu, uint32_t(std::min(d->desc.size, s->desc.size)));
+        if (crumbsOn())
+            crumb(this, 'B', s->gpu, d->gpu, 0, 0, uint32_t(std::min(d->desc.size, s->desc.size)), 0, 0, 0, 0, 0, nullptr);
     }
 
     void Deko3DCommandList::copyTexture(const RenderTexture *dst, const RenderTexture *src) {
@@ -1811,6 +2177,8 @@ namespace plume {
                     Deko3DTraceToken("K");  // sasrt-nx (2026-11-08, the trace)
                 workSinceFragmentWait = true;  // sasrt-nx (2026-11-08, leanBarrierSkip)
                 dkCmdBufCopyImage(cmd, &sv, &r, &dv, &r, 0);
+                if (crumbsOn())
+                    crumb(this, 'T', 0, 0, 0, 0, 0, r.width, r.height, 0, 0, 0, nullptr);
             }
         }
         invalidateZcullAfterCopy(dt);
@@ -2208,6 +2576,7 @@ namespace plume {
             if (cl && cl->list)
                 dkQueueSubmitCommands(device->queue, cl->list);
         }
+        g_crumbSubmitted.store(g_crumbId.load(std::memory_order_acquire), std::memory_order_release);  // fable2-nx
         if (signalFence) {
             Deko3DCommandFence *f = static_cast<Deko3DCommandFence *>(signalFence);
             // flush: the GPU's caches are written out before the fence signals, so the CPU reads what the GPU wrote
@@ -2216,7 +2585,8 @@ namespace plume {
             f->pending = true;
         }
         device->noteSubmission();
-        dkQueueFlush(device->queue);
+        if (crumbCheckBeforeFlush(device->queue))  // fable2-nx (2026-11-19, the GPU fault)
+            dkQueueFlush(device->queue);
         device->checkGuards();
         device->collectRetired();
     }
@@ -2369,12 +2739,35 @@ namespace plume {
         if (slot < 0)
             return false;
         *textureIndex = uint32_t(slot);
+        acquiredSlot = slot;
         return true;
     }
 
+    // fable2-nx (2026-11-18, two crashes in dkQueuePresentImage, deko3d's DkResult_Fail, 2359-0001): the release deko3d
+    // aborts there without a message. It fails when the queue is in an error state (the GPU faulted on work already
+    // submitted) or when the display refuses the image. Before the present: the queue flushed and its error state read,
+    // and the image checked against the one acquired; on an error the present is skipped and the reason logged, so the
+    // log says which it was (after a GPU fault the picture stops; the renderer reports it at the next present).
     bool Deko3DSwapChain::present(uint32_t textureIndex, RenderCommandSemaphore **, uint32_t) {
         if (!swapchain)
             return false;
+        if (acquiredSlot != int(textureIndex)) {
+            logf("present: image %u was not the one acquired (%d); not presented", textureIndex, acquiredSlot);
+            return false;
+        }
+        if (!crumbCheckBeforeFlush(device->queue))  // fable2-nx (2026-11-19, the GPU fault)
+            return true;
+        dkQueueFlush(device->queue);
+        if (dkQueueIsInErrorState(device->queue)) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                logf("present: the queue is in an error state (the GPU faulted on the work submitted so far); image %u "
+                     "not presented, nothing more is drawn", textureIndex);
+            }
+            return true;  // not false: that asks for a swapchain rebuild, which a queue in an error state cannot do
+        }
+        acquiredSlot = -1;
         dkQueuePresentImage(device->queue, swapchain, int(textureIndex));
         return true;
     }

@@ -33,6 +33,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+REXCVAR_DECLARE(bool, input_diag_users);  // xam_input.cpp
+
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 REXCVAR_DEFINE_BOOL(xam_guest_signin, true, "Kernel",
                     "When the game opens the sign-in screen, every further connected controller (2 to 4) is signed "
@@ -127,6 +129,14 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
     } else if (IsGuest(user_index)) {
       signin_state = 1;  // signed in locally
     }
+  }
+  if (REXCVAR_GET(input_diag_users)) {
+    // fable2-nx (2026-11-18): each change of what a user index answers (the first 100)
+    static std::atomic<uint32_t> last[5] = {~0u, ~0u, ~0u, ~0u, ~0u}, logged{0};
+    const uint32_t slot = user_index < 4 ? uint32_t(user_index) : 4u;
+    if (last[slot].exchange(signin_state, std::memory_order_relaxed) != signin_state &&
+        logged.fetch_add(1, std::memory_order_relaxed) < 100)
+      REXKRNL_INFO("[input] XamUserGetSigninState(user {}) -> {}", uint32_t(user_index), signin_state);
   }
   return signin_state;
 }

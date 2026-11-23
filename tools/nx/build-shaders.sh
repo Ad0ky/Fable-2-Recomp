@@ -2,7 +2,8 @@
 # fable2-nx on renut_nx_ultimate_base: the game's shaders for Renut's deko3d renderer (the base's
 # tools/switch_shaders.ps1, run on Linux in the Docker image). Its steps:
 #   1. the host tools (build-shader-tools.sh) and Renut's XenosRecomp, with the host Clang;
-#   2. the dump folder XenosRecomp reads (out/renut_shader_dump): the containers stored in default.xex
+#   2. the dump folder XenosRecomp reads (out/renut_shader_dump): every shader of the game's shader banks
+#      (tools/fable2_shader_bank.py on app/assets/shaders/*.sbk, 2026-11-23), the containers stored in default.xex
 #      (tools/renut_shader_dump.py on the generator's image dump, out/renut_image.bin) and the shaders the console
 #      captured (out/shader_capture: copy the SD card's /switch/fable2-nx/shader_capture there; fable2-nx's captures
 #      count too);
@@ -48,12 +49,22 @@ if [ -f out/renut_image.bin ]; then
 fi
 shopt -s nullglob
 caps=("$captures"/*.bin)
+# fable2-nx (2026-11-23): every shader of the game's shader banks (data/Shaders/*.sbk, which run-switch-build.bat copies
+# to app/assets/shaders), not only the ones a run drew; and the dump's files not named by their content's hash removed
+# (fable2-nx's old captures: the same shaders again, under keys no draw looks up).
+banks=(app/assets/shaders/*.sbk)
+if [ ${#banks[@]} -gt 0 ]; then
+    python3 tools/fable2_shader_bank.py --bank "${banks[@]}" --out "$dump" || echo "warning: fable2_shader_bank.py failed"
+else
+    echo "banks: none in app/assets/shaders (run-switch-build.bat copies the game's data/Shaders/*.sbk there)"
+fi
 if [ ${#caps[@]} -gt 0 ]; then
     cp -n "${caps[@]}" "$dump/"
     echo "captures: ${#caps[@]} in $captures"
 else
     echo "captures: none in $captures (copy the SD card's /switch/fable2-nx/shader_capture there)"
 fi
+python3 tools/fable2_shader_bank.py --out "$dump" --prune --bank || true
 n=$(ls "$dump"/*.bin 2>/dev/null | wc -l)
 [ "$n" -gt 0 ] || { echo "error: no shaders in $dump" >&2; exit 1; }
 echo "dump: $n shaders in $dump"
@@ -86,6 +97,13 @@ python3 tools/deko3d_glsl_opt.py --in "$deko/glsl" --out "$deko/glsl_opt" --chec
 python3 tools/deko3d_shader_package.py --glsl "$deko/glsl_opt" --out "$switch_out"
 
 echo "==== DKSH cache (generic variants) ===="
+# fable2-nx (2026-11-17): with the console's pipeline list (run-switch-build.bat copies it to out/console), every listed
+# pipeline's variants too, so the console does not compile them while playing (it drew with generic pipelines until
+# then); the console's own cache (out/console/deko3d_shaders.bin) merged in, its entries kept.
+extra=()
+[ -f out/console/pipeline_list.bin ] && extra+=(--list out/console/pipeline_list.bin)
+[ -f out/console/deko3d_shaders.bin ] && extra+=(--merge out/console/deko3d_shaders.bin)
+echo "variant cache: ${extra[*]:-generic variants only}"
 python3 tools/deko3d_variant_cache.py --generic --glsl "$deko/glsl_opt" --out "$switch_out/deko3d_shaders.bin" \
-    --jobs "$JOBS"
+    --jobs "$JOBS" "${extra[@]}"
 echo "shaders: done ($switch_out)"

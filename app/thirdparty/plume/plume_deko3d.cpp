@@ -61,6 +61,7 @@ namespace plume {
     // Deko3DSetDedicatedTargets.
     static Deko3DDevice *g_imageDevice = nullptr;
     static std::atomic<bool> g_dedicatedTargets{true};
+    static std::atomic<uint32_t> g_imagePoolMb{64};  // fable2-nx (2026-11-17): Deko3DSetImagePoolMb
     uint64_t Deko3DHeapFreeBytes() {  // plume_deko3d.h
         uint64_t heapFree = 0, processFree = 0;
         memoryFigures(heapFree, processFree);
@@ -667,7 +668,21 @@ namespace plume {
         const uint32_t alignment = dkImageLayoutGetAlignment(&layout);
         // sasrt-nx (2026-11-09, Deko3DSetDedicatedTargets; port 58): a render or depth target of 1 MB or more in its own chunk.
         const bool dedicated = render && size >= (uint64_t(1) << 20) && g_dedicatedTargets.load(std::memory_order_relaxed);
-        if (size > 0xFFFFFFFFull || !device->imageAlloc(uint32_t(size), alignment, alloc, dedicated)) {
+        // fable2-nx (2026-11-17, Deko3DSetImagePoolMb): the layout's key (what dkImageLayoutInitialize was given, after
+        // tileSizeFix) and the memory's kind; a ready pooled image of the same key is this texture, as made before.
+        poolKey[0] = uint64_t(m.type) | uint64_t(m.format) << 8 | uint64_t(m.msMode) << 16 | uint64_t(m.mipLevels) << 24 |
+                     uint64_t(m.flags) << 32 | uint64_t(dedicated) << 63;
+        poolKey[1] = uint64_t(m.dimensions[0]) | uint64_t(m.dimensions[1]) << 32;
+        poolKey[2] = uint64_t(m.dimensions[2]) | uint64_t(m.pitchStride) << 32;  // pitchStride: a union with tileSize
+        if (g_imagePoolMb.load(std::memory_order_relaxed) && size <= 0xFFFFFFFFull &&
+            device->takePooledImage(poolKey, alloc, image, compressed)) {
+            g_deko3dStats.imageBytes += alloc.size;
+            valid = true;
+            return;
+        }
+        if (size > 0xFFFFFFFFull || (!device->imageAlloc(uint32_t(size), alignment, alloc, dedicated) &&
+                                     !(device->dropImagePool() &&
+                                       device->imageAlloc(uint32_t(size), alignment, alloc, dedicated)))) {
             g_memoryEmergency.store(true, std::memory_order_relaxed);  // sasrt-nx (2026-11-09 night; port 58)
             logf("texture %ux%ux%u format %d: no memory for %" PRIu64 " bytes", desc.width, desc.height, desc.depth,
                  int(desc.format), size);
@@ -681,7 +696,10 @@ namespace plume {
     Deko3DTexture::~Deko3DTexture() {
         if (valid && ownsMemory) {
             g_deko3dStats.imageBytes -= alloc.size;
-            device->retire(alloc, nullptr);
+            if (g_imagePoolMb.load(std::memory_order_relaxed) && alloc.chunk >= 0 && poolKey[0])
+                device->retirePooled(poolKey, alloc, image, compressed);
+            else
+                device->retire(alloc, nullptr);
         }
     }
 
@@ -959,6 +977,7 @@ namespace plume {
     }
 
     void Deko3DSetDedicatedTargets(bool on) { g_dedicatedTargets.store(on, std::memory_order_relaxed); }
+    void Deko3DSetImagePoolMb(uint32_t mb) { g_imagePoolMb.store(mb, std::memory_order_relaxed); }
 
     // sasrt-nx (2026-11-11, Deko3DSetTargetBlockCacheMb)
     static std::atomic<uint64_t> g_targetCacheCap{0};
@@ -1187,7 +1206,162 @@ namespace plume {
             dkDeviceDestroy(dk);
     }
 
+    // fable2-nx (2026-11-19, the GPU's MMU fault): every memory block's GPU mappings while it lives, and the last
+    // GoneSlots destroyed ones with the breadcrumb count at their destruction, so the fault report
+    // (PlumeDeko3DGpuFault) can say in which block a faulting or sampled address lies, or that its block was destroyed
+    // (and how long before the GPU stopped). deko3d gives an image block three mappings (pitch, generic and compressed
+    // kinds); only the pitch one is in its API, the other two are read from its MemBlock (dk_memblock.h: 56, 64, 72),
+    // and used only when the word at 56 is the pitch address the API gives.
+    struct BlockRecord {
+        DkMemBlock block = nullptr;
+        uint64_t map[3] = {DK_GPU_ADDR_INVALID, DK_GPU_ADDR_INVALID, DK_GPU_ADDR_INVALID};
+        uint32_t size = 0;
+        uint64_t madeCrumb = 0, goneCrumb = 0, goneSubmitted = 0;
+        char what[28] = {};
+    };
+    static constexpr uint32_t GoneSlots = 8192;
+    static std::mutex g_blockLogMutex;
+    static std::unordered_map<DkMemBlock, BlockRecord> g_blocksAlive;
+    static BlockRecord *g_blocksGone = nullptr;
+    static uint64_t g_blocksGoneCount = 0;
+    static const char *const kMapNames[3] = {"pitch", "generic", "compressed"};
+
+    static void noteBlockMade(DkMemBlock block, uint32_t size, const char *what) {
+        if (!block)
+            return;
+        BlockRecord r;
+        r.block = block;
+        r.size = size;
+        r.map[0] = dkMemBlockGetGpuAddr(block);
+        const uint64_t *w = reinterpret_cast<const uint64_t *>(reinterpret_cast<const uint8_t *>(block) + 56);
+        if (w[0] == r.map[0]) {
+            r.map[1] = w[1];
+            r.map[2] = w[2];
+        }
+        r.madeCrumb = Deko3DCrumbNow();
+        std::snprintf(r.what, sizeof(r.what), "%s", what ? what : "?");
+        std::lock_guard<std::mutex> lock(g_blockLogMutex);
+        g_blocksAlive[block] = r;
+    }
+
+    static void noteBlockGone(DkMemBlock block) {
+        std::lock_guard<std::mutex> lock(g_blockLogMutex);
+        auto it = g_blocksAlive.find(block);
+        if (it == g_blocksAlive.end())
+            return;
+        if (!g_blocksGone)
+            g_blocksGone = new BlockRecord[GoneSlots];
+        BlockRecord r = it->second;
+        r.goneCrumb = Deko3DCrumbNow();
+        r.goneSubmitted = Deko3DCrumbSubmittedNow();
+        g_blocksGone[g_blocksGoneCount++ % GoneSlots] = r;
+        g_blocksAlive.erase(it);
+    }
+
+    __attribute__((format(printf, 4, 5))) static void appendf(char *out, size_t n, size_t &at, const char *fmt, ...) {
+        if (at >= n)
+            return;
+        va_list args;
+        va_start(args, fmt);
+        const int k = std::vsnprintf(out + at, n - at, fmt, args);
+        va_end(args);
+        if (k > 0)
+            at += size_t(k);
+    }
+
+    // Where 'addr' lies: the live blocks holding it and the newest destroyed ones that held it (up to 3 of each).
+    void Deko3DDescribeGpuAddr(uint64_t addr, char *out, size_t n) {
+        size_t at = 0;
+#define put(...) appendf(out, n, at, __VA_ARGS__)
+        out[0] = 0;
+        std::unique_lock<std::mutex> lock(g_blockLogMutex, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            put("(the block table is busy)");
+            return;
+        }
+        uint32_t live = 0, gone = 0;
+        for (const auto &e : g_blocksAlive) {
+            const BlockRecord &r = e.second;
+            for (int m = 0; m < 3 && live < 3; m++) {
+                if (r.map[m] != DK_GPU_ADDR_INVALID && addr >= r.map[m] && addr < r.map[m] + r.size) {
+                    put("%sLIVE %s (%u KiB, made at crumb #%llu), %s mapping +0x%llX", live || gone ? "; " : "", r.what,
+                        r.size >> 10, (unsigned long long)r.madeCrumb, kMapNames[m],
+                        (unsigned long long)(addr - r.map[m]));
+                    live++;
+                }
+            }
+        }
+        const uint64_t count = g_blocksGoneCount < GoneSlots ? g_blocksGoneCount : GoneSlots;
+        for (uint64_t i = 0; i < count && gone < 3; i++) {
+            const BlockRecord &r = g_blocksGone[(g_blocksGoneCount - 1 - i) % GoneSlots];
+            for (int m = 0; m < 3; m++) {
+                if (r.map[m] != DK_GPU_ADDR_INVALID && addr >= r.map[m] && addr < r.map[m] + r.size) {
+                    put("%sDESTROYED %s (%u KiB, made at crumb #%llu, destroyed when crumb #%llu was recorded and #%llu "
+                        "submitted), %s mapping +0x%llX", live || gone ? "; " : "", r.what, r.size >> 10,
+                        (unsigned long long)r.madeCrumb, (unsigned long long)r.goneCrumb,
+                        (unsigned long long)r.goneSubmitted, kMapNames[m], (unsigned long long)(addr - r.map[m]));
+                    gone++;
+                    break;
+                }
+            }
+        }
+        if (!live && !gone)
+            put("in no live block, nor in the last %llu destroyed", (unsigned long long)count);
+#undef put
+    }
+
+    // The live blocks' mapping ranges by kind, and the image blocks one by one (the GPU's address layout).
+    void Deko3DLogGpuLayout() {
+        std::unique_lock<std::mutex> lock(g_blockLogMutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return;
+        uint64_t lo[3] = {~0ull, ~0ull, ~0ull}, hi[3] = {0, 0, 0};
+        uint32_t blocks[3] = {0, 0, 0};
+        for (const auto &e : g_blocksAlive) {
+            const BlockRecord &r = e.second;
+            for (int m = 0; m < 3; m++) {
+                if (r.map[m] == DK_GPU_ADDR_INVALID)
+                    continue;
+                lo[m] = std::min(lo[m], r.map[m]);
+                hi[m] = std::max(hi[m], r.map[m] + r.size);
+                blocks[m]++;
+            }
+        }
+        for (int m = 0; m < 3; m++)
+            if (blocks[m])
+                logf("gpu layout: %s mappings of %u live blocks span %010llX..%010llX", kMapNames[m], blocks[m],
+                     (unsigned long long)lo[m], (unsigned long long)hi[m]);
+        uint32_t shown = 0;
+        for (const auto &e : g_blocksAlive) {
+            const BlockRecord &r = e.second;
+            if (r.map[1] == DK_GPU_ADDR_INVALID || shown >= 48)
+                continue;
+            logf("gpu layout: %s %u KiB: pitch %010llX generic %010llX compressed %010llX", r.what, r.size >> 10,
+                 (unsigned long long)r.map[0], (unsigned long long)r.map[1], (unsigned long long)r.map[2]);
+            shown++;
+        }
+        logf("gpu layout: %llu blocks destroyed so far", (unsigned long long)g_blocksGoneCount);
+    }
+
+    // A live block's CPU memory and size (the fault report reads descriptor sets with it); null when destroyed.
+    const void *Deko3DBlockCpuIfAlive(DkMemBlock block, uint32_t &size) {
+        std::unique_lock<std::mutex> lock(g_blockLogMutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return nullptr;
+        auto it = g_blocksAlive.find(block);
+        if (it == g_blocksAlive.end())
+            return nullptr;
+        size = it->second.size;
+        return dkMemBlockGetCpuAddr(block);
+    }
+
     DkMemBlock Deko3DDevice::makeBlock(uint32_t size, uint32_t flags, const char *what) {
+        DkMemBlock block = makeBlockRaw(size, flags, what);
+        noteBlockMade(block, alignUp(size, DK_MEMBLOCK_ALIGNMENT), what);
+        return block;
+    }
+
+    DkMemBlock Deko3DDevice::makeBlockRaw(uint32_t size, uint32_t flags, const char *what) {
         DkMemBlockMaker m;
         dkMemBlockMakerDefaults(&m, dk, alignUp(size, DK_MEMBLOCK_ALIGNMENT));
         m.flags = flags;
@@ -1336,6 +1510,7 @@ namespace plume {
                 g_regionBlocks.erase(it);
             }
         }
+        noteBlockGone(block);  // fable2-nx (2026-11-19): the fault report's block table
         dkMemBlockDestroy(block);
         if (range.second) {
             std::lock_guard<std::mutex> lock(g_regionMutex);
@@ -1567,6 +1742,62 @@ namespace plume {
         retired.push_back({submitSerial.load(std::memory_order_acquire), image, block});
     }
 
+    // fable2-nx (2026-11-17, Deko3DSetImagePoolMb).
+    bool Deko3DDevice::takePooledImage(const uint64_t key[3], Deko3DImageAlloc &alloc, DkImage &image, bool &compressed) {
+        std::lock_guard<std::mutex> lock(retireMutex);
+        for (size_t i = poolReady.size(); i-- > 0;) {
+            PooledImage &p = poolReady[i];
+            if (p.key[0] == key[0] && p.key[1] == key[1] && p.key[2] == key[2]) {
+                alloc = p.alloc;
+                image = p.image;
+                compressed = p.compressed;
+                poolReadyBytes -= p.alloc.size;
+                poolReady.erase(poolReady.begin() + ptrdiff_t(i));
+                ++poolHits;
+                return true;
+            }
+        }
+        ++poolMisses;
+        if (((poolHits + poolMisses) & 1023) == 0)
+            logf("image pool (Deko3DSetImagePoolMb): %llu textures from the pool, %llu made; %zu ready (%llu KB), %zu "
+                 "waiting for the GPU", (unsigned long long)poolHits, (unsigned long long)poolMisses, poolReady.size(),
+                 (unsigned long long)(poolReadyBytes >> 10), poolPending.size());
+        return false;
+    }
+
+    void Deko3DDevice::retirePooled(const uint64_t key[3], const Deko3DImageAlloc &alloc, const DkImage &image,
+                                    bool compressed) {
+        std::lock_guard<std::mutex> lock(retireMutex);
+        PooledImage p;
+        std::memcpy(p.key, key, sizeof(p.key));
+        p.serial = submitSerial.load(std::memory_order_acquire);
+        p.alloc = alloc;
+        p.image = image;
+        p.compressed = compressed;
+        poolPending.push_back(p);
+    }
+
+    void Deko3DDevice::trimPoolLocked(uint64_t max_bytes) {
+        size_t drop = 0;  // the oldest first
+        while (drop < poolReady.size() && poolReadyBytes > max_bytes) {
+            poolReadyBytes -= poolReady[drop].alloc.size;
+            retired.push_back({0, poolReady[drop].alloc, nullptr});  // serial 0: freed by the next collectRetired
+            ++drop;
+        }
+        poolReady.erase(poolReady.begin(), poolReady.begin() + ptrdiff_t(drop));
+    }
+
+    bool Deko3DDevice::dropImagePool() {
+        {
+            std::lock_guard<std::mutex> lock(retireMutex);
+            if (poolReady.empty())
+                return false;
+            trimPoolLocked(0);
+        }
+        collectRetired();
+        return true;
+    }
+
     void Deko3DDevice::noteSubmission() {
         // A fence per submission serial (16 in a ring): what was retired before a submission is freed once its fence
         // signalled.
@@ -1585,7 +1816,9 @@ namespace plume {
 
     void Deko3DDevice::collectRetired() {
         std::lock_guard<std::mutex> lock(retireMutex);
-        if (retired.empty())
+        // fable2-nx (2026-11-17): the pool's pending images too (with every texture pooled, 'retired' stayed empty and
+        // they were never looked at: 4,000 waiting, the heap exhausted, std::bad_alloc at the main menu).
+        if (retired.empty() && poolPending.empty() && poolReady.empty())
             return;
         uint64_t done = completedSerial.load();
         for (uint32_t i = 0; i < SerialFences; i++) {
@@ -1593,6 +1826,24 @@ namespace plume {
                 done = std::max(done, serialFenceValue[i]);
         }
         completedSerial.store(done);
+        // fable2-nx (2026-11-17, Deko3DSetImagePoolMb): pooled images the GPU has passed become ready; the pool keeps
+        // at most its size (and nothing while the heap's room is short), the rest freed below as retired memory.
+        if (!poolPending.empty()) {
+            size_t still = 0;
+            for (size_t i = 0; i < poolPending.size(); i++) {
+                if (poolPending[i].serial <= done) {
+                    poolReadyBytes += poolPending[i].alloc.size;
+                    poolReady.push_back(poolPending[i]);
+                } else {
+                    poolPending[still++] = poolPending[i];
+                }
+            }
+            poolPending.resize(still);
+        }
+        if (!poolReady.empty()) {
+            const uint64_t cap = heapRoomShort() ? 0 : uint64_t(g_imagePoolMb.load(std::memory_order_relaxed)) << 20;
+            trimPoolLocked(cap);
+        }
         size_t kept = 0;
         for (size_t i = 0; i < retired.size(); i++) {
             Retired &r = retired[i];
@@ -2154,6 +2405,17 @@ namespace plume {
 
     bool Deko3DShaderWritesVertexKill(const RenderShader *shader) {
         return shader != nullptr && static_cast<const Deko3DShader *>(shader)->usage.writesVertexKill;
+    }
+
+    bool Deko3DShaderHasSpec(const RenderShader *shader, uint32_t id) {  // fable2-nx (2026-11-17)
+        if (shader == nullptr)
+            return false;
+        const std::vector<uint32_t> &ids = static_cast<const Deko3DShader *>(shader)->specIds;
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    }
+
+    bool Deko3DShaderReadsInput(const RenderShader *shader, uint32_t loc) {  // fable2-nx (2026-11-17)
+        return shader != nullptr && loc < 32 && (static_cast<const Deko3DShader *>(shader)->usage.inputMask >> loc) & 1u;
     }
 
     bool Deko3DShaderReadsVertexId(const RenderShader *shader) {

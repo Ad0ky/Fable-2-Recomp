@@ -211,6 +211,12 @@ REXCVAR_DEFINE_BOOL(switch_profile_stacks, false, "Banjo/Enhancements",
                     "Switch: the SDK's sampling profiler records every thread's pc (logs/rex/rex_profile.log), as an "
                     "empty logs/rex/stacks_profile.flag does. On in the A/B and profile configs")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// fable2-nx (2026-11-17): with switch_profile_stacks, every sample (pc, lr and the x29 call frames) also goes to
+// logs/rex/cpu_samples.bin for tools/fable2_cpu_samples.py (the SDK's sampler reads this by name).
+REXCVAR_DEFINE_BOOL(switch_profile_raw, false, "Banjo/Enhancements",
+                    "Switch: with switch_profile_stacks, every CPU sample with its call frames to "
+                    "logs/rex/cpu_samples.bin (tools/fable2_cpu_samples.py)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // The native copies of hot game functions (src/cpu/banjo_hot_guest.cpp, from sa2-nx): one key per function
 // (banjo_cpu_native_<function>, CPU group), defined by the list tools/localize_native.py writes. Calls `row` for each.

@@ -239,6 +239,9 @@ def main():
     # blur-nx (2026-11-11, CPU batch 1, docs/vector-store-ideas.md VS-05): a 128-byte dcbzl as two DC ZVA (no read of
     # the line it zeroes). After store_cards.py, which finds the dcbz by its memset to put the card in front.
     run(tool('vec_dcbz_zva.py'), '--gen', gen)
+    # fable2-nx (2026-11-17): the main loop's limit of 2 catch-up steps a pass as a setting (fable2_tick_catchup);
+    # last, on the final text, so every copy of the loop has it.
+    run(tool('fable2_tick_catchup.py'), '--gen', gen)
     if scratch:
         print(f'post_codegen: optimised codegen steps done on {gen}')
         return

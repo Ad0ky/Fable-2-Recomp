@@ -21,8 +21,10 @@
 
 namespace renut::gpu {
 
-// Queues pCallback(Context) behind the work queued so far.
-void InsertCallback(u32 function, u32 context);
+// Queues pCallback(Context) behind the work queued so far. fable2-nx (2026-11-18): flush_fills false skips reading the
+// work's linear textures and vertex fills now (QueueKickFlush), for a callback that frees nothing they read (Fable's
+// frame-time record at every Swap: the flush was 6% of the render thread's time).
+void InsertCallback(u32 function, u32 context, bool flush_fills = true);
 
 // The last callback inserted: the fence of a KickOff issued now completes
 // after it (render_thread::QueueFenceCompletion).

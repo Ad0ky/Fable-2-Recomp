@@ -136,6 +136,7 @@ if true; then
         -DCMAKE_TOOLCHAIN_FILE="$root/tools/switch/cmake/switch-devkitA64.cmake" \
         -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
         -DDEVKITPRO="$DEVKITPRO" -DREXSDK_DIR="$root/sdk" -DREXGLUE_SWITCH_NVK=OFF \
+        -DBANJO_SWITCH_RENDERER_LINES=ON \
         -DBANJO_DEKO3D_SPIRV_CROSS="$root/out/deko3d_tools/spirv-cross-build/spirv-cross" \
         -DBANJO_DEKO3D_UAM="$root/out/deko3d_tools/uam-build/uam" \
         -DBANJO_GLSLANG_VALIDATOR="$root/out/glslang-linux/StandAlone/glslangValidator" \

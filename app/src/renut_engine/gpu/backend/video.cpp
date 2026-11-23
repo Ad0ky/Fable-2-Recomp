@@ -29,6 +29,7 @@
 #include "renut_engine/perf/frame_stats.h"
 #include "renut_engine/gpu/backend/backend.h"
 #include "renut_engine/gpu/backend/gpu_profile.h"
+#include "renut_engine/gpu/backend/queued.h"  // fable2-nx (2026-11-23): OcclusionQueriesCollectLocked
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/backend/native_window.h"
 #include "renut_engine/gpu/render/pipeline.h"
@@ -906,6 +907,7 @@ void WaitSlotLocked(VideoState &s, uint32_t slot) {
   s.submitted[slot] = false;
   CollectGpuTime(s, slot);
   gpu_profile::Collect(s, slot);
+  OcclusionQueriesCollectLocked();  // fable2-nx (2026-11-23): the counts the GPU has written
   // banjo-nx (2026-10-19, banjo_deko3d_kick_submit): every list of the slot's frame has run: its kick lists are free.
   s.kick_lists_used[slot] = 0;
   s.slot_list[slot] = nullptr;

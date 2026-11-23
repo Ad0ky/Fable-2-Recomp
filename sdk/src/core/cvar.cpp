@@ -130,6 +130,45 @@ bool ApplyFromSource(FlagEntry& entry, std::string_view value, Source source) {
   return true;
 }
 
+// fable2-nx (2026-11-20, the user's request): every setting also answers to a fable2_ name: fable2_ and the rest of
+// its name without the base's prefix (banjo_renut_, banjo_, sasrt_, renut_, masseffect_, nfsmw_, katamari_; a name with
+// none of them gets fable2_ in front). A config key is looked up as it is first, so a real fable2_ setting wins; then
+// fable2_X tries banjo_renut_X, banjo_X, sasrt_X, renut_X, masseffect_X, nfsmw_X, katamari_X and X, in that order. A
+// value given for a setting that registers later is kept under the name it was given, and the setting takes it when it
+// registers under its own name or the one its fable2_ name stands for.
+static constexpr std::string_view kFable2AliasPrefixes[] = {"banjo_renut_", "banjo_",       "sasrt_",   "renut_",
+                                                           "masseffect_",  "nfsmw_",       "katamari_"};
+
+std::string Fable2AliasOf(std::string_view name) {
+  if (name.substr(0, 7) == "fable2_")
+    return std::string(name);
+  for (std::string_view p : kFable2AliasPrefixes) {
+    if (name.substr(0, p.size()) == p)
+      return "fable2_" + std::string(name.substr(p.size()));
+  }
+  return "fable2_" + std::string(name);
+}
+
+// The registered setting a fable2_ key stands for; empty when none (or when the key is not a fable2_ one). 'exists'
+// tells whether a name is registered (GetFlagInfo, or the index when the registry's lock is held).
+template <typename Exists>
+static std::string ResolveFable2AliasWith(const std::string& key, Exists&& exists) {
+  if (key.size() <= 7 || key.compare(0, 7, "fable2_") != 0)
+    return {};
+  const std::string rest = key.substr(7);
+  for (std::string_view p : kFable2AliasPrefixes) {
+    std::string candidate = std::string(p) + rest;
+    if (exists(candidate))
+      return candidate;
+  }
+  if (exists(rest))
+    return rest;
+  return {};
+}
+static std::string ResolveFable2Alias(const std::string& key) {
+  return ResolveFable2AliasWith(key, [](const std::string& n) { return GetFlagInfo(n) != nullptr; });
+}
+
 // Recursively apply TOML values
 void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
   for (const auto& [key, value] : table) {
@@ -152,6 +191,12 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
         continue;
       }
 
+      if (GetFlagInfo(full_key) == nullptr) {
+        if (std::string real = ResolveFable2Alias(full_key); !real.empty()) {  // fable2-nx (2026-11-20)
+          REXLOG_DEBUG("Config: {} is {}", full_key, real);
+          full_key = std::move(real);
+        }
+      }
       if (GetFlagInfo(full_key) == nullptr) {
         std::lock_guard lock(GetRegistryMutex());
         GetPendingValuesStorage()[full_key].config = value_str;
@@ -278,6 +323,8 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
     FlagEntry& stored = storage[pos];
     auto& pending = GetPendingValuesStorage();
     auto pending_it = pending.find(stored.name);
+    if (pending_it == pending.end())  // fable2-nx (2026-11-20): or under its fable2_ name
+      pending_it = pending.find(Fable2AliasOf(stored.name));
     if (pending_it != pending.end() && pending_it->second.config) {
       ApplyFromSource(stored, *pending_it->second.config, Source::kConfig);
     }
@@ -580,14 +627,21 @@ std::vector<std::string> ListModifiedFlags() {
 std::string SerializeCvars(const std::set<std::string>* preserve_keys) {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
+  const auto& index = GetRegistryIndex();
+  const auto exists = [&](const std::string& n) { return index.find(n) != index.end(); };
   for (const auto& entry : GetRegistryStorage()) {
     const bool preserved =
         preserve_keys != nullptr && preserve_keys->count(entry.name) != 0;
     if (entry.getter() != entry.default_value || preserved) {
+      // fable2-nx (2026-11-20): written under its fable2_ name when that name stands for it (not for the few whose
+      // fable2_ name is another setting's).
+      std::string name = Fable2AliasOf(entry.name);
+      if (name != entry.name && (exists(name) || ResolveFable2AliasWith(name, exists) != entry.name))
+        name = entry.name;
       if (entry.type == FlagType::String) {
-        result += entry.name + " = " + FormatTomlString(entry.getter()) + "\n";
+        result += name + " = " + FormatTomlString(entry.getter()) + "\n";
       } else {
-        result += entry.name + " = " + entry.getter() + "\n";
+        result += name + " = " + entry.getter() + "\n";
       }
     }
   }
@@ -781,9 +835,17 @@ void SaveConfig(const std::filesystem::path& config_path) {
         if (value.is_table()) {
           continue;  // leave TOML sections as-is; only scalar cvars are merged
         }
-        const std::string name(key);
-        preserve_keys.insert(name);
+        std::string name(key);
         std::lock_guard lock(GetRegistryMutex());
+        // fable2-nx (2026-11-20): a fable2_ name is the setting it stands for (written once, under that name).
+        if (GetRegistryIndex().find(name) == GetRegistryIndex().end()) {
+          const auto& index = GetRegistryIndex();
+          std::string real = ResolveFable2AliasWith(
+              name, [&](const std::string& n) { return index.find(n) != index.end(); });
+          if (!real.empty())
+            name = std::move(real);
+        }
+        preserve_keys.insert(name);
         if (GetRegistryIndex().find(name) == GetRegistryIndex().end()) {
           const std::string value_text = FormatTomlNode(value);
           if (!value_text.empty()) {

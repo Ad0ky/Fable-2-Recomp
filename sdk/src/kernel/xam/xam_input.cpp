@@ -20,6 +20,7 @@
 #include <rex/system/xtypes.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 
 #include <rex/cvar.h>
@@ -77,7 +78,15 @@ u32 XamInputGetCapabilities_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_C
   }
 
   auto* is = input_system();
-  return is->GetCapabilities(actual_user_index, flags, caps);
+  const X_RESULT result = is->GetCapabilities(actual_user_index, flags, caps);
+  if (REXCVAR_GET(input_diag_users)) {  // fable2-nx (2026-11-18): the first 100 queries and what they got
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 100)
+      REXKRNL_INFO("[input] XamInputGetCapabilities{}(user {}, flags 0x{:X}) -> 0x{:X}, type {} subtype {}", "",
+                   uint32_t(user_index), uint32_t(flags), uint32_t(result), uint32_t(caps->type),
+                   uint32_t(caps->sub_type));
+  }
+  return result;
 }
 
 u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
@@ -99,7 +108,38 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
 
   (void)unk;  // Unused in this implementation
   auto* is = input_system();
-  return is->GetCapabilities(actual_user_index, flags, caps);
+  const X_RESULT result = is->GetCapabilities(actual_user_index, flags, caps);
+  if (REXCVAR_GET(input_diag_users)) {  // fable2-nx (2026-11-18): the first 100 queries and what they got
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 100)
+      REXKRNL_INFO("[input] XamInputGetCapabilities{}(user {}, flags 0x{:X}) -> 0x{:X}, type {} subtype {}", "Ex",
+                   uint32_t(user_index), uint32_t(flags), uint32_t(result), uint32_t(caps->type),
+                   uint32_t(caps->sub_type));
+  }
+  return result;
+}
+
+// fable2-nx (2026-11-19, the marker): both sticks clicked together (L3 + R3) counts a marker; the renderer dumps the
+// next frame's draws under that number ([mark N] in renut_001.log), to tie a screenshot of a glitch to its draws.
+}  // namespace xam
+}  // namespace kernel
+}  // namespace rex
+extern "C" {
+uint32_t g_rex_marker_count = 0;
+}
+namespace rex {
+namespace kernel {
+namespace xam {
+using namespace rex::system;
+static void NoteMarkerCombo(uint32_t buttons) {
+  static bool held = false;
+  constexpr uint32_t kBoth = 0x0040 | 0x0080;  // XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB
+  const bool now = (buttons & kBoth) == kBoth;
+  if (now && !held) {
+    const uint32_t n = __atomic_add_fetch(&g_rex_marker_count, 1, __ATOMIC_RELAXED);
+    REXKRNL_INFO("[mark {}] L3 + R3: the next two frames' draws are dumped", n);
+  }
+  held = now;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
@@ -127,19 +167,46 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
 
   auto* is = input_system();
   if (!REXCVAR_GET(input_diag_users)) {
-    return is->GetState(actual_user_index, input_state);
+    const X_RESULT plain = is->GetState(actual_user_index, input_state);
+    if (plain == X_ERROR_SUCCESS && input_state)
+      NoteMarkerCombo(uint16_t(input_state->gamepad.buttons));  // fable2-nx (2026-11-19)
+    return plain;
   }
   // peggle2-nx (input_diag_users): [user][0] calls, [1] connected, [2] something held; user 4 = any.
-  static std::atomic<uint32_t> counts[5][3];
+  // fable2-nx (2026-11-18): [3] a stick past a quarter of its range; the last held state seen, and every change of the
+  // buttons (the first 200), so a log shows what the game was given when the character would not move.
+  static std::atomic<uint32_t> counts[5][4];
+  static std::atomic<uint64_t> last_held{0};
+  static std::atomic<uint32_t> last_buttons{0}, button_changes_logged{0};
   static std::atomic<int64_t> window_start{0};
   const uint32_t slot = ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) ? 4 : (user_index & 3);
   const X_RESULT result = is->GetState(actual_user_index, input_state);
+  if (result == X_ERROR_SUCCESS && input_state)
+    NoteMarkerCombo(uint16_t(input_state->gamepad.buttons));  // fable2-nx (2026-11-19)
   counts[slot][0].fetch_add(1, std::memory_order_relaxed);
   if (result == X_ERROR_SUCCESS) {
     counts[slot][1].fetch_add(1, std::memory_order_relaxed);
     if (input_state && (uint16_t(input_state->gamepad.buttons) || uint8_t(input_state->gamepad.left_trigger) ||
                         uint8_t(input_state->gamepad.right_trigger)))
       counts[slot][2].fetch_add(1, std::memory_order_relaxed);
+    if (input_state) {
+      const auto &g = input_state->gamepad;
+      const int lx = int16_t(g.thumb_lx), ly = int16_t(g.thumb_ly), rx = int16_t(g.thumb_rx), ry = int16_t(g.thumb_ry);
+      const bool stick = std::abs(lx) > 8192 || std::abs(ly) > 8192 || std::abs(rx) > 8192 || std::abs(ry) > 8192;
+      if (stick)
+        counts[slot][3].fetch_add(1, std::memory_order_relaxed);
+      const uint32_t buttons = uint16_t(g.buttons);
+      if (stick || buttons || g.left_trigger || g.right_trigger)
+        last_held.store(uint64_t(buttons) | uint64_t(uint8_t(lx >> 8)) << 16 | uint64_t(uint8_t(ly >> 8)) << 24 |
+                            uint64_t(uint8_t(rx >> 8)) << 32 | uint64_t(uint8_t(ry >> 8)) << 40 |
+                            uint64_t(g.left_trigger) << 48 | uint64_t(g.right_trigger) << 56,
+                        std::memory_order_relaxed);
+      if (last_buttons.exchange(buttons, std::memory_order_relaxed) != buttons &&
+          button_changes_logged.fetch_add(1, std::memory_order_relaxed) < 200)
+        REXKRNL_INFO("[input] user {} (flags 0x{:X}): buttons {:04X}, packet {}, sticks L {} {} R {} {}, triggers {} {}",
+                     user_index, uint32_t(flags), buttons, uint32_t(input_state->packet_number), lx, ly, rx, ry,
+                     g.left_trigger, g.right_trigger);
+    }
   }
   const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -150,11 +217,17 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
     std::string line;
     for (uint32_t u = 0; u < 5; ++u) {
       const uint32_t calls = counts[u][0].exchange(0), found = counts[u][1].exchange(0),
-                     held = counts[u][2].exchange(0);
+                     held = counts[u][2].exchange(0), sticks = counts[u][3].exchange(0);
       if (calls)
-        line += fmt::format("{}user {}: {} calls, {} connected, {} with input", line.empty() ? "" : "; ",
-                            u == 4 ? std::string("any") : std::to_string(u), calls, found, held);
+        line += fmt::format("{}user {}: {} calls, {} connected, {} with a button or trigger, {} with a stick moved",
+                            line.empty() ? "" : "; ", u == 4 ? std::string("any") : std::to_string(u), calls, found,
+                            held, sticks);
     }
+    const uint64_t h = last_held.exchange(0, std::memory_order_relaxed);
+    if (h)
+      line += fmt::format(" | last input: buttons {:04X}, sticks L {} {} R {} {} (/128), triggers {} {}",
+                          uint32_t(h & 0xFFFF), int8_t(h >> 16), int8_t(h >> 24), int8_t(h >> 32), int8_t(h >> 40),
+                          uint32_t((h >> 48) & 0xFF), uint32_t(h >> 56));
     REXKRNL_INFO("[input] 10 s of XamInputGetState: {}", line.empty() ? std::string("no calls") : line);
   }
   return result;
@@ -199,7 +272,16 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
   }
 
   auto* is = input_system();
-  return is->GetKeystroke(actual_user_index, flags, keystroke);
+  const X_RESULT result = is->GetKeystroke(actual_user_index, flags, keystroke);
+  if (REXCVAR_GET(input_diag_users)) {  // fable2-nx (2026-11-18): the keystrokes the game is given (the first 200)
+    static std::atomic<uint32_t> calls{0}, logged{0};
+    calls.fetch_add(1, std::memory_order_relaxed);
+    if (result == X_ERROR_SUCCESS && logged.fetch_add(1, std::memory_order_relaxed) < 200)
+      REXKRNL_INFO("[input] keystroke: user {} flags 0x{:X}: key {:04X} flags {:04X} ({} calls so far)", user_index,
+                   uint32_t(flags), uint32_t(keystroke->virtual_key), uint32_t(keystroke->flags),
+                   calls.load(std::memory_order_relaxed));
+  }
+  return result;
 }
 
 // Same as non-ex, just takes a pointer to user index.
@@ -224,6 +306,14 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
   auto result = is->GetKeystroke(user_index, flags, keystroke);
   if (XSUCCEEDED(result)) {
     *user_index_ptr = keystroke->user_index;
+  }
+  if (REXCVAR_GET(input_diag_users)) {  // fable2-nx (2026-11-18): as XamInputGetKeystroke
+    static std::atomic<uint32_t> calls{0}, logged{0};
+    calls.fetch_add(1, std::memory_order_relaxed);
+    if (result == X_ERROR_SUCCESS && logged.fetch_add(1, std::memory_order_relaxed) < 200)
+      REXKRNL_INFO("[input] keystrokeEx: user {} flags 0x{:X}: key {:04X} flags {:04X} ({} calls so far)", user_index,
+                   uint32_t(flags), uint32_t(keystroke->virtual_key), uint32_t(keystroke->flags),
+                   calls.load(std::memory_order_relaxed));
   }
   return result;
 }

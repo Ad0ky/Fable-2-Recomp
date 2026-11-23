@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <plume_render_interface.h>
+#include <plume_recycled.h>  // fable2-nx (2026-11-20)
 
 #include <rex/types.h>
 
@@ -51,7 +52,8 @@ struct DepthImage {
   u32 format_word = 0;
 };
 
-struct HostSurface {
+// fable2-nx (2026-11-20): Recycled (plume_recycled.h): targets made and released frame by frame.
+struct HostSurface : plume::Recycled<HostSurface> {
   u32 guest_va = 0;  // the first surface over the view
   // Header words of the surface over the view bound most recently.
   u32 size_word = 0;
@@ -302,5 +304,8 @@ void DepthHandOverBeforeRetireLocked(HostSurface *surface);
 // Framebuffer over up to 4 color targets plus depth; cached per target set.
 plume::RenderFramebuffer *GetFramebufferLocked(HostSurface *const *colors, uint32_t color_count,
                                                HostSurface *depth);
+
+// fable2-nx (2026-11-20, the marker): the target whose image a bindless slot samples, or null.
+const HostSurface *MarkerSurfaceForSlotLocked(uint32_t slot);
 
 } // namespace renut::gpu

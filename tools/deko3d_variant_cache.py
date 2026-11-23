@@ -287,7 +287,11 @@ def read_list(path, blend_skip_on, alpha_guess=ALPHA_GUESS):
             spec[904] = tess_kind
         for k in range(4):
             if fetch_types[k]:
-                spec[920 + k] = fetch_types[k]
+                # fable2-nx (2026-11-17, render/pipeline.cpp): bits 24-31 the bound input's index + 1 when it is not k;
+                # inputs 4-15 are constants 1300 + input
+                tag = fetch_types[k] >> 24
+                inp = tag - 1 if tag else k
+                spec[(920 + inp) if inp < 4 else (1300 + inp)] = fetch_types[k] & 0xFFFFFF
         # sasrt-nx (2026-11-08, the third GPU round; render/draw.cpp SasrtSpecWordsOf): the vertex epilogue (932), the
         # memory fetches' byte order (937-939), the pixel shader's 3D fetches (934-936)
         if sw[0] and vs:

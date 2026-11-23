@@ -1863,4 +1863,19 @@ plume::RenderFramebuffer *GetFramebufferLocked(HostSurface *const *colors, uint3
   return remember(g_framebuffers.back().framebuffer.get());
 }
 
+// fable2-nx (2026-11-20, the marker): the target whose own image a bindless slot samples (a hand-over or a target read
+// as a texture), for render/textures.cpp MarkerDescribeTextureLocked. A linear search, for marked frames only.
+const HostSurface *MarkerSurfaceForSlotLocked(uint32_t slot) {
+  for (const auto &[key, t] : g_targets) {
+    if (!t)
+      continue;
+    if (t->sample_slot == slot || t->stencil_slot == slot)
+      return t.get();
+    for (const auto &v : t->handover_views)
+      if (v.slot == slot)
+        return t.get();
+  }
+  return nullptr;
+}
+
 } // namespace renut::gpu

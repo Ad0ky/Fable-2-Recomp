@@ -91,6 +91,8 @@ if(NOT TARGET rexglue_switch_startup)
     target_link_options(rexglue_switch_startup INTERFACE
         "LINKER:--wrap=threadCreate,--wrap=threadClose"
         "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvMapCreate"
+        # fable2-nx (2026-11-19): deko3d's read of the GPU channel's error (switch_perf.cpp, the GPU fault report)
+        "LINKER:--wrap=nvGpuChannelGetErrorNotification"
         "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx"
         "LINKER:--wrap=armDCacheClean,--wrap=nwindowQueueBuffer,--wrap=bqDequeueBuffer"
         "LINKER:--wrap=svcSleepThread,--wrap=svcSetThreadCoreMask")

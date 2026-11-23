@@ -165,6 +165,13 @@ void FreeRaw(void *host) {
 
 void Register(u32 guest_va, RecordKind kind) {
   std::unique_lock lock(g_registry_mutex);
+  // fable2-nx (2026-11-19, the 3D Engine thread's heap-lock waits: Register was 42% of its operator new): with the
+  // lock-free table on, a record the table holds is answered there (Lookup's Fast path), so the map's node (made here,
+  // freed at the Unregister, at every record the game makes and drops) is not made. The map keeps the ones outside.
+  if (banjo::renut_gpu::RecordsLockFreeOn() && Mark(guest_va, kKindMask, u8(u32(kind) + 1))) {
+    g_registry.erase(guest_va);  // one kept from before (none expected); a no-op otherwise
+    return;
+  }
   const bool added = g_registry.insert_or_assign(guest_va, kind).second;
   if (!Mark(guest_va, kKindMask, u8(u32(kind) + 1)) && added)  // rr6-nx (2026-11-08, rr6_records_lockfree)
     g_outside.fetch_add(1, std::memory_order_release);

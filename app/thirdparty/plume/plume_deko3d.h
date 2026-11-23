@@ -23,6 +23,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+
+#include "plume_recycled.h"  // fable2-nx (2026-11-20)
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>  // banjo-nx (2026-10-21): Deko3DDevice::asyncQueued
@@ -143,7 +145,7 @@ namespace plume {
         int32_t chunk = -1;     // -1: its own block (swapchain images)
     };
 
-    struct Deko3DTexture : RenderTexture {
+    struct Deko3DTexture : RenderTexture, Recycled<Deko3DTexture> {  // fable2-nx (2026-11-20): Recycled
         Deko3DDevice *device = nullptr;
         RenderTextureDesc desc;
         DkImageLayout layout{};
@@ -153,6 +155,9 @@ namespace plume {
         Deko3DImageAlloc alloc;
         bool ownsMemory = true;
         bool valid = false;
+        // fable2-nx (2026-11-17, Deko3DSetImagePool): the layout's key; a retired image of the same key is reused (its
+        // memory and its DkImage, whose GPU mapping dkImageInitialize made) instead of a new one.
+        uint64_t poolKey[3] = {};
         bool compressed = false;  // sasrt-nx (2026-10-21): made with DkImageFlags_HwCompression
         // renut-ultimate (2026-11-08, Deko3DOptions::depthResolveLazy): a compressed depth target written through
         // depthPendingView and not decompressed since it left the bind point. Decompressed when it next moves to a read
@@ -188,7 +193,7 @@ namespace plume {
         mutable std::atomic<bool> sampledDescriptorReady{false};
     };
 
-    struct Deko3DTextureView : RenderTextureView {
+    struct Deko3DTextureView : RenderTextureView, Recycled<Deko3DTextureView> {  // fable2-nx (2026-11-20)
         const Deko3DTexture *texture = nullptr;
         DkImageView view{};
         RenderTextureViewDesc desc;
@@ -404,7 +409,7 @@ namespace plume {
     struct Deko3DCommandSemaphore : RenderCommandSemaphore {
     };
 
-    struct Deko3DFramebuffer : RenderFramebuffer {
+    struct Deko3DFramebuffer : RenderFramebuffer, Recycled<Deko3DFramebuffer, 128> {  // fable2-nx (2026-11-20)
         DkImageView colors[8]{};
         uint32_t colorCount = 0;
         DkImageView depth{};
@@ -672,6 +677,7 @@ namespace plume {
         Deko3DDevice *device = nullptr;
         RenderSwapChainDesc desc;
         DkSwapchain swapchain = nullptr;
+        int acquiredSlot = -1;  // fable2-nx (2026-11-18): the image acquired and not presented yet (present checks it)
         std::vector<std::unique_ptr<Deko3DTexture>> textures;
         std::vector<DkMemBlock> blocks;
         uint32_t width = 0, height = 0;
@@ -778,6 +784,24 @@ namespace plume {
             DkMemBlock block;
         };
         std::vector<Retired> retired;
+        // fable2-nx (2026-11-17, Deko3DSetImagePool; Fable 2's town: ~10% of the render thread in dkImageInitialize's
+        // GPU mapping ioctl, a resolve destination or render target made again every frame): a retired image, kept with
+        // its memory, its layout and its initialised DkImage. Pending until the GPU has passed it, then ready for a new
+        // texture of the same key. Under retireMutex.
+        struct PooledImage {
+            uint64_t key[3];
+            uint64_t serial;
+            Deko3DImageAlloc alloc;
+            DkImage image;
+            bool compressed;
+        };
+        std::vector<PooledImage> poolPending, poolReady;
+        uint64_t poolReadyBytes = 0;
+        uint64_t poolHits = 0, poolMisses = 0;
+        bool takePooledImage(const uint64_t key[3], Deko3DImageAlloc &alloc, DkImage &image, bool &compressed);
+        void retirePooled(const uint64_t key[3], const Deko3DImageAlloc &alloc, const DkImage &image, bool compressed);
+        void trimPoolLocked(uint64_t max_bytes);                    // retireMutex held
+        bool dropImagePool();  // every ready pooled image freed (an allocation failed); whether there was one
         std::atomic<uint64_t> submitSerial{1};
         std::atomic<uint64_t> completedSerial{0};
         static constexpr uint32_t SerialFences = 16;
@@ -839,6 +863,7 @@ namespace plume {
 
         // internal
         DkMemBlock makeBlock(uint32_t size, uint32_t flags, const char *what);
+        DkMemBlock makeBlockRaw(uint32_t size, uint32_t flags, const char *what);
         void destroyBlock(DkMemBlock block);
         // PLUME_DEKO3D_GUARDS (debug builds): every block's storage has guard bytes after it, checked here.
         void checkGuards();
@@ -971,6 +996,10 @@ namespace plume {
     bool Deko3DShaderReadsVertexId(const RenderShader *shader);
     // vivapinata-nx (2026-11-03): whether a vertex shader has the kill's constant 914 (Deko3DShaderUsage::writesVertexKill).
     bool Deko3DShaderWritesVertexKill(const RenderShader *shader);
+    // fable2-nx (2026-11-17, fable2_point_native): whether a shader declares a specialization constant (980: the point
+    // sprites without the geometry shader, tools/deko3d_glsl_opt.py pointnative); and whether it reads input location loc.
+    bool Deko3DShaderHasSpec(const RenderShader *shader, uint32_t id);
+    bool Deko3DShaderReadsInput(const RenderShader *shader, uint32_t loc);
     // banjo-nx (2026-10-21, asyncVariants): this thread does not draw (Renut's pipeline prebuild workers): the variants it
     // asks for are compiled after the draws' ones, and only so many wait at a time (the rest when a draw needs them).
     void Deko3DSetBackgroundThread(bool background);
@@ -1011,6 +1040,24 @@ namespace plume {
     // region at once, for buffers too, instead of a hole in a shared image chunk that only images can use; and the
     // image heap's empty chunks given back on request (a governor).
     void Deko3DSetDedicatedTargets(bool on);
+    // fable2-nx (2026-11-17): retired images reused by new textures of the same layout, up to this many MB kept (0: off).
+    void Deko3DSetImagePoolMb(uint32_t mb);
+    // fable2-nx (2026-11-19): GPU breadcrumbs after every draw, dispatch and copy, read when the GPU refuses a submission
+    // (plume_deko3d_commands.cpp); and the renderer's name for the next operation (its shaders' hashes).
+    void Deko3DSetGpuCrumbs(bool on);
+    void Deko3DCrumbLabel(uint64_t vs, uint64_t ps);
+    // fable2-nx (2026-11-19, the MMU fault): the breadcrumbs recorded and submitted so far; where a GPU address lies (the
+    // live blocks' mappings, the destroyed ones'); the live blocks' address layout in the log; a live block's CPU memory.
+    uint64_t Deko3DCrumbNow();
+    uint64_t Deko3DCrumbSubmittedNow();
+    void Deko3DDescribeGpuAddr(uint64_t addr, char *out, size_t n);
+    void Deko3DLogGpuLayout();
+    const void *Deko3DBlockCpuIfAlive(DkMemBlock block, uint32_t &size);
+    // fable2-nx (2026-11-19, the marker): the next draw's textures logged under mark 'mark', draw 'ordinal'.
+    void Deko3DDumpNextDraw(uint32_t mark, uint32_t ordinal);
+    // The marked frame's text (Deko3DMarkAppend adds a line; Deko3DMarkTake hands it over and empties it).
+    void Deko3DMarkAppend(const char *line);
+    std::string Deko3DMarkTake();
     uint64_t Deko3DReleaseEmptyImageChunks();
     // sasrt-nx (2026-11-11, the stutter hunt: a dynamic-resolution step made ~33 dedicated blocks in one frame, ~2.5 ms
     // each, and destroyed the old ones two frames later): an emptied dedicated target's block stays, up to this many

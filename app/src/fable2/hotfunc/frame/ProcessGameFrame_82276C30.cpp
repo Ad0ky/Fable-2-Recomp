@@ -99,6 +99,45 @@
 //   }
 #include "renut_pch.h"  // fable2-nx: the generated project is "renut" (the base keeps its name)
 
+#include <atomic>
+#include <chrono>
+
+#include <rex/logging.h>
+
+// fable2-nx (2026-11-18, the character would not move after the intro): the "game clock" line (TickCatchup.cpp)
+// counts the front end's loop only, and it reads 0 in play. This counts the play loop: every 10 s, the passes into
+// this function, the loop's turns that did the frame's work (each ends in ProcessGameStateUpdate), and the ones that
+// found none and yielded.
+std::atomic<uint64_t> g_fable2_play_state_updates{0};  // also read by DeadlockProbe.cpp's ring report
+namespace {
+std::atomic<uint64_t>& g_play_state_updates = g_fable2_play_state_updates;
+std::atomic<uint64_t> g_play_calls{0}, g_play_work{0}, g_play_yields{0};
+void play_loop_report() {
+  using clock = std::chrono::steady_clock;
+  static std::atomic<int64_t> last_ns{0};
+  static uint64_t last_calls = 0, last_work = 0, last_yields = 0, last_updates = 0;
+  const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count();
+  int64_t prev = last_ns.load(std::memory_order_relaxed);
+  if (prev == 0) {
+    last_ns.compare_exchange_strong(prev, now);
+    return;
+  }
+  if (now - prev < 10000000000LL || !last_ns.compare_exchange_strong(prev, now))
+    return;
+  const double secs = double(now - prev) / 1e9;
+  const uint64_t calls = g_play_calls.load(), work = g_play_work.load(), yields = g_play_yields.load(),
+                 updates = g_play_state_updates.load();
+  REXLOG_INFO("[fable2] play loop: {:.1f} s: {} passes ({:.1f} a second), {} turns with work ({:.1f} a second), {} "
+              "state updates, {} turns that yielded",
+              secs, calls - last_calls, double(calls - last_calls) / secs, work - last_work,
+              double(work - last_work) / secs, updates - last_updates, yields - last_yields);
+  last_calls = calls;
+  last_work = work;
+  last_yields = yields;
+  last_updates = updates;
+}
+}  // namespace
+
 extern "C" void CallActivePlayerMethod_821A11E8(PPCContext& ctx, uint8_t* base);
 extern "C" void ConstructRefCounted_8222CF18(PPCContext& ctx, uint8_t* base);
 extern "C" void DispatchFrameCallback_821A6010(PPCContext& ctx, uint8_t* base);
@@ -907,6 +946,7 @@ static __attribute__((noinline)) void process_frame_work(PPCContext& ctx, uint8_
 	// --- Update the global game state ---
 	// bl 0x821c9008
 	ctx.lr = 0x82277134;
+	g_play_state_updates.fetch_add(1, std::memory_order_relaxed);
 	ProcessGameStateUpdate_821C9008(ctx, base);
 	// addi r3,r1,168
 	ctx.r3.s64 = ctx.r1.s64 + 168;
@@ -1067,6 +1107,8 @@ extern "C" void ProcessGameFrame_82276C30(PPCContext& __restrict ctx, uint8_t* b
 	ea = -512 + ctx.r1.u32;
 	SV32(ea, ctx.r1.u32);
 	ctx.r1.u32 = ea;
+	g_play_calls.fetch_add(1, std::memory_order_relaxed);
+	play_loop_report();
 	probe_and_setup(ctx, base);
 	compute_frame_timing(ctx, base);
 	// beq cr6,0x8227722c  (setup+loop runs when !cr6.eq)
@@ -1078,8 +1120,11 @@ extern "C" void ProcessGameFrame_82276C30(PPCContext& __restrict ctx, uint8_t* b
 	compute_loop_timing(ctx, base);
 	// ble 0x82277208  (big block runs when cr0.gt, else yield)
 	if (ctx.cr0.gt) {
+	g_play_work.fetch_add(1, std::memory_order_relaxed);
 	process_frame_work(ctx, base);
 	} else {
+	g_play_yields.fetch_add(1, std::memory_order_relaxed);
+	play_loop_report();
 	// --- (no work on this path) yield + re-check the frame threshold ---
 	// bl 0x82cbd098
 	ctx.lr = 0x8227720C;

@@ -1530,14 +1530,20 @@ BANJO_RENUT_HOOK_RAW(sub_8220BE78) {
     case kQueryTypeEvent:
       put(0, 1);
       break;
-    case kQueryTypeOcclusion:
-      put(0, kQueryOcclusionSamples);
+    case kQueryTypeOcclusion: {
+      // fable2-nx (2026-11-23, fable2_occlusion_queries): the GPU's count when there is one (queued.h). The culling test
+      // (sub_8220BDD8, 16 bytes) takes out[0] != 0 as visible and out[1] * 100 / out[3] as its percentage: 100 % or 0.
+      u32 samples = kQueryOcclusionSamples;
+      if (!OcclusionQueryAnswer(query, size < 16, samples))
+        samples = kQueryOcclusionSamples;
+      put(0, samples);
       if (size >= 16) {
-        put(4, kQueryOcclusionSamples);
+        put(4, samples ? 1u : 0u);
         put(8, 0);
-        put(12, kQueryOcclusionSamples);
+        put(12, 1);
       }
       break;
+    }
     case kQueryTypeScreenExtent:
       put(0, 0);
       put(4, 0);
@@ -1548,6 +1554,23 @@ BANJO_RENUT_HOOK_RAW(sub_8220BE78) {
       break;
   }
   ctx.r3.u64 = 0;  // S_OK
+}
+
+// fable2-nx (2026-11-23, fable2_occlusion_queries): D3DQuery_Issue(query, flags) = sub_822195E8 (the function that
+// writes the 0xFFFFFEED sentinel): flags bit 1 BEGIN, bit 0 END; the query's device at +0, its type at +4 (9:
+// occlusion). The original runs (its packets, the issued flag and fence GetData checks), then an occlusion query's begin
+// or end is queued in draw order for the render thread (queued.h). Its callers call it directly (__imp__) until
+// tools/direct_calls.py --redo (post_codegen.py) sees this hook.
+BANJO_RENUT_HOOK_RAW(sub_822195E8) {
+  const u32 query = ctx.r3.u32;
+  const u32 flags = ctx.r4.u32;
+  const u32 device = query ? LoadGuestU32(query) : 0;
+  const u32 type = query ? LoadGuestU32(query + 4) : 0;
+  if (device && type == kQueryTypeOcclusion && (flags & 2))
+    QueueQueryBegin(device, query);
+  __imp__sub_822195E8(ctx, base);
+  if (device && type == kQueryTypeOcclusion && (flags & 1))
+    QueueQueryEnd(device, query);
 }
 
 // fable2-nx (2026-11-07, first console run: "Record heap used before Init", every reNut record null): Fable has no

@@ -17,9 +17,12 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/load_profile.h>
 #include <rex/kernel/xboxkrnl/private.h>
@@ -375,8 +378,79 @@ u32 KeQueryPerformanceFrequency_entry() {
   return static_cast<uint32_t>(result);
 }
 
+// fable2-nx (2026-11-18, the game too slow to play): with diag_guest_sleeps, every 10 s, the time each guest thread
+// spent in KeDelayExecutionThread (Sleep), split by the guest return address, so a log shows which game loop waits
+// and for how long (the GameThread on the 3D ring, say) without the CPU sampler running.
+REXCVAR_DEFINE_BOOL(diag_guest_sleeps, false, "Kernel",
+                    "Log every 10 s the time each guest thread spends in Sleep (KeDelayExecutionThread), by caller");
+
+namespace {
+struct SleepSite {
+  std::atomic<uint64_t> key{0};  // thread id << 32 | guest return address
+  std::atomic<uint64_t> us{0}, calls{0}, zero{0};
+};
+constexpr uint32_t kSleepSites = 256;
+SleepSite g_sleep_sites[kSleepSites];
+std::atomic<int64_t> g_sleep_report_us{0};
+std::mutex g_sleep_report_mutex;
+
+void NoteSleep(uint32_t tid, uint32_t lr, uint64_t us, bool zero) {
+  const uint64_t key = uint64_t(tid) << 32 | lr;
+  uint32_t h = uint32_t((key * 0x9E3779B97F4A7C15ull) >> 56);
+  for (uint32_t i = 0; i < 16; ++i, h = (h + 1) % kSleepSites) {
+    SleepSite& s = g_sleep_sites[h];
+    uint64_t k = s.key.load(std::memory_order_relaxed);
+    if (k == 0 && s.key.compare_exchange_strong(k, key))
+      k = key;
+    if (k != key)
+      continue;
+    s.us.fetch_add(us, std::memory_order_relaxed);
+    s.calls.fetch_add(1, std::memory_order_relaxed);
+    if (zero)
+      s.zero.fetch_add(1, std::memory_order_relaxed);
+    break;
+  }
+  const int64_t now = int64_t(load_profile::NowUs());
+  int64_t prev = g_sleep_report_us.load(std::memory_order_relaxed);
+  if (prev == 0) {
+    g_sleep_report_us.compare_exchange_strong(prev, now);
+    return;
+  }
+  if (now - prev < 10000000 || !g_sleep_report_us.compare_exchange_strong(prev, now))
+    return;
+  std::lock_guard<std::mutex> lock(g_sleep_report_mutex);
+  struct Row {
+    uint64_t key, us, calls, zero;
+  };
+  std::vector<Row> rows;
+  for (auto& s : g_sleep_sites) {
+    const uint64_t k = s.key.load(std::memory_order_relaxed);
+    const uint64_t c = s.calls.exchange(0, std::memory_order_relaxed);
+    if (!k || !c)
+      continue;
+    rows.push_back({k, s.us.exchange(0, std::memory_order_relaxed), c, s.zero.exchange(0, std::memory_order_relaxed)});
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.us > b.us; });
+  const double secs = double(now - prev) / 1e6;
+  std::string line;
+  for (size_t i = 0; i < rows.size() && i < 12; ++i) {
+    const uint32_t row_tid = uint32_t(rows[i].key >> 32);
+    std::string name;
+    if (auto t = REX_KERNEL_STATE()->GetThreadByID(row_tid))
+      name = t->name();
+    line += fmt::format("\n  thread {:X} ({}) from {:08X}: {:.0f}% of the time ({} sleeps, {} of 0 ms)", row_tid, name,
+                        uint32_t(rows[i].key), 100.0 * double(rows[i].us) / (secs * 1e6), rows[i].calls,
+                        rows[i].zero);
+  }
+  REXKRNL_INFO("[sleeps] {:.1f} s of guest Sleep calls, the most time first:{}", secs, line);
+}
+}  // namespace
+
 u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
   XThread* thread = XThread::GetCurrentThread();
+  const bool diag = REXCVAR_GET(diag_guest_sleeps);
+  const uint64_t diag_start = diag ? load_profile::NowUs() : 0;
+  const uint32_t diag_lr = diag ? uint32_t(thread->thread_state()->context()->lr) : 0;
 
   if (alertable) {
     thread->DeliverAPCs();
@@ -399,6 +473,9 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
   if (alertable && result == X_STATUS_USER_APC) {
     thread->DeliverAPCs();
   }
+  if (diag)
+    NoteSleep(thread->thread_id(), diag_lr, load_profile::NowUs() - diag_start,
+              static_cast<int64_t>(static_cast<uint64_t>(*interval_ptr)) == 0);
 
   return result;
 }

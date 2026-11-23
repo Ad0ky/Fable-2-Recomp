@@ -1709,15 +1709,19 @@ def pass_gpr32(text, name=None):
     (the fur shader: 15 loads, 5 stores). The constant changes no code by itself."""
     global _GPR32
     if _GPR32 is None:
-        _GPR32 = set()
+        # fable2-nx (2026-11-17): a line may give the cap after the hash ("C472C3A411FD0A14 64"; 32 without): Fable 2's
+        # heaviest shaders have 49-80 GPRs, where 32 would spill too much. The cap other than 32 goes into the text as
+        # a comment, which uam's CompileBest reads (app/thirdparty/uam/source/compiler_iface.cpp).
+        _GPR32 = {}
         if os.path.isfile(GPR32_LIST):
             for line in open(GPR32_LIST, encoding='utf-8'):
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    _GPR32.add(line.upper())
+                fields = line.split('#')[0].split()
+                if fields:
+                    _GPR32[fields[0].upper()] = int(fields[1]) if len(fields) > 1 else 32
     if name is None or name.upper() not in _GPR32 or 'SPIRV_CROSS_CONSTANT_ID_910' in text:
         return text
-    return insert_before_main(text, GPR32_DECL)
+    cap = _GPR32[name.upper()]
+    return insert_before_main(text, GPR32_DECL + (f'// banjo-gpr-cap={cap}\n' if cap != 32 else ''))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2668,7 +2672,12 @@ def pass_skinonce(text, name=None):
     return insert_before_main(text, SKIN_DECL)
 
 
-FETCH_WORDS = ['g_UboShared.v[%du].w' % (66 + k) for k in range(4)]
+FETCH_WORDS = ['g_UboShared.v[%du].w' % (66 + k) for k in range(16)]
+# fable2-nx (2026-11-17): bound inputs 4-15 too (Fable 2's skinned characters read rows 73-75: 5,927 instructions and 101
+# registers with the types read at run time, ~450 and 28 with them known), as constants 1300 + k (1000-1255 are the
+# bools); render/draw.cpp FetchSpecWords names which four inputs a draw's key holds.
+def fetch_spec_id(k):
+    return 920 + k if k < 4 else 1300 + k
 
 
 def pass_fetchspec(text):
@@ -2677,7 +2686,7 @@ def pass_fetchspec(text):
     specialization constants 920-923, each the word + 1 (0: read at run time). render/pipeline.cpp gives them to a
     tessellated draw's pipeline from its key (render/draw.cpp FetchSpecWords, the draw's own words): the generic fetch's
     switch over fifteen formats becomes one format's decode."""
-    if FETCH_WORDS[0] not in text or 'g_DkAddressWindow' not in text:
+    if not any(w in text for w in FETCH_WORDS) or 'g_DkAddressWindow' not in text:
         return text
     span = main_span(text)
     if not span:
@@ -2689,7 +2698,7 @@ def pass_fetchspec(text):
         if word not in body:
             continue
         body = body.replace(word, 'DK_FETCH_TYPE%d' % k)
-        c = 920 + k
+        c = fetch_spec_id(k)
         decl += (f'#ifndef SPIRV_CROSS_CONSTANT_ID_{c}\n#define SPIRV_CROSS_CONSTANT_ID_{c} 0u\n#endif\n'
                  f'const uint g_banjoFetchType{k} = SPIRV_CROSS_CONSTANT_ID_{c};\n'
                  f'#define DK_FETCH_TYPE{k} ((g_banjoFetchType{k} != 0u) ? (g_banjoFetchType{k} - 1u) : {word})\n')
@@ -3166,6 +3175,182 @@ def pass_clamp7e3(text):
     return insert_globals(insert_before_main(text, CLAMP7E3_FN), CLAMP7E3_DECL)
 
 
+
+# ---------------------------------------------------------------------------------------------------------------------
+# pass: pointnative — point sprites without the geometry shader (fable2-nx, constant 980)
+
+POINTNATIVE_DECL = ('#ifndef SPIRV_CROSS_CONSTANT_ID_980\n#define SPIRV_CROSS_CONSTANT_ID_980 0u\n#endif\n'
+                    'const uint g_fable2PointNative = SPIRV_CROSS_CONSTANT_ID_980;\n')
+POINTSIZE_RE = re.compile(r'^(\s*)out_var_POINTSIZE = ([^;]+);$', re.M)
+
+
+def pass_pointnative(text):
+    """fable2-nx (2026-11-17, Fable 2's snow: 86,000 points a frame): Renut makes a square of each point with
+    point_sprite_gs.hlsl, a geometry shader, ~120 ns a point on the console (sasrt_gpu_export_no_point_gs's
+    measurement). The Switch's GPU draws point sprites itself (deko3d enables point sprites, the vertex shader's point
+    size and the point coordinate in every command buffer). With constant 980 (render/pipeline.cpp, fable2_point_native)
+    a point list's pipeline has no geometry shader, and:
+      - the vertex shader sizes the point as point_sprite_gs does (its written size, -2 for a size written as zero or
+        less: the minimum; the render state's size when it writes none; clamped to the state's minimum and maximum;
+        none at all when it ends up zero or below: the point moved out of clip space) in the target's pixels
+        (SharedConstants: point_state v[82], resolution_scale v[83].z);
+      - the pixel shader reads gl_PointCoord where it read the geometry shader's POINTCOORD (980 = 2: y flipped).
+    Only shaders that write POINTSIZE / read POINTCOORD get it; render/pipeline.cpp keeps the geometry shader for a
+    pipeline whose shaders lack the constant."""
+    span = main_span(text)
+    if not span:
+        return text
+    a, b = span
+    body = text[a:b]
+    if re.search(r'\bgl_Position\b', text):
+        if 'g_UboShared' not in text:
+            return text
+        m = POINTSIZE_RE.search(body)
+        if not m or len(POINTSIZE_RE.findall(body)) != 1:
+            return text
+        ind, expr = m.group(1), m.group(2)
+        block = (f'{ind}float dk_psz = {expr};\n'
+                 f'{ind}out_var_POINTSIZE = dk_psz;\n'
+                 f'{ind}if (g_fable2PointNative != 0u)\n{ind}{{\n'
+                 f'{ind}    vec4 dk_pst = uintBitsToFloat(g_UboShared.v[82u]);\n'
+                 f'{ind}    bool dk_wz = dk_psz < -1.5;\n'
+                 f'{ind}    float dk_s = dk_wz ? 0.0 : ((dk_psz > 0.0) ? dk_psz : dk_pst.x);\n'
+                 f'{ind}    if (dk_pst.w > 0.0) {{ dk_s = min(dk_s, dk_pst.w); }}\n'
+                 f'{ind}    dk_s = max(dk_s, dk_pst.z);\n'
+                 f'{ind}    dk_ptCull = (dk_psz < 0.0 && !dk_wz) || !(dk_s > 0.0);\n'
+                 f'{ind}    dk_ptSize = max(dk_s * uintBitsToFloat(g_UboShared.v[83u].z), 1.0);\n'
+                 f'{ind}}}')
+        # The point's fate at the end of main(), after gl_Position's last write wherever the size was written.
+        tail = ('\n    if (g_fable2PointNative != 0u)\n    {\n'
+                '        if (dk_ptCull) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); }\n'
+                '        gl_PointSize = dk_ptSize;\n    }\n')
+        body = ('\n    bool dk_ptCull = false;\n    float dk_ptSize = 1.0;' + body[:m.start()] + block +
+                body[m.end():].rstrip() + tail)
+        text = text[:a] + body + text[b:]
+        return insert_before_main(text, POINTNATIVE_DECL)
+    else:
+        if not re.search(r'^layout\(location = \d+\) in vec2 in_var_POINTCOORD;$', text, re.M):
+            return text
+        if not re.search(r'\bin_var_POINTCOORD\b', body):
+            return text
+        # A macro, not a variable: later passes move statements (earlyhoist) above where a declaration would stand.
+        body = re.sub(r'\bin_var_POINTCOORD\b', 'dk_pointCoord', body)
+    text = text[:a] + body + text[b:]
+    return insert_before_main(text, POINTNATIVE_DECL +
+                              '#define dk_pointCoord ((g_fable2PointNative == 0u) ? in_var_POINTCOORD : '
+                              '((g_fable2PointNative == 2u) ? vec2(gl_PointCoord.x, 1.0 - gl_PointCoord.y) : '
+                              'gl_PointCoord))\n')
+
+PCFGATHER_DECL = ('#ifndef SPIRV_CROSS_CONSTANT_ID_981\n#define SPIRV_CROSS_CONSTANT_ID_981 0u\n#endif\n'
+                  'const uint g_fable2PcfGather = SPIRV_CROSS_CONSTANT_ID_981;\n')
+PCF_TAP_RE = re.compile(r'^(\s*)vec4 (_\d+) = texture\((dk_tex_b\d+), ([\w.]+)'
+                        r'(?: \+ \(vec2\((-?\d+)\.0(?:, (-?\d+)\.0)?\) / (_\d+)\))?\);$', re.M)
+PCF_ALIAS_RE = re.compile(r'^\s*vec2 (_\d+) = (_\d+\.[xyzw]{2});$', re.M)
+
+
+def pass_pcfgather(text):
+    """fable2-nx (2026-11-17, Fable 2's C472C3A4: 8 ms a frame, 25 of its 34 reads one shadow map's 5x5 texels): a
+    shadow filter that reads a grid of texels at whole-texel offsets (texture(t, uv + vec2(i, j) / size), i, j in -2..2)
+    and compares each against the pixel's depth. textureGather reads 2x2 texels at once, exactly as the point-sampled
+    reads would (no filtering in either), so 9 gathers give the 25 values. With constant 981 (render/pipeline.cpp,
+    fable2_pcf_gather) and only when the texture's own size is the shader's texel size (not a scaled shadow map); the
+    reads as before otherwise. Only grids whose reads use nothing but the first component, in main()'s outer scope."""
+    span = main_span(text)
+    if not span:
+        return text
+    a, b = span
+    body = text[a:b]
+    alias = {m.group(1): m.group(2) for m in PCF_ALIAS_RE.finditer(body)}
+    groups = {}
+    for m in PCF_TAP_RE.finditer(body):
+        tex, base, size = m.group(3), m.group(4), m.group(7)
+        if m.group(5) is None:
+            off = (0, 0)
+        else:
+            off = (int(m.group(5)), int(m.group(6) if m.group(6) is not None else m.group(5)))
+        groups.setdefault((tex, alias.get(base, base)), []).append((m, off, size))
+    edits = []
+    gi = 0
+    for (tex, cbase), taps in groups.items():
+        sizes = {s for _, _, s in taps if s}
+        offs = [o for _, o, _ in taps]
+        if len(taps) < 9 or len(sizes) != 1 or len(set(offs)) != len(offs):
+            continue
+        if any(abs(x) > 2 or abs(y) > 2 for x, y in offs):
+            continue
+        size = sizes.pop()
+        # Outer scope only, every value read through .x (directly, or a vec4 it is copied into whole).
+        ok = True
+        for m, _, _ in taps:
+            if body[:m.start()].count('{') - body[:m.start()].count('}') != 0:
+                ok = False
+                break
+            v = m.group(2)
+            uses = [u for u in re.finditer(r'\b' + v + r'\b(\.\w+)?', body) if u.start() != m.start(2)]
+            for u in uses:
+                if u.group(1) == '.x':
+                    continue
+                cp = re.match(r'(_\d+) = ' + v + ';', body[body.rfind('\n', 0, u.start()) + 1:].lstrip())
+                if not cp or u.group(1):
+                    ok = False
+                    break
+                p = cp.group(1)
+                for w in re.finditer(r'\b' + p + r'\b(\.\w+)?(\s*=[^=])?', body):
+                    if w.group(1) not in ('.x', None) or (w.group(1) is None and not w.group(2) and
+                                                         not body[w.start() - 5:w.start()].endswith('vec4 ')):
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if not ok:
+                break
+        if not ok:
+            continue
+        first = min(taps, key=lambda t: t[0].start())[0]
+        if size not in body[:first.start()] and size not in first.group(0):
+            continue
+        ind = first.group(1)
+        base = first.group(4)
+        p = f'dk_pcf{gi}'
+        gi += 1
+        names = {o: f'{p}_{o[0] + 2}{o[1] + 2}' for o in offs}
+        xs = sorted({x for x, _ in offs})
+        ys = sorted({y for _, y in offs})
+        gx = list(range(xs[0], xs[-1] + 1, 2))
+        gy = list(range(ys[0], ys[-1] + 1, 2))
+        lines = [f'{ind}float ' + ', '.join(names[o] for o in offs) + ';',
+                 f'{ind}vec2 {p}S = vec2(textureSize({tex}, 0));',
+                 f'{ind}SPIRV_CROSS_BRANCH',
+                 f'{ind}if (g_fable2PcfGather != 0u && all(equal({p}S, {size})))',
+                 f'{ind}{{',
+                 f'{ind}    vec2 {p}C = floor({base} * {p}S) + vec2(1.0);']
+        comp = {(0, 0): 'w', (1, 0): 'z', (0, 1): 'x', (1, 1): 'y'}
+        for ox in gx:
+            for oy in gy:
+                inside = [(ox + dx, oy + dy) for dx in (0, 1) for dy in (0, 1) if (ox + dx, oy + dy) in names]
+                if not inside:
+                    continue
+                g = f'{p}g{ox + 2}{oy + 2}'
+                lines.append(f'{ind}    vec4 {g} = textureGather({tex}, ({p}C + vec2({float(ox)}, {float(oy)})) / {p}S);')
+                for o in inside:
+                    lines.append(f'{ind}    {names[o]} = {g}.{comp[(o[0] - ox, o[1] - oy)]};')
+        lines += [f'{ind}}}', f'{ind}else', f'{ind}{{']
+        for o in offs:
+            off = '' if o == (0, 0) else f' + (vec2({float(o[0])}, {float(o[1])}) / {size})'
+            lines.append(f'{ind}    {names[o]} = texture({tex}, {base}{off}).x;')
+        lines.append(f'{ind}}}')
+        edits.append((first.start(), first.start(), '\n'.join(lines) + '\n'))
+        for m, o, _ in taps:
+            edits.append((m.start(), m.end(), f'{m.group(1)}vec4 {m.group(2)} = vec4({names[o]});'))
+    if not edits:
+        return text
+    edits.sort(key=lambda e: (e[0], e[1] - e[0]), reverse=True)
+    for s, e, r in edits:
+        body = body[:s] + r + body[e:]
+    text = text[:a] + body + text[b:]
+    return insert_before_main(text, PCFGATHER_DECL)
+
+
 PASSES = [
     ('scalecodes', pass_scalecodes),
     ('scale1', pass_scale1),
@@ -3175,6 +3360,7 @@ PASSES = [
     ('fetchspec', pass_fetchspec),
     ('bonerow', pass_bonerow),
     ('vszero', pass_vszero),
+    ('pointnative', pass_pointnative),  # fable2-nx (2026-11-17): constant 980, before vsout
     ('vsout', pass_vsout),
     ('pszero', pass_pszero),
     ('pred', pass_pred),
@@ -3214,6 +3400,7 @@ PASSES = [
     ('vskill', pass_vskill),  # vivapinata-nx (2026-11-03): last
     ('expwin', pass_expwin),  # sasrt-nx (2026-11-08): the fourth GPU round, constant 944
     ('expparts', pass_expparts),  # sasrt-nx (2026-11-09): an EXPERIMENT, constant 945 (0: as before)
+    ('pcfgather', pass_pcfgather),  # fable2-nx (2026-11-17): constant 981, after onex / onexsize
     ('clamp7e3', pass_clamp7e3),  # dishonored-nx (2026-10-31; port 106): constant 990, the last pixel pass
     ('invariant', pass_invariant),  # dishonored-nx (2026-10-30; port 100): vertex shaders, no constant
 ]
@@ -3227,6 +3414,7 @@ DEFAULT = ','.join(name for name, _ in PASSES if name not in ('scale1', 'fragsca
 STAGE_OF = {'earlykill': 'frag', 'noearly': 'frag', 'facesign': 'frag', 'clipspec': 'vert', 'nofxaa': 'frag',
             'vsepi': 'vert', 'expwin': 'vert', 'expparts': 'vert', 'stack3d': 'frag', 'fetchendian': 'vert', 'expfmt': 'vert', 'skinonce': 'vert', 'bonesel': 'vert', 'aw4': 'vert', 'lightbranch': 'frag', 'nullps': 'frag', 'gpr32': 'frag', 'earlyz': 'frag', 'txq': 'frag', 'alpha': 'frag', 'alphamask': 'frag', 'earlyhoist': 'frag', 'tess': 'vert', 'vsout': 'vert', 'vszero': 'vert', 'pszero': 'frag'}
 STAGE_OF['invariant'] = 'vert'  # dishonored-nx (port 100)
+STAGE_OF['pcfgather'] = 'frag'  # fable2-nx
 STAGE_OF['clamp7e3'] = 'frag'  # dishonored-nx (port 106)
 
 

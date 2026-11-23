@@ -115,7 +115,7 @@ constexpr u64 kReportSeconds = 10;
  */
 constexpr u64 kStartDelayNs = 8000000000ULL;
 constexpr size_t kMaxSamples = 1 << 15;
-constexpr size_t kFrames = 10;
+constexpr size_t kFrames = 16;  // fable2-nx (2026-11-17): 10 -> 16, deeper call paths for cpu_samples.bin
 // 0-32 renderer/audio counters (see RexSwitchPerfAdd); 40-55 host-runtime overhead (include/rex/sys_counters.h).
 constexpr unsigned kCounterCount = 64;
 // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
@@ -130,6 +130,10 @@ struct Slot {
   u32 seen = 0;
   u64 last_ticks = 0;
   bool busy = true;
+  // fable2-nx (2026-11-17): above 2% of a core in the last report (or new): sampled every round; the others one round
+  // in 16, so the busy threads get most of the 1 ms samples (round-robin over ~35 threads gave the render thread ~27 a
+  // second).
+  bool hot = true;
   double cpu = 0.0;
   // sasrt-nx (2026-11-09; port 58, the guest threads' 16 MB host stacks: ~500 MB of heap in SASRT): the deepest the
   // sampled sp has been below the top of its stack mapping (svcQueryMemory of sp), since the slot's thread registered.
@@ -285,6 +289,7 @@ void LimitOfMapping(u64* used_mb, u64* cap_mb, u64* process_mb, u64* total_mb) {
 }
 
 u64 g_base = 0, g_text_lo = 0, g_text_hi = 0;
+bool g_raw_dump = false;  // fable2-nx: switch_profile_raw (see Report)
 Thread g_thread;
 
 void Register(Handle h) {
@@ -444,11 +449,13 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
       s.seen = h;
       s.last_ticks = ticks;
       s.busy = true;
+      s.hot = true;
       s.cpu = 0.0;
       continue;
     }
     s.cpu = double(ticks - s.last_ticks) * 100.0 / double(elapsed_ticks);
     s.last_ticks = ticks;
+    s.hot = s.cpu >= 2.0;
     /*
      * All threads are sampled, including those that use no CPU. In a hang caused by
      * a wait, the thread that matters is exactly that one: the stopped one.
@@ -667,6 +674,58 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
     counters_last[i] = counters_now[i];
   }
 
+  // fable2-nx (2026-11-17, switch_profile_raw): every sample of the interval, with its x29 frames, appended to
+  // logs/rex/cpu_samples.bin for tools/fable2_cpu_samples.py (self and inclusive time of every function, call paths,
+  // source lines): the text report keeps only histograms. Block: "F2PS", version 1, image base, interval ticks, tick
+  // frequency, thread count, then per thread slot u16, CPU % float, priority s32, name[32]; sample count, then per sample pc, lr,
+  // frames[kFrames], tick (u64 each) and slot u16.
+  if (g_raw_dump && g_sample_count) {
+    // One write of the whole block: thousands of small fwrite calls to the SD made a report take ~14 s, during which
+    // no samples were taken.
+    std::vector<uint8_t> buf;
+    buf.reserve(64 + kMaxThreads * 42 + g_sample_count * (8 * (3 + kFrames) + 2));
+    auto put = [&buf](const void *p, size_t n) {
+      const auto *b = static_cast<const uint8_t *>(p);
+      buf.insert(buf.end(), b, b + n);
+    };
+    const u32 magic = 0x53503246u, version = 1;
+    put(&magic, 4);
+    put(&version, 4);
+    put(&g_base, 8);
+    put(&elapsed_ticks, 8);
+    put(&tick_freq, 8);
+    u32 threads = 0;
+    for (size_t i = 0; i < kMaxThreads; ++i)
+      threads += g_slots[i].handle.load() != 0;
+    put(&threads, 4);
+    for (size_t i = 0; i < kMaxThreads; ++i) {
+      const Slot& t = g_slots[i];
+      if (!t.handle.load())
+        continue;
+      const u16 slot = u16(i);
+      const float cpu = float(t.cpu);
+      s32 priority = -1;
+      svcGetThreadPriority(&priority, t.handle.load());
+      put(&slot, 2);
+      put(&cpu, 4);
+      put(&priority, 4);
+      put(t.name, 32);
+    }
+    const u32 count = u32(g_sample_count);
+    put(&count, 4);
+    for (size_t k = 0; k < g_sample_count; ++k) {
+      const Sample& m = g_samples[k];
+      put(&m.pc, 8);
+      put(&m.lr, 8);
+      put(m.frames, 8 * kFrames);
+      put(&m.tick, 8);
+      put(&m.slot, 2);
+    }
+    if (FILE* rf = std::fopen((std::string(RexSwitchLogDir()) + "cpu_samples.bin").c_str(), "ab")) {
+      std::fwrite(buf.data(), 1, buf.size(), rf);
+      std::fclose(rf);
+    }
+  }
   std::vector<Sample> samples(g_samples, g_samples + g_sample_count);
   g_sample_count = 0;
   std::sort(samples.begin(), samples.end(),
@@ -1027,6 +1086,11 @@ void ProfilerMain(void*) {
   {
     const std::string value = rex::cvar::GetFlagByName("switch_profile_stacks");
     if (value == "true" || value == "1") sample_stacks = true;
+    // fable2-nx (2026-11-17): every sample to logs/rex/cpu_samples.bin as well (needs the sampling above).
+    const std::string raw = rex::cvar::GetFlagByName("switch_profile_raw");
+    g_raw_dump = sample_stacks && (raw == "true" || raw == "1");
+    if (g_raw_dump)
+      std::remove((std::string(RexSwitchLogDir()) + "cpu_samples.bin").c_str());
   }
 
   u64 counters_last[kCounterCount]{};
@@ -1055,15 +1119,20 @@ void ProfilerMain(void*) {
 
   size_t rr = 0;
   size_t mode_index = 0;
+  u64 round = 0;
   while (true) {
     __real_svcSleepThread(sample_stacks ? kSampleIntervalNs : kPassiveIntervalNs);
 
+    ++round;
     for (size_t tries = 0; sample_stacks && tries < kMaxThreads; ++tries) {
       const size_t idx = rr;
       rr = (rr + 1) % kMaxThreads;
       Slot& s = g_slots[idx];
       const u32 h = s.handle.load();
       if (!h || !s.busy) {
+        continue;
+      }
+      if (!s.hot && (round & 15) != 0) {  // fable2-nx: the idle threads one round in 16
         continue;
       }
       if (R_FAILED(svcSetThreadActivity(h, ThreadActivity_Paused))) {
@@ -1210,10 +1279,67 @@ Result __wrap_nvFenceWait(NvFence* f, s32 timeout_us) {
   return rc;
 }
 
+// fable2-nx (2026-11-19, the GPU fault): deko3d aborts in its flush (DkResult_Fail, 2359-0001) with no word of what
+// faulted. Its Queue::checkError (from the flush, from appending GPU work and from Device::checkQueueErrors) reads the
+// channel's error notification (nvGpuChannelGetErrorNotification) and, when its status is set, the error info
+// (nvGpuChannelGetErrorInfo), marks the queue failed, and the next flush aborts. The fourth round: that read wrapped
+// (--wrap, rexglue_switch.cmake), so the moment deko3d finds the error the renderer's report runs (plume's GPU
+// breadcrumbs, through g_rex_gpu_fault_hook, which plume sets) with the notification and the error info; and a refused
+// kickoff reported too. The rounds before read the notification themselves; the driver hands it over once, so the one
+// deko3d read first was never seen there.
+extern "C" Result __real_nvGpuChannelGetErrorNotification(NvGpuChannel* c, void* out);
+extern "C" Result RexNvGpuChannelErrorInfo(NvGpuChannel* c, void* out) __asm__("nvGpuChannelGetErrorInfo")
+    __attribute__((weak));
+extern "C" {
+void (*g_rex_gpu_fault_hook)(uint32_t rc, const uint32_t* notification, int have_notification) = nullptr;
+int g_rex_gpu_crumbs_on = 0;
+uint32_t g_rex_gpu_error_info[32] = {};  // nvGpuChannelGetErrorInfo's answer, for the report
+int g_rex_gpu_error_info_valid = 0;
+}
+
+extern "C" Result __wrap_nvGpuChannelGetErrorNotification(NvGpuChannel* c, void* out) {
+  const Result rc = __real_nvGpuChannelGetErrorNotification(c, out);
+  if (R_SUCCEEDED(rc) && out && static_cast<const uint16_t*>(out)[7] != 0) [[unlikely]] {
+    // The notification's status (offset 14), as deko3d's checkError tests it.
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+      if (RexNvGpuChannelErrorInfo) {
+        uint32_t info[32] = {};
+        if (R_SUCCEEDED(RexNvGpuChannelErrorInfo(c, info))) {
+          std::memcpy(g_rex_gpu_error_info, info, sizeof(info));
+          g_rex_gpu_error_info_valid = 1;
+        }
+      }
+      uint32_t notification[16] = {};
+      std::memcpy(notification, out, 16);
+      if (g_rex_gpu_fault_hook)
+        g_rex_gpu_fault_hook(0, notification, 1);
+    }
+  }
+  return rc;
+}
+
 Result __wrap_nvGpuChannelKickoff(NvGpuChannel* c) {
   const u64 from = armGetSystemTick();
   const Result rc = __real_nvGpuChannelKickoff(c);
   Note(kKickoff, from);
+  if (R_FAILED(rc) && g_rex_gpu_fault_hook) [[unlikely]] {
+    // fable2-nx (2026-11-19, fifth round: the report came, a kickoff refused with LibnxNvidiaError_Timeout 0xD5C, the
+    // GPU stopped mid-frame): the channel's notification and error info read here too (the type of error and its
+    // details: an MMU fault's address, or a hang).
+    uint32_t notification[16] = {};
+    int have = 0;
+    if (R_SUCCEEDED(__real_nvGpuChannelGetErrorNotification(c, notification)))
+      have = 1;
+    if (RexNvGpuChannelErrorInfo) {
+      uint32_t info[32] = {};
+      if (R_SUCCEEDED(RexNvGpuChannelErrorInfo(c, info))) {
+        std::memcpy(g_rex_gpu_error_info, info, sizeof(info));
+        g_rex_gpu_error_info_valid = 1;
+      }
+    }
+    g_rex_gpu_fault_hook(uint32_t(rc), notification, have);
+  }
   return rc;
 }
 

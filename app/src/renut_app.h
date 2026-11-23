@@ -47,6 +47,7 @@
 #include <rex/ui/window.h>
 //#include <rex/discord_rpc.h>
 #include <cstdlib>
+#include <cstdio>  // fable2-nx (2026-11-20): the user data folder line
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -301,6 +302,29 @@ public:
                 paths.game_data_root = extracted;
             }
         }
+#if REX_PLATFORM_SWITCH
+        // fable2-nx (2026-11-20, the user's request): the player's data (saves, profile, achievements, the cache) in
+        // sdmc:/switch/fable2-nx/profile, not in a folder named after the base's internal project name ("renut", the
+        // default: the user folder / the app's name). An existing renut folder is renamed once, so nothing is lost; a
+        // user_data_root set in the toml is left alone.
+        {
+            const auto old_root = rex::filesystem::GetUserFolder() / "renut";
+            if (paths.user_data_root == old_root) {
+                const auto new_root = rex::filesystem::GetExecutableFolder() / "profile";
+                std::error_code ec;
+                if (std::filesystem::is_directory(old_root, ec) && !std::filesystem::exists(new_root, ec)) {
+                    std::filesystem::rename(old_root, new_root, ec);
+                    std::fprintf(stderr, "[fable2] user data: %s renamed to %s (%s)\n", old_root.string().c_str(),
+                                 new_root.string().c_str(), ec ? ec.message().c_str() : "done");
+                }
+                if (!ec || std::filesystem::is_directory(new_root, ec)) {
+                    if (paths.cache_root == old_root / "cache")
+                        paths.cache_root = new_root / "cache";
+                    paths.user_data_root = new_root;
+                }
+            }
+        }
+#endif
         renut::dlc::SetUserDataRoot(paths.user_data_root);  // the folder the DLC installer checks for installed ones
     }
 

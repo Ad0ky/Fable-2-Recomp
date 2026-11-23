@@ -23,6 +23,30 @@
 #include <utility>
 #include <vector>
 
+#include <rex/cvar.h>
+
+// fable2-nx (2026-11-17, Fable 2's snow: 21 draws of 4096 points a frame, ~10 ms of the geometry shader alone): point
+// lists drawn as the GPU's own point sprites, without point_sprite_gs (tools/deko3d_glsl_opt.py pointnative).
+REXCVAR_DEFINE_INT32(fable2_point_native, 1, "Fable2",
+                     "Point sprites drawn by the GPU itself, without the geometry shader: 0 = off (the geometry "
+                     "shader), 1 = on, 2 = on with the point coordinate's y flipped");
+namespace fable2 {
+int PointNativeMode() {
+  static const int v = [] {
+    const int x = REXCVAR_GET(fable2_point_native);
+    return x < 0 ? 0 : (x > 2 ? 2 : x);
+  }();
+  return v;
+}
+}  // namespace fable2
+
+// fable2-nx (2026-11-17, Fable 2's C472C3A4: 25 point-sampled reads of a shadow map's 5x5 texels, 8 ms a frame):
+// the same texels read 2x2 at a time with textureGather, 9 reads (tools/deko3d_glsl_opt.py pcfgather, constant 981).
+// Off: the console measured no gain (C472 8.3 ms either way; it is ALU-bound, not read-bound), and its variants were
+// not in the prebuilt cache, so turning it on compiled them at run time (a 7.5 s stall).
+REXCVAR_DEFINE_BOOL(fable2_pcf_gather, false, "Fable2",
+                    "Shadow filters' 5x5 texel reads done as 9 gathers of 2x2 texels (false: 25 reads as before)");
+
 #include <plume_render_interface_builders.h>
 #include <rex/cvar.h>
 
@@ -329,8 +353,29 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
   desc.pixelShader = inputs.pixel_shader;
   if (key.rectangle_list)
     desc.geometryShader = s.rectangle_list_gs.get();
-  if (key.point_sprite)
+  // fable2-nx (2026-11-17, fable2_point_native): point_sprite 2 = the GPU's own point sprites, no geometry shader, when
+  // the vertex shader sizes them (constant 980) and the pixel shader takes gl_PointCoord (constant 980, or it does not
+  // read the point coordinate, location 25); otherwise the geometry shader as before.
+  bool point_native = false;
+#if defined(PLUME_DEKO3D)
+  if (key.point_sprite == 2)
+    point_native = plume::Deko3DShaderHasSpec(inputs.vertex_shader, 980) &&
+                   (!inputs.pixel_shader || plume::Deko3DShaderHasSpec(inputs.pixel_shader, 980) ||
+                    !plume::Deko3DShaderReadsInput(inputs.pixel_shader, 25));
+#endif
+  if (key.point_sprite && !point_native)
     desc.geometryShader = s.point_sprite_gs.get();
+  if (key.point_sprite) {  // fable2-nx (2026-11-17): every point pipeline built, the first ones
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+#if defined(PLUME_DEKO3D)
+      RGPU_INFO("[points] build: point_sprite {}, VS has 980 {}, PS has 980 {}, PS reads the point coordinate {}",
+                key.point_sprite, plume::Deko3DShaderHasSpec(inputs.vertex_shader, 980),
+                plume::Deko3DShaderHasSpec(inputs.pixel_shader, 980),
+                plume::Deko3DShaderReadsInput(inputs.pixel_shader, 25));
+#endif
+    }
+  }
   desc.primitiveTopology = key.topology;
 
   // PA_SU_SC_MODE_CNTL: cull front 0, cull back 1, front face clockwise 2.
@@ -477,8 +522,13 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
   if (key.pixel_shader && key.fetch_pad)
     spec[spec_count++] = plume::RenderSpecConstant(926, key.fetch_pad);
   for (uint32_t k = 0; k < 4; ++k) {
-    if (key.fetch_types[k])
-      spec[spec_count++] = plume::RenderSpecConstant(920 + k, key.fetch_types[k]);
+    if (!key.fetch_types[k])
+      continue;
+    // fable2-nx (2026-11-17, render/draw.cpp FetchSpecWords): bits 24-31 the bound input's index + 1 when it is not k.
+    const uint32_t tag = key.fetch_types[k] >> 24;
+    const uint32_t input = tag ? tag - 1 : k;
+    spec[spec_count++] =
+        plume::RenderSpecConstant(input < 4 ? 920 + input : 1300 + input, key.fetch_types[k] & 0xFFFFFFu);
   }
   // sasrt-nx (2026-11-08, the third GPU round; render/draw.cpp SasrtSpecWordsOf): the vertex shader's epilogue (932) and
   // memory fetches' byte order (937-939), the pixel shader's 3D fetches (934-936), as the draw has them.
@@ -583,6 +633,25 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
       plume::Deko3DShaderWritesVertexKill(inputs.vertex_shader))
     spec[spec_count++] = plume::RenderSpecConstant(914, 1);
 #endif
+#if defined(PLUME_DEKO3D)
+  if (key.pixel_shader && REXCVAR_GET(fable2_pcf_gather) && plume::Deko3DShaderHasSpec(inputs.pixel_shader, 981)) {
+    spec[spec_count++] = plume::RenderSpecConstant(981, 1);  // fable2-nx (2026-11-17): pass pcfgather
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+      RGPU_INFO("[pcf] a pipeline with the shadow filter's gathers (constant 981)");
+  }
+#endif
+  if (point_native) {  // fable2-nx (2026-11-17): 1, or 2 with the point coordinate's y flipped
+    spec[spec_count++] = plume::RenderSpecConstant(980, uint32_t(fable2::PointNativeMode()));
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+      RGPU_INFO("[points] a point-sprite pipeline without the geometry shader (fable2_point_native {})",
+                fable2::PointNativeMode());
+  } else if (key.point_sprite == 2) {
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+      RGPU_INFO("[points] a point-sprite pipeline keeps the geometry shader: its shaders lack constant 980");
+  }
   desc.specConstants = spec_count ? spec : nullptr;
   desc.specConstantsCount = spec_count;
   if (REXCVAR_GET(banjo_deko3d_variant_log)) {

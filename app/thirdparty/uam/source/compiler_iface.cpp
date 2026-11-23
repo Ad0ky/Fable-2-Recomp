@@ -679,7 +679,20 @@ std::unique_ptr<DekoCompiler> DekoCompiler::CompileBest(pipeline_stage stage, co
 	// banjo-nx (2026-10-19, banjo_deko3d_gpr32): a variant with constant 910 = 1 (plume writes its define ahead of the
 	// text) is compiled with 32 GPRs at most: every warp slot of the SM, spilling what does not fit.
 	struct Cap {
-		explicit Cap(const char* text) { nv50_ir_set_banjo_gpr_cap(strstr(text, "SPIRV_CROSS_CONSTANT_ID_910 1u") ? 32 : 0); }
+		// fable2-nx (2026-11-17): "// banjo-gpr-cap=N" in the text (tools/deko3d_glsl_opt.py gpr32, a capped list entry)
+		// sets another cap, 24-128.
+		explicit Cap(const char* text) {
+			int cap = 0;
+			if (strstr(text, "SPIRV_CROSS_CONSTANT_ID_910 1u")) {
+				cap = 32;
+				if (const char* c = strstr(text, "// banjo-gpr-cap=")) {
+					const int n = atoi(c + 17);
+					if (n >= 24 && n <= 128)
+						cap = n;
+				}
+			}
+			nv50_ir_set_banjo_gpr_cap(cap);
+		}
 		~Cap() { nv50_ir_set_banjo_gpr_cap(0); }
 	} cap(glsl);
 	std::unique_ptr<DekoCompiler> best(new DekoCompiler(stage, optLevel));

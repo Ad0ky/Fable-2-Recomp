@@ -31,6 +31,12 @@ bool HeapRoomShort() {
 #endif
 }
 constexpr uint32_t kShortHeapTrimResets = 30;
+// fable2-nx (2026-11-19, the GPU's MMU fault at the page below a chunk): each chunk's first bytes stay unused. A vertex
+// shader read its fetch data at a small negative offset from the window (the chunk's start, bound as storage binding
+// 15): inside a chunk that reads the bytes before, but the draw whose data was a fresh chunk's first allocation read
+// the page below the chunk, which nothing maps: MMU fault, the queue lost (deko3d.log, 2026-11-19 22:12: the fault at
+// 0x5_499BF000, the window of the first unfinished draw at 0x5_499C0000).
+constexpr uint64_t kChunkGuard = 64ull << 10;
 }  // namespace
 
 bool UploadRing::Init(plume::RenderDevice *device, const char *name, bool constant_sets, bool host_cached) {
@@ -41,7 +47,7 @@ bool UploadRing::Init(plume::RenderDevice *device, const char *name, bool consta
   ++s_resets_;  // banjo-nx (2026-10-23, batch 6): its chunks go
   chunks_.clear();
   current_ = 0;
-  offset_ = 0;
+  offset_ = kChunkGuard;  // fable2-nx (2026-11-19)
   return AddChunk(kChunkSize);
 }
 
@@ -109,7 +115,7 @@ void UploadRing::Reset() {
     window_resets_ = 0;
   }
   current_ = 0;
-  offset_ = 0;
+  offset_ = kChunkGuard;  // fable2-nx (2026-11-19)
   for (Chunk &chunk : chunks_)
     chunk.written = chunk.published = 0;
 }
@@ -171,10 +177,10 @@ UploadAllocation UploadRing::Allocate(uint64_t size, uint64_t alignment) {
       return out;
     }
     // Next chunk, growing the ring if this frame outgrew every existing one.
-    if (current_ + 1 >= chunks_.size() && !AddChunk(size))
+    if (current_ + 1 >= chunks_.size() && !AddChunk(size + kChunkGuard))
       return out;
     ++current_;
-    offset_ = 0;
+    offset_ = kChunkGuard;  // fable2-nx (2026-11-19)
   }
 }
 
@@ -199,10 +205,10 @@ UploadAllocation UploadRing::AllocateWithRoom(uint64_t size, uint64_t room, uint
       chunk.written = offset_;
       return out;
     }
-    if (current_ + 1 >= chunks_.size() && !AddChunk(room))
+    if (current_ + 1 >= chunks_.size() && !AddChunk(room + kChunkGuard))
       return out;
     ++current_;
-    offset_ = 0;
+    offset_ = kChunkGuard;  // fable2-nx (2026-11-19)
   }
 }
 

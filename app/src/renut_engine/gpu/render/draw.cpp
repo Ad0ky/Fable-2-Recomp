@@ -2,6 +2,7 @@
  * @file    gpu/render/draw.cpp
  */
 #include "renut_engine/gpu/render/draw.h"
+#include "renut_engine/gpu/backend/queued.h"  // fable2-nx (2026-11-23): occlusion queries
 #include "renut_engine/gpu/render/smaa.h"
 #include "renut_engine/gpu/render/ui_scale.h"  // banjo-nx (2026-10-21, internal resolution)  // banjo-nx (2026-10-21): banjo_renut_smaa
 
@@ -12,6 +13,7 @@
 #include <bit>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>  // fable2-nx (2026-11-19): the marker file
 #include <cstring>
 #include <limits>
 #include <map>
@@ -90,6 +92,32 @@ REXCVAR_DEFINE_STRING(banjo_renut_diag_blend_skip_exclude, "", "Banjo/Renut",
                       "Diagnostic: pixel shader hashes (hex, comma separated) banjo_gpu_blend_skip leaves alone");
 // fable2-nx (2026-11-15, the slow cutscene): draws with these pixel shaders are not drawn, to see what the frame rate
 // does to the game's speed without them (Fable 2's snow, PS EF43ABE324F6E039, is ~32 of ~72 ms).
+namespace fable2 {
+int PointNativeMode();  // render/pipeline.cpp (fable2_point_native)
+}
+REXCVAR_DEFINE_DOUBLE(fable2_diag_point_max_px, 0.0, "Banjo/Renut",
+                      "Diagnostic: the largest point sprite in pixels (0 = the game's own); see PointStateOf");
+REXCVAR_DEFINE_INT32(fable2_cpu_terrain_tess, 1, "Fable2/GPU",
+                     "The terrain's tessellation factor pass (an export-only vertex shader) on the CPU (from himdo's port): "
+                     "0 off; 1 verify (computed and compared with the GPU's result, [cpu tess] lines; the GPU's used); 2 "
+                     "written to guest memory at the draw, the draw left out (the shaders fable2_cpu_terrain_vs lists)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(fable2_cpu_terrain_vs, "AC0C424248A6B1AD", "Fable2/GPU",
+                      "Vertex shader hashes (hex, comma separated) fable2_cpu_terrain_tess = 2 computes on the CPU")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(fable2_export_heap_clip, true, "Fable2/GPU",
+                    "A memory export's write-back stops at the first heap block header inside its range (Fable 2's "
+                    "streams are sized past the buffers the game allocates for them; the castle's heap corruption)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+static bool ExportHeapClipOn() {
+  static const bool on = REXCVAR_GET(fable2_export_heap_clip);
+  return on;
+}
+REXCVAR_DEFINE_STRING(fable2_fetch_range_vs, "724905F3C03C00B8:4,2F08103924BC6AC8:4", "Fable2/GPU",
+                      "Vertex shaders (hex hash:vertices per element, comma separated) that read their by-address "
+                      "vertex data as element floor(vertex index / n) of their bound fetches only (the particle quads): "
+                      "their non-indexed draws copy the elements they read, not the whole buffer. Empty = off")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(fable2_diag_skip_ps, "", "Banjo/Renut",
                       "Diagnostic: pixel shader hashes (hex, comma separated) whose draws are not drawn");
 namespace {
@@ -1297,7 +1325,7 @@ public:
       Insert(chunk, span.offset, span.size);
       // Spans hold their chunk's index, so the entry stays for AddChunk to
       // reuse. The other slot may still draw from it: retired, not freed.
-      if (span.chunk != 0 && chunk.free.size() == 1 && chunk.free.begin()->second == chunk.size) {
+      if (span.chunk != 0 && chunk.free.size() == 1 && chunk.free.begin()->second == chunk.size - kChunkGuard) {
         Video::RetireLocked(std::move(chunk.buffer));
         chunk.cpu = nullptr;
         chunk.free.clear();
@@ -1354,6 +1382,9 @@ private:
   // fetch buffers are kept together only in one chunk: not smaller than this.)
   static constexpr uint64_t kChunkSize = 32ull << 20;
   static constexpr uint64_t kAlign = 256;
+  // fable2-nx (2026-11-19): each chunk's first 64 KB stay unused, as the upload ring's (upload_ring.cpp, kChunkGuard):
+  // a vertex shader's fetch at a small negative offset from a chunk's start read the unmapped page below it (MMU fault).
+  static constexpr uint64_t kChunkGuard = 64ull << 10;
   // banjo-nx (2026-10-28, night_gpu2 console freeze): see Allocate.
   static constexpr uint64_t kSmallChunkSize = 8ull << 20;
   static constexpr uint64_t kNoChunkFrames = 600;
@@ -1367,7 +1398,7 @@ private:
 
   // The index of a new chunk of at least 'min_size' bytes (and 'chunk_size'), or UINT32_MAX.
   u32 AddChunk(uint64_t min_size, uint64_t chunk_size = kChunkSize) {
-    const uint64_t size = std::max(chunk_size, min_size);
+    const uint64_t size = std::max(chunk_size, min_size + kChunkGuard);
     auto buffer = State().device->createBuffer(plume::RenderBufferDesc::UploadBuffer(
         size, plume::RenderBufferFlag::VERTEX | plume::RenderBufferFlag::INDEX));
     void *mapped = buffer ? buffer->map() : nullptr;
@@ -1383,7 +1414,7 @@ private:
     chunk.buffer = std::move(buffer);
     chunk.cpu = static_cast<u8 *>(mapped);
     chunk.size = size;
-    chunk.free.emplace(0, size);
+    chunk.free.emplace(kChunkGuard, size - kChunkGuard);  // fable2-nx (2026-11-19): see kChunkGuard
     return index;
   }
 
@@ -3019,8 +3050,14 @@ bool IsSkinOnceVs(uint64_t hash);
         exports |= r.entry->memExportConstants[word];
       const ShaderVertexInput *inputs = g_activeShaderVertexInputs + r.entry->vertexInputOffset;
       const u32 count = std::min<u32>(r.entry->vertexInputCount, kMaxBoundFetches);
-      for (u32 i = 0; i < count; ++i)
-        bound |= (inputs[i].flags & kVertexInputBoundFetch) != 0;
+      u32 listed = 0;
+      for (u32 i = 0; i < count; ++i) {
+        if ((inputs[i].flags & kVertexInputBoundFetch) == 0)
+          continue;
+        bound = true;
+        if (listed < 4)
+          g.bound_index[listed++] = uint8_t(i);  // fable2-nx (2026-11-17): FetchSpecWords
+      }
     }
     g.exports = exports != 0;
     g.bound_fetches = bound;
@@ -3749,6 +3786,12 @@ struct alignas(64) GeometryObject {
   GeometryAnswer answer[2];  // lines 1 and 2
 };
 static_assert(sizeof(GeometryAnswer) == 64 && sizeof(GeometryObject) == 192);
+// fable2-nx (2026-11-20, the marker): see MarkerFrameOn; a marked draw's fetch slots (FillTextures), logged by DrawLog
+// after the draw's line.
+static bool MarkerFrameOn();
+static void MarkerText(const std::string &line);
+static std::string g_marker_tex;
+
 namespace {
 // banjo-nx (2026-10-28, the heap): 32,768 (65,536): the d4 console run made 1,648 in twelve minutes of title and city,
 // and static tables come out of the heap a loader gives the NRO; the geometry objects below took the room.
@@ -3901,6 +3944,14 @@ inline void PointStateOf(const d3d::Device &dev, float point_state[4]) {
   const float minmax_scale = banjo::renut_gpu::PointMinMaxRadiusOn() ? 8.0f : 16.0f;
   point_state[2] = float(point_min_max & 0xFFFF) / minmax_scale;
   point_state[3] = float(point_min_max >> 16) / minmax_scale;
+  // fable2-nx (2026-11-17, the snow's cost, a TEST): fable2_diag_point_max_px > 0 caps every point sprite at that size
+  // (pixels), so the snow's 21 draws of 4096 points cost almost no pixels: if the frame time falls with it, the snow
+  // costs pixels (blending); if not, its vertex shader and the point-to-square expansion.
+  static const float cap = REXCVAR_GET(fable2_diag_point_max_px);
+  if (cap > 0.0f) {
+    point_state[3] = cap;
+    point_state[2] = std::min(point_state[2], cap);
+  }
 }
 // banjo-nx (2026-10-28): OFF by default: it HURT on the console (A/B 53, night_final: render thread +0.64 ms a frame
 // with it on in the static city); kept for measuring again.
@@ -4456,6 +4507,21 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
       last.valid = false;
       last.obj = nullptr;  // banjo-nx (2026-10-27, Phase A)
       last.obj_fx = nullptr;  // banjo-nx (2026-10-28)
+    }
+  }
+  // fable2-nx (2026-11-20, the marker): each fetch slot as the guest set it and what the host bound for it.
+  if (MarkerFrameOn()) [[unlikely]] {
+    g_marker_tex.clear();
+    for (u32 bits = fetch_mask; bits; bits &= bits - 1) {
+      const u32 r = u32(std::countr_zero(bits));
+      const u32 d = sc.texture_indices[1][r] != kNullTexture3DSlot     ? 1u
+                    : sc.texture_indices[2][r] != kNullTextureCubeSlot ? 2u
+                                                                       : 0u;
+      if (!g_marker_tex.empty())
+        g_marker_tex += '\n';
+      g_marker_tex += fmt::format("    fetch {}: {}", r,
+                                  MarkerDescribeTextureLocked(SlotTextureVa(device, r), fetches[r],
+                                                              sc.texture_indices[d][r]));
     }
   }
   // banjo-nx (2026-10-23, batch 6): see same_as_last. The slots outside the mask hold the defaults in both.
@@ -6752,6 +6818,91 @@ bool EnsureBuffer(std::unique_ptr<plume::RenderBuffer> &buffer, uint64_t &capaci
 // shader; UploadVertexFetchData then logs its fetch copies.
 bool g_dump_fetch = false;
 
+// fable2-nx (2026-11-23, the run of 2026-11-21: "fetch copies made" 1.9-2.1 GB in 10 s at 13 fps, 16 MB a frame; memmove
+// at the kicks 7 % of the render thread): the fetch copies queued, by vertex shader and fetch constant, for the 10 s line
+// (the top 8). g_census_vs: the drawing vertex shader's hash, set by both callers.
+uint64_t g_census_vs = 0;
+struct FetchCopyCensus {
+  uint64_t bytes = 0;
+  uint64_t copies = 0;
+  uint64_t largest = 0;
+};
+std::map<std::pair<uint64_t, u32>, FetchCopyCensus> g_fetch_census;
+void NoteFetchCopy(u32 index, u32 size) {
+  FetchCopyCensus &c = g_fetch_census[{g_census_vs, index}];
+  c.bytes += size;
+  ++c.copies;
+  c.largest = std::max<uint64_t>(c.largest, size);
+}
+// fable2-nx (2026-11-23, the run of 2026-11-23: VS 724905F3C03C00B8's fetch 95 copied whole, 0.5 MB a draw, up to 5.7 GB
+// in 10 s): fable2_fetch_range_vs. Its GLSL reads fetch 95 only through its three bound inputs (SharedConstants
+// bound_fetch: fetch index, offset and stride in dwords), at element floor(r0.x * 0.25), r0.x the guest vertex index
+// (a non-indexed draw: start_vertex .. start_vertex + count - 1). The copy is those elements' bytes; the slot is moved
+// back by the bytes left out (the shader's address sums are 32-bit, so the slot may wrap below 0).
+u32 FetchRangeDivisor(uint64_t hash) {
+  static const std::vector<std::pair<uint64_t, u32>> list = [] {
+    std::vector<std::pair<uint64_t, u32>> v;
+    const std::string text = REXCVAR_GET(fable2_fetch_range_vs);
+    size_t at = 0;
+    while (at < text.size()) {
+      size_t end = text.find(',', at);
+      if (end == std::string::npos)
+        end = text.size();
+      const std::string item = text.substr(at, end - at);
+      const size_t colon = item.find(':');
+      if (colon != std::string::npos && item.find_first_not_of(" \t") != std::string::npos) {
+        const uint64_t h = std::stoull(item.substr(0, colon), nullptr, 16);
+        const u32 n = u32(std::stoul(item.substr(colon + 1)));
+        if (n)
+          v.push_back({h, n});
+      }
+      at = end + 1;
+    }
+    return v;
+  }();
+  for (const auto &e : list)
+    if (e.first == hash)
+      return e.second;
+  return 0;
+}
+uint64_t g_fetch_range_draws = 0, g_fetch_range_whole_bytes = 0, g_fetch_range_bytes = 0;
+// The bytes [lo, hi) of the fetch's buffer the draw reads, or false (no bound input reads it, or nothing to leave out).
+bool FetchRangeOf(const DrawCall &call, const SharedConstants &sc, u32 index, u32 size, u32 n, u32 &lo, u32 &hi) {
+  const uint64_t first = call.start_vertex / n, last = (uint64_t(call.start_vertex) + call.count - 1) / n;
+  uint64_t a = UINT64_MAX, b = 0;
+  for (u32 i = 0; i < 16; ++i) {
+    if (sc.bound_fetch[i][0] != index || !sc.bound_fetch[i][2])
+      continue;
+    const int64_t offset = int32_t(sc.bound_fetch[i][1]), stride = int32_t(sc.bound_fetch[i][2]);
+    if (offset < 0 || stride <= 0)
+      return false;
+    a = std::min<uint64_t>(a, (first * uint64_t(stride) + uint64_t(offset)) * 4);
+    b = std::max<uint64_t>(b, (last * uint64_t(stride) + uint64_t(offset)) * 4 + 16);  // up to 4 dwords an element
+  }
+  if (a == UINT64_MAX)
+    return false;
+  a &= ~uint64_t(15);
+  b = std::min<uint64_t>(b, size);
+  if (a >= b || (a == 0 && b == size))
+    return false;
+  lo = u32(a);
+  hi = u32(b);
+  return true;
+}
+std::string FetchCensusReport() {
+  std::string ranges = fmt::format(" fetch ranges (fable2_fetch_range_vs): {} draws copied {:.1f} MB of {:.1f} MB;",
+                                   g_fetch_range_draws, double(g_fetch_range_bytes) / 1048576.0,
+                                   double(g_fetch_range_whole_bytes) / 1048576.0);
+  g_fetch_range_draws = g_fetch_range_bytes = g_fetch_range_whole_bytes = 0;
+  std::vector<std::pair<std::pair<uint64_t, u32>, FetchCopyCensus>> v(g_fetch_census.begin(), g_fetch_census.end());
+  g_fetch_census.clear();
+  std::sort(v.begin(), v.end(), [](const auto &x, const auto &y) { return x.second.bytes > y.second.bytes; });
+  std::string out = "fetch copies by vertex shader and fetch constant (fable2-nx):" + ranges;
+  for (size_t i = 0; i < v.size() && i < 8; ++i)
+    out += fmt::format(" VS {:016X} vf{} {:.1f} MB in {} copies (largest {} KB);", v[i].first.first, v[i].first.second,
+                       double(v[i].second.bytes) / 1048576.0, v[i].second.copies, v[i].second.largest >> 10);
+  return out;
+}
 UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall &call, u32 mask,
                                        SharedConstants &sc) {
   struct Copy {
@@ -6762,6 +6913,7 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
     bool exported;        // from the export window below
     u32 export_slot;
     uint64_t export_offset;
+    u32 skip;  // fable2-nx (2026-11-23): bytes of the buffer before src (fable2_fetch_range_vs); the slot is moved back
   };
   Copy copies[32];
   u32 copy_count = 0;
@@ -6799,6 +6951,20 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
     }
     if (c.size && !cp_fetch && FetchFromExportWindow(device, call, index, c.export_slot, c.export_offset))
       any_exported = c.exported = true;
+    if (c.size && !c.exported && !cp_fetch && !(index == up_fetch_index && call.up_vertices) && !call.indexed &&
+        !call.tessellation && call.count) {
+      if (const u32 n = FetchRangeDivisor(g_census_vs)) {
+        u32 lo = 0, hi = 0;
+        if (FetchRangeOf(call, sc, index, c.size, n, lo, hi)) {
+          ++g_fetch_range_draws;
+          g_fetch_range_whole_bytes += c.size;
+          g_fetch_range_bytes += hi - lo;
+          c.src += lo;
+          c.size = hi - lo;
+          c.skip = lo;
+        }
+      }
+    }
     copies[copy_count++] = c;
     total += (c.size + 15u) & ~15u;
   }
@@ -6848,7 +7014,7 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
       u32 bytes = 0;
       for (u32 i = 0; i < copy_count; ++i) {
         const Copy &c = copies[i];
-        sc.vertex_fetch_slots[c.index] = offsets[i] | c.endian;
+        sc.vertex_fetch_slots[c.index] = (offsets[i] - c.skip) | c.endian;
         bytes += c.size;
         if (verify && std::memcmp(chunk_cpu + offsets[i], c.src, c.size) != 0) {
           ++g_fetch_pool_differ;
@@ -6912,7 +7078,7 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
     u32 at = u32(chunk_offset) + offset;
     if (reused[i]) {
       // Queued in this chunk by an earlier draw: read there, no room here.
-      sc.vertex_fetch_slots[c.index] = reused_offset[i] | c.endian;  // port 56: as found (see reused_offset)
+      sc.vertex_fetch_slots[c.index] = (reused_offset[i] - c.skip) | c.endian;  // port 56: as found (see reused_offset)
       continue;
     }
     if (c.size && !c.exported) {
@@ -6924,14 +7090,16 @@ UploadAllocation UploadVertexFetchData(const GuestDevice &device, const DrawCall
           at = known.offset;
         } else {
           g_copy_fills.push_back({c.src, dst, c.size});
+          NoteFetchCopy(c.index, c.size);  // fable2-nx (2026-11-23)
           known = {c.src, c.size, g_fetch_copy_generation, alloc.ref.ref, at, g_flush_serial + 1, UploadRing::Resets(),
                    0, dst};
         }
       } else {
         g_copy_fills.push_back({c.src, dst, c.size});
+        NoteFetchCopy(c.index, c.size);  // fable2-nx (2026-11-23)
       }
     }
-    sc.vertex_fetch_slots[c.index] = at | c.endian;
+    sc.vertex_fetch_slots[c.index] = (at - c.skip) | c.endian;
     if (g_dump_fetch) {
       static uint32_t logged = 0;
       if (logged++ < 48) {
@@ -7107,9 +7275,17 @@ FetchSpec FetchSpecWords(const SharedConstants &sc, const ShaderRecord &vs, bool
     s.kind = sc.tessellation[0] + 1;
   else if (!round_on || ab_off == 150 || !IsDeko3D())  // deko3d's GLSL has the types (pass fetchspec); Vulkan's not
     return s;
-  if (DrawSummaryOf(vs).bound_fetches) {
-    for (u32 k = 0; k < 4; ++k)
-      s.types[k] = sc.bound_fetch[k][3] + 1;
+  const auto &summary = DrawSummaryOf(vs);
+  if (summary.bound_fetches) {
+    // fable2-nx (2026-11-17): the first four bound inputs, whichever rows they are: slot j holds input i's type word + 1,
+    // with i + 1 in bits 24-31 when i is not j (0 there: input j, the encoding before; render/pipeline.cpp gives input i
+    // constant 920 + i for i < 4, 1300 + i above: tools/deko3d_glsl_opt.py pass fetchspec). The word is 22 bits.
+    for (u32 j = 0; j < 4; ++j) {
+      const u32 i = summary.bound_index[j];
+      if (i >= 16)
+        break;
+      s.types[j] = (sc.bound_fetch[i][3] + 1) | (i == j ? 0u : (i + 1) << 24);
+    }
   }
   return s;
 }
@@ -7211,7 +7387,11 @@ static_assert(sizeof(SasrtSpecWords::w) == sizeof(PipelineKey::sasrt_words));
       continue;
     }
     s.w[8] |= 1u << r;
-    s.w[9 + n++] = z;
+    // fable2-nx (2026-11-20, the compile storm): only the bits the export reads (shader_common.h memExport: the endian
+    // 0-2, the format 8-13, the number format 16-18; the rest of the word is not read). Fable 2's z words differ draw by
+    // draw in the bits nothing reads (0x4B0724AA, 0x4B07E6A2, ...), and each value compiled the 420 KB export shader
+    // c1e1cfbaa4ecf8ae again, blocking (deko3d.log 2026-11-20: 60 compiles of it in one session).
+    s.w[9 + n++] = z & 0x00073F07u;
     sasrt::gpu_round::Count(sasrt::gpu_round::kExportFmtSpec);
   }
 }
@@ -7559,13 +7739,303 @@ void GatherMemExportStreams(const ShaderCacheEntry *entry, const FloatConstants 
   }
 }
 
+// fable2-nx (2026-11-20, from himdo/rexglue-sdk bbd9800 "Compute Fable II's terrain and skinning memexport on the CPU";
+// the run of 22:17: the terrain's export draws, VS AC0C424248A6B1AD, about 25 a frame of 16-31 points each, cost 1.3 ms of
+// GPU a frame, and their results reach guest memory a frame or two late, through the slot's write-back): the terrain's
+// tessellation factor pass computed on the CPU. The vertex shader only reads what the game's CPU wrote (twelve float4
+// attributes of a 192-byte vertex, an 8-bit texture in fetch slot 16, its constants), and exports one float4 a vertex.
+// RunTerrainTessVS is that shader as himdo's port generated it from its disassembly (fable2_terrain_tess_vs.inc, their
+// file unchanged). fable2_cpu_terrain_tess: 1 (verify) computes it and compares it with the GPU's result at the
+// write-back ([cpu tess] lines), the GPU's still used; 2 writes it to guest memory at the draw and leaves the draw out
+// (only for the vertex shaders fable2_cpu_terrain_vs lists).
+namespace fable2_cpu_tess {
+
+template <typename ConstantFn, typename SampleFn>
+void RunTerrainTessVS(float r[16][4], const ConstantFn &C, const SampleFn &sample) {
+  bool p0 = false;
+  float ps = 0.0f;
+  (void)ps;
+#include "renut_engine/gpu/render/fable2_terrain_tess_vs.inc"
+}
+
+float BigEndianFloat(const u8 *bytes) {
+  u32 value;
+  std::memcpy(&value, bytes, 4);
+  value = __builtin_bswap32(value);
+  float result;
+  std::memcpy(&result, &value, 4);
+  return result;
+}
+
+constexpr u32 kVertexBytes = 192;
+constexpr u32 kOutputBytes = 16;
+constexpr u32 kMaxVertices = 4096;
+
+// The draw's output (big-endian, as the export writes it) and where it goes, or false for a draw this does not cover.
+bool Compute(const GuestDevice &device, const DrawCall &call, const ShaderRecord &vs, const FloatConstants &constants,
+             std::vector<u8> &out, u32 &dest_pa, const char **why) {
+  const ShaderCacheEntry *entry = vs.entry;
+  if (!entry || call.indexed || call.tessellation || call.up_vertices || !call.count || call.count > kMaxVertices) {
+    *why = "the call";
+    return false;
+  }
+  // The shader's literals (its def registers) over the device's registers, as the GPU's register file holds them.
+  float literal[256][4];
+  uint64_t has_literal[4] = {};
+  for (u32 i = 0; i < entry->literalCount; ++i) {
+    const ShaderLiteral &l = g_activeShaderLiterals[entry->literalOffset + i];
+    if (l.reg >= 256)
+      continue;
+    std::memcpy(literal[l.reg], l.value, 16);
+    has_literal[l.reg / 64] |= uint64_t(1) << (l.reg % 64);
+  }
+  // fable2-nx (2026-11-23, the run of 2026-11-23: every draw "not covered (c255)"): the literal table holds only the
+  // registers the translated shader still reads from its constants; AC0C424248A6B1AD's c254 and c255 are folded into
+  // its code (vec4(0, 1, 0, 0), vec3(0.5) in its GLSL), so they are not there. Their def values, from the container
+  // (renut_shader_dump/vs_ac0c424248a6b1ad.bin at 0x2AC): c254 = (8, 15, 0, 0), c255 = (0, 1, 0.5, 5).
+  if (vs.hash == 0xAC0C424248A6B1ADull) {
+    static const float kDefs[2][4] = {{8.0f, 15.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.5f, 5.0f}};
+    for (u32 k = 0; k < 2; ++k) {
+      const u32 reg = 254 + k;
+      if (!((has_literal[reg / 64] >> (reg % 64)) & 1)) {
+        std::memcpy(literal[reg], kDefs[k], 16);
+        has_literal[reg / 64] |= uint64_t(1) << (reg % 64);
+      }
+    }
+  }
+  const auto C = [&](u32 index, u32 component) -> float {
+    if ((has_literal[index / 64] >> (index % 64)) & 1)
+      return literal[index][component];
+    return BigEndianFloat(constants.Register(index) + component * 4);
+  };
+  // The export stream in c8: k_32_32_32_32_FLOAT, 8in32, as the shader writes it.
+  const auto *stream = reinterpret_cast<const be_u32 *>(constants.Register(8));
+  const u32 x = stream[0], z = stream[2], w = stream[3];
+  const u32 elements = w & 0x7FFFFF;
+  if ((x >> 30) != 1 || (z & 7) != 2 || ((z >> 8) & 0x3F) != 38) {
+    *why = "the export stream";
+    return false;
+  }
+  if (C(255, 0) != 0.0f || C(255, 1) != 1.0f) {
+    *why = "c255";
+    return false;
+  }
+  // One vertex stream of 192-byte vertices (48 dwords), 8in32.
+  const ShaderVertexInput *inputs = g_activeShaderVertexInputs + entry->vertexInputOffset;
+  if (!entry->vertexInputCount) {
+    *why = "no vertex inputs";
+    return false;
+  }
+  const u32 fetch_index = inputs[0].fetchIndex;
+  for (u32 i = 0; i < entry->vertexInputCount; ++i) {
+    // fable2-nx (2026-11-23, the run of 23:40: every draw "not covered (the vertex inputs)"): our shader table gives this
+    // shader's twelve inputs (fetch 95) no stride (0: the bound declaration's, per draw); 48 dwords is himdo's layout,
+    // which the vertex fetch's size check below and the verify (mode 1) confirm.
+    if (inputs[i].fetchIndex != fetch_index || (inputs[i].strideDwords && inputs[i].strideDwords != kVertexBytes / 4)) {
+      *why = "the vertex inputs";
+      return false;
+    }
+  }
+  const u32 w0 = device.VertexFetchWord(fetch_index, 0), w1 = device.VertexFetchWord(fetch_index, 1);
+  const u32 index_offset = call.start_vertex;
+  const uint64_t needed = uint64_t(call.count) + index_offset;
+  if ((w1 & 3) != 2 || needed * kVertexBytes > (w1 & 0x3FFFFFCu) || needed > elements) {
+    *why = "the vertex fetch";
+    return false;
+  }
+  // The texture in fetch slot 16: linear k_8 or k_8_8_8_8.
+  const TextureFetch tex = DeviceTextureFetch(device.dev(), 16);
+  const u32 format = u32(tex.Format());
+  if (tex.Tiled() || (format != 2 && format != 6)) {
+    *why = "the texture";
+    return false;
+  }
+  const u8 *vertices = GuestPhysicalPtr<const u8>(w0 & ~3u);
+  const u8 *texels = GuestPhysicalPtr<const u8>(tex.BasePage() << 12);
+  dest_pa = (x & 0x3FFFFFFFu) * 4 + index_offset * kOutputBytes;
+  if (!vertices || !texels || dest_pa >= 0x20000000u) {
+    *why = "an address";
+    return false;
+  }
+  const bool four_channels = format == 6;
+  const u32 bytes_per_texel = four_channels ? 4 : 1;
+  const u32 row_bytes = tex.PitchTexels() * bytes_per_texel;
+  const int32_t width = int32_t(tex.dword[2] & 0x1FFFu) + 1;
+  const int32_t height = int32_t((tex.dword[2] >> 13) & 0x1FFFu) + 1;
+  const u32 swizzle = tex.Swizzle();
+  const auto sample = [&](float u, float v, u32 component) -> float {
+    const int32_t tx = std::clamp(int32_t(std::floor(u)), 0, width - 1);
+    const int32_t ty = std::clamp(int32_t(std::floor(v)), 0, height - 1);
+    const u8 *texel = texels + u32(ty) * row_bytes + u32(tx) * bytes_per_texel;
+    const u32 select = (swizzle >> (component * 3)) & 7;
+    if (select == 4)
+      return 0.0f;
+    if (select == 5)
+      return 1.0f;
+    u32 byte_value;
+    if (four_channels) {
+      byte_value = texel[3 - select];  // a 32-bit big-endian texel, red in the low byte
+    } else {
+      if (select != 0)
+        return select == 3 ? 1.0f : 0.0f;
+      byte_value = texel[0];
+    }
+    return float(byte_value) / 255.0f;
+  };
+  out.resize(size_t(call.count) * kOutputBytes);
+  for (u32 vertex = 0; vertex < call.count; ++vertex) {
+    const u32 index = vertex + index_offset;
+    const u8 *a = vertices + size_t(index) * kVertexBytes;
+    float r[16][4] = {};
+    const auto fetch = [&](u32 reg, u32 attribute, u32 count, u32 first) {
+      for (u32 i = 0; i < count; ++i)
+        r[reg][first + i] = BigEndianFloat(a + attribute * 16 + i * 4);
+    };
+    fetch(13, 0, 4, 0);
+    fetch(12, 1, 4, 0);
+    fetch(11, 2, 4, 0);
+    fetch(10, 3, 4, 0);
+    fetch(5, 4, 3, 0);
+    fetch(3, 5, 3, 0);
+    fetch(4, 6, 3, 0);
+    fetch(7, 7, 3, 0);
+    fetch(9, 8, 3, 0);
+    fetch(8, 9, 3, 0);
+    fetch(0, 10, 3, 1);
+    fetch(6, 11, 3, 0);
+    r[0][0] = float(index);
+    RunTerrainTessVS(r, C, sample);
+    u8 *element = out.data() + size_t(vertex) * kOutputBytes;
+    for (u32 i = 0; i < 4; ++i) {
+      u32 value;
+      std::memcpy(&value, &r[1][i], 4);
+      value = __builtin_bswap32(value);
+      std::memcpy(element + i * 4, &value, 4);
+    }
+  }
+  return true;
+}
+
+// Verify: each slot's CPU results by guest address, compared with the GPU's at the slot's write-back.
+std::unordered_map<u32, std::vector<u8>> g_checks[kFramesInFlight];
+uint64_t g_draws = 0, g_skipped = 0, g_not_covered = 0, g_regions = 0, g_words = 0, g_differ = 0, g_unmatched = 0;
+double g_cpu_us = 0.0;
+float g_max_diff = 0.0f;
+
+int Mode() {
+  static const int mode = std::clamp(int(REXCVAR_GET(fable2_cpu_terrain_tess)), 0, 2);
+  return mode;
+}
+bool Listed(uint64_t hash) {
+  static const std::vector<uint64_t> list = [] {
+    std::vector<uint64_t> v;
+    const std::string text = REXCVAR_GET(fable2_cpu_terrain_vs);
+    size_t at = 0;
+    while (at < text.size()) {
+      size_t end = text.find(',', at);
+      if (end == std::string::npos)
+        end = text.size();
+      const std::string item = text.substr(at, end - at);
+      if (item.find_first_not_of(" \t") != std::string::npos)
+        v.push_back(std::stoull(item, nullptr, 16));
+      at = end + 1;
+    }
+    return v;
+  }();
+  return std::find(list.begin(), list.end(), hash) != list.end();
+}
+
+void Report() {
+  static uint64_t last = 0;
+  if (g_draws + g_not_covered < last + 2048 && last)
+    return;
+  last = g_draws + g_not_covered;
+  RGPU_INFO("[cpu tess] mode {}: {} draws computed ({:.1f} us each), {} written by the CPU (their exports not drawn), {} not covered; "
+            "verify: {} regions, {} words, {} differ (largest difference {:g}), {} without a GPU window",
+            Mode(), g_draws, g_draws ? g_cpu_us / double(g_draws) : 0.0, g_skipped, g_not_covered, g_regions, g_words,
+            g_differ, double(g_max_diff), g_unmatched);
+}
+
+// At the draw: what is left for the GPU (mode 2: the output written by the CPU).
+// fable2-nx (2026-11-23, the run of 2026-11-21): the terrain's export draws are not inert (no pixel shader, but colour
+// mask F and depth writes on: RB_DEPTHCONTROL 00708766), so as himdo's port does, such a draw is still drawn in mode 2,
+// only without its exports (no window, no write-back): kDropExports. An inert one is left out whole: kDone.
+enum Answer { kGpu = 0, kDone = 1, kDropExports = 2 };
+Answer AtDraw(uint32_t slot, const GuestDevice &device, const DrawCall &call, const ShaderRecord &vs,
+              const FloatConstants &constants, bool inert) {
+  const int mode = Mode();
+  if (!mode)
+    return kGpu;
+  static thread_local std::vector<u8> out;
+  u32 dest_pa = 0;
+  const char *why = "";
+  const auto start = std::chrono::steady_clock::now();
+  if (!Compute(device, call, vs, constants, out, dest_pa, &why)) {
+    ++g_not_covered;
+    Report();
+    static uint32_t logged = 0;
+    if (logged < 16 && (Listed(vs.hash) || std::string(why) != "the export stream")) {
+      ++logged;
+      RGPU_INFO("[cpu tess] VS {:016X}: an export draw of {} vertices not covered ({})", vs.hash, call.count, why);
+    }
+    return kGpu;
+  }
+  g_cpu_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+  ++g_draws;
+  static uint32_t seen = 0;
+  if (seen < 4) {
+    ++seen;
+    RGPU_INFO("[cpu tess] VS {:016X}: {} vertices from {} computed on the CPU into guest {:08X} (mode {}{})", vs.hash,
+              call.count, call.start_vertex, dest_pa, mode, Listed(vs.hash) ? ", listed" : ", not listed");
+  }
+  Report();
+  if (mode == 2 && Listed(vs.hash)) {
+    if (u8 *guest = GuestPhysicalPtr<u8>(dest_pa)) {
+      std::memcpy(guest, out.data(), out.size());
+      rex::memory::MarkStoreCardsAt(StoreCards(), 0xA0000000u + dest_pa, u32(out.size()));
+      ++g_flush_serial;  // as after a write-back: cached copies are proven again
+      ++g_skipped;
+      return inert ? kDone : kDropExports;
+    }
+    return kGpu;
+  }
+  g_checks[slot][dest_pa] = out;  // verify: the GPU draws it as before
+  return kGpu;
+}
+
+}  // namespace fable2_cpu_tess
+
 struct PendingExport {
   u32 base = 0;
   u32 size = 0;
   // Its window in the slot's export buffer, and its copy in the slot's
   // readback buffer (the same offset in both).
   uint64_t offset = 0;
+  // fable2-nx (2026-11-19, the heap corruption): the game's heap block the export lands in (its header, the word
+  // ABCDABCD and the three after it, found within 4 KB before the start) when the export was recorded; compared when
+  // the export is written to guest memory, a frame or more later (CompleteMemExportsLocked).
+  u32 header_pa = 0;
+  u32 header[4] = {};
+  uint64_t frame = 0;
 };
+// fable2-nx (2026-11-19): see PendingExport::header_pa.
+static void NoteExportHeader(PendingExport &p) {
+  p.frame = TextureFrameLocked();
+  const u8 *at = GuestPhysicalPtr<u8>(p.base);
+  if (!at || (p.base & 0x1FFFFFFFu) < 0x1000)
+    return;
+  const uintptr_t begin = uintptr_t(at) & ~uintptr_t(3);
+  for (uintptr_t q = begin; q > begin - 4096;) {
+    q -= 4;
+    u32 v;
+    std::memcpy(&v, reinterpret_cast<const void *>(q), 4);
+    if (v == 0xCDABCDABu) {  // ABCDABCD in guest byte order
+      p.header_pa = u32(int64_t(p.base) - int64_t(uintptr_t(at) - q));
+      std::memcpy(p.header, reinterpret_cast<const void *>(q), sizeof(p.header));
+      return;
+    }
+  }
+}
 // The exports a slot's lists made. They reach guest memory once the slot's
 // fence is waited (detail::CompleteMemExportsLocked), a frame later; until
 // then their windows stay in the slot's export buffer, where the next frame's
@@ -7575,6 +8045,51 @@ struct SlotExports {
   uint64_t used = 0;
 };
 SlotExports g_exports[kFramesInFlight];
+// fable2-nx (2026-11-20, the heap corruption, found: run of 2026-11-20 18:06, the guard's line 20 ms before the crash):
+// a memory export window is the game's whole stream (its element count times the element size: 86,740 bytes), seeded
+// when the export is recorded and written back whole a frame or more later. The game's heap had allocated blocks inside
+// that range in between (block headers at +3968 and +8064 bytes, the crashes' blocks among them), and the write-back put
+// the old bytes back over them. Guest memory as it was when each fresh window was recorded is kept here (by the window's
+// offset in the slot's export buffer), and the write-back writes only the words the GPU changed from it; the words it
+// did not write keep whatever the CPU put there since.
+std::unordered_map<uint64_t, std::vector<u8>> g_export_snapshots[kFramesInFlight];
+uint64_t g_export_bytes_kept = 0, g_export_bytes_written = 0, g_export_whole_writes = 0;
+// fable2-nx (2026-11-20, second castle crash, 19:23): a fresh window is seeded from guest memory and then, where an export
+// still pending in this slot or an older one covers it, from that export's window (SeedFromPendingExportsLocked: newest
+// first), so where the older export's GPU wrote nothing its window holds the older window's seed: guest memory as it
+// was a frame or more earlier. Comparing the result with guest memory as it is now (the first snapshot) took those
+// stale bytes for the GPU's writes and wrote them back: the 86,740-byte window is the same every frame and is always
+// seeded from last frame's, so the heap blocks inside it got last frame's bytes again. The snapshot is the seed as the
+// CPU knows it: guest memory now, with the pending windows' own snapshots laid over it the way their GPU copies are.
+static void ExportSeedSnapshot(const VideoState &s, const MemExportStream &stream, std::vector<u8> &snap) {
+  snap.clear();
+  const u8 *now = GuestPhysicalPtr<const u8>(stream.base);
+  if (!now)
+    return;
+  snap.assign(now, now + stream.size);
+  static std::vector<u8> covered;
+  covered.assign(stream.size, 0);
+  const u32 begin0 = stream.base, end0 = stream.base + stream.size;
+  for (u32 k = kFramesInFlight; k >= 1; --k) {  // newest first, as SeedFromPendingExportsLocked
+    const u32 slot = (s.frame + k) % kFramesInFlight;
+    const auto &pending = g_exports[slot].pending;
+    for (auto p = pending.rbegin(); p != pending.rend(); ++p) {
+      const u32 b = std::max(p->base, begin0), e = std::min(p->base + p->size, end0);
+      if (b >= e)
+        continue;
+      const auto it = g_export_snapshots[slot].find(p->offset);
+      if (it == g_export_snapshots[slot].end() || it->second.size() < p->size)
+        continue;
+      const u8 *older = it->second.data();
+      for (u32 a = b; a < e; ++a) {
+        if (!covered[a - begin0]) {
+          snap[a - begin0] = older[a - p->base];
+          covered[a - begin0] = 1;
+        }
+      }
+    }
+  }
+}
 
 // The 64 KiB granules of physical memory any pending export writes: most
 // ranges a draw reads touch none, and skip the lists (PendingExportSlots runs
@@ -8339,6 +8854,12 @@ bool PrepareMemExportLocked(VideoState &s, const MemExportStream *streams, u32 c
     fresh_offsets[fresh_count++] = offsets[i];
     total += (streams[i].size + 255u) & ~255u;
   }
+  // fable2-nx (2026-11-20): each fresh window's seed as the CPU knows it (see g_export_snapshots, ExportSeedSnapshot).
+  for (u32 k = 0; k < fresh_count; ++k) {
+    static std::vector<u8> snap;
+    ExportSeedSnapshot(s, fresh[k], snap);
+    g_export_snapshots[s.frame][fresh_offsets[k]].assign(snap.begin(), snap.end());
+  }
   plume::RenderBuffer *buffer = MemExportBufferLocked(s, total);
   // banjo-nx (2026-10-23, batch 6): CPU-cached (plume's deko3d buffer drops the read range's lines at map).
   if (!buffer || !EnsureBuffer(s.memexport_readback[s.frame], s.memexport_readback_capacity[s.frame],
@@ -8458,6 +8979,7 @@ bool FinishMemExportLocked(VideoState &s, const MemExportStream *streams, u32 co
       if (known)
         continue;
       slot.pending.push_back({streams[i].base, streams[i].size, offsets[i]});
+      NoteExportHeader(slot.pending.back());  // fable2-nx (2026-11-19)
       ++g_pending_export_count;
       slot.used = offsets[i] + ((streams[i].size + 255u) & ~255u);
     }
@@ -8470,6 +8992,7 @@ bool FinishMemExportLocked(VideoState &s, const MemExportStream *streams, u32 co
     cmd->copyBufferRegion(plume::RenderBufferReference(readback, offsets[i]),
                           plume::RenderBufferReference(buffer, offsets[i]), streams[i].size);
     slot.pending.push_back({streams[i].base, streams[i].size, offsets[i]});
+    NoteExportHeader(slot.pending.back());  // fable2-nx (2026-11-19)
     ++g_pending_export_count;
     MarkExportGranules(streams[i].base, streams[i].size);
     slot.used = offsets[i] + ((streams[i].size + 255u) & ~255u);
@@ -9349,11 +9872,93 @@ bool DrawsWithoutPixelShader(const GuestDevice &device, const Targets &t, const 
   return ((color_control >> 4) & 1) == 0;  // alpha to coverage, as MakeKey's
 }
 
+// fable2-nx (2026-11-19, the marker): L3 + R3 (xam_input.cpp, g_rex_marker_count) marks the next two whole frames
+// (2026-11-20: two, so a flicker shows as the difference between them): their draws go the full way (the fast path skips
+// the draw log) and each is logged ("frame K" sections, "[mark N] draw D"; plume adds each draw's textures). One relaxed
+// load a draw otherwise.
+extern "C" uint32_t g_rex_marker_count;
+constexpr uint32_t kMarkerFrames = 2;
+static uint32_t g_marker_seen = 0, g_marker_id = 0, g_marker_draws = 0, g_marker_total = 0;
+static uint64_t g_marker_frame = UINT64_MAX, g_marker_section = UINT64_MAX;
+static void MarkerText(const std::string &line) {
+#if defined(PLUME_DEKO3D)
+  plume::Deko3DMarkAppend(line.c_str());
+#else
+  RGPU_INFO("{}", line);
+#endif
+}
+static bool MarkerFrameOn() {
+  const uint32_t count = __atomic_load_n(&g_rex_marker_count, __ATOMIC_RELAXED);
+  const uint64_t frame = TextureFrameLocked();
+  if (count != g_marker_seen) [[unlikely]] {
+    g_marker_seen = count;
+    g_marker_id = count;
+    g_marker_frame = frame + 1;
+    g_marker_section = UINT64_MAX;
+    g_marker_draws = g_marker_total = 0;
+    RGPU_INFO("[mark {}] at frame {}: the draws of frames {} and {} follow (mark_{}.log)", count, frame, frame + 1,
+              frame + kMarkerFrames, count);
+  }
+  if (g_marker_frame == UINT64_MAX)
+    return false;
+  if (frame >= g_marker_frame + kMarkerFrames) [[unlikely]] {
+    // The frames' lines in one file next to the NRO (mark_N.log), one write.
+    std::string text;
+#if defined(PLUME_DEKO3D)
+    text = plume::Deko3DMarkTake();
+#endif
+    const std::string name = fmt::format("mark_{}.log", g_marker_id);
+    bool written = false;
+    if (FILE *f = std::fopen(banjo::renut_gpu::NextToExecutable(name).string().c_str(), "w")) {
+      written = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+      std::fclose(f);
+    }
+    RGPU_INFO("[mark {}] frames {}-{}: {} draws, {} KB {} {}", g_marker_id, g_marker_frame,
+              g_marker_frame + kMarkerFrames - 1, g_marker_total, text.size() >> 10,
+              written ? "written to" : "NOT written to", name);
+    g_marker_frame = UINT64_MAX;
+    return false;
+  }
+  if (frame < g_marker_frame)
+    return false;
+  if (frame != g_marker_section) [[unlikely]] {  // a frame's section: its header line, its draws numbered from 0
+    g_marker_section = frame;
+    g_marker_draws = 0;
+    MarkerText(fmt::format("==== [mark {}] frame {} ({} of {})", g_marker_id, frame, frame - g_marker_frame + 1,
+                           kMarkerFrames));
+  }
+  return true;
+}
+
 // banjo-nx (2026-10-18, matching RenderDoc captures of Ryujinx to the game's shaders): banjo_renut_diag_draw_log_s
 // seconds after the first draw, every draw of the next two frames: its shaders, counts, target and state, in order.
 void DrawLog(const DrawCall &call, const Geometry &geometry, const ShaderRecord *vs, const ShaderRecord *ps,
              const Targets &targets, const PipelineKey &key, const SharedConstants &sc, u32 export_count) {
   static const int32_t at = REXCVAR_GET(banjo_renut_diag_draw_log_s);
+  // fable2-nx (2026-11-19, the marker): every draw of the marked frame, under the mark's number, its textures logged by
+  // plume (deko3d.log, the same mark and draw number).
+  if (MarkerFrameOn()) {
+    const HostSurface *m0 = targets.color_count ? targets.colors[0] : nullptr;
+    const u32 n = g_marker_draws++;
+    ++g_marker_total;
+    const std::string line = fmt::format("[mark {}] draw {}: vs {:016X} ps {:016X} prim {} {} {} inst {}{} target {}x{} fmt {} x{} depth {} "
+              "dc {:08X} blend {:08X} mask {:X} a2c {} vfetch {} bytes, exports {}",
+              g_marker_id, n, vs ? vs->hash : 0, ps ? ps->hash : 0, call.primitive,
+              geometry.indexed ? "indices" : "vertices", geometry.indexed ? geometry.index_count : geometry.vertex_count,
+              geometry.instance_count, call.tessellation ? " tess" : "", m0 ? m0->width : 0, m0 ? m0->height : 0,
+              m0 ? int(m0->format) : -1, targets.color_count, targets.depth ? int(targets.depth->format) : -1,
+              key.depth_control, key.blend_control[0], key.color_mask, key.alpha_to_coverage, sc.vertex_fetch_bytes,
+              export_count);
+    MarkerText(line);
+    if (!g_marker_tex.empty()) {  // fable2-nx (2026-11-20): its fetch slots (FillTextures)
+      MarkerText(g_marker_tex);
+      g_marker_tex.clear();
+    }
+#if defined(PLUME_DEKO3D)
+    plume::Deko3DDumpNextDraw(g_marker_id, n);
+#endif
+    return;
+  }
   if (at <= 0)
     return;
   static const auto start = std::chrono::steady_clock::now();
@@ -10334,7 +10939,7 @@ int FastDrawLocked(const u8 *device_state, const DrawCall &call, const ReplayCon
   // control) and the depth control may have changed.
   const bool targets_changed = (fields & kFieldTargets) || f.surface_epoch != SurfaceEpochLocked() ||
                                (f.targets.depth_dropped && (fields & kFieldViewPackets));
-  if (cfg.draw_log || cfg.census || banjo::renut_gpu::ResolveTraceOn() || g_dump_fetch)
+  if (cfg.draw_log || cfg.census || banjo::renut_gpu::ResolveTraceOn() || g_dump_fetch || MarkerFrameOn())
     return FastMiss(kFastDiag);
   const bool verify = cfg.verify;
   auto &s = State();
@@ -10868,6 +11473,7 @@ int FastDrawLocked(const u8 *device_state, const DrawCall &call, const ReplayCon
     SetShared(sc, sc.pixel_origin, viewport.pixel_origin);
     if (targets_changed) {  // with the targets (DrawStateLocked sets them at every draw)
       SetShared(sc, sc.resolution_scale, targets.scale.Factor());
+  g_occlusion_scale = targets.scale.Factor();  // fable2-nx (2026-11-23): an occlusion query's samples in guest terms
       SetShared(sc, sc.pad_1352[1], std::bit_cast<float>(InternalHeightsWord()));
     }
   }
@@ -10930,6 +11536,7 @@ int FastDrawLocked(const u8 *device_state, const DrawCall &call, const ReplayCon
     }
     const uint64_t old_data = sc.vertex_fetch_data;
     const u32 old_bytes = sc.vertex_fetch_bytes;
+    g_census_vs = vs->hash;  // fable2-nx (2026-11-23): FetchCensusReport
     const UploadAllocation fetch_alloc = UploadVertexFetchData(device, call, fetch_mask, sc);
     if (!fetch_alloc)
       return -1;
@@ -11083,6 +11690,10 @@ int FastDrawLocked(const u8 *device_state, const DrawCall &call, const ReplayCon
       c.key.fetch_pad = c.key.pixel_shader ? plain_fetches : 0u;  // sasrt-nx (2026-11-08, sasrt_gpu_plain_fetches)
       c.key.reserved = (c.key.reserved & ~8u) | clip_bit;  // sasrt-nx (2026-11-08, sasrt_gpu_clip_spec)
       std::memcpy(c.key.sasrt_words, spec_words.w, sizeof(spec_words.w));  // sasrt-nx (the third round)
+      // fable2-nx (2026-11-17): the GPU's own point sprites here too (DrawStateLocked's key gets 2 the same way): this
+      // path made its own key, with the geometry shader (point_sprite 1), and Fable 2's snow is drawn through it.
+      if (c.key.point_sprite == 1 && fable2::PointNativeMode())
+        c.key.point_sprite = 2;
       c.blend_used = BlendConstantUsed(c.key);
       c.hot = KeyHot::Of(c.key);
       f.kp = &c.key;
@@ -11109,6 +11720,8 @@ int FastDrawLocked(const u8 *device_state, const DrawCall &call, const ReplayCon
     key.fetch_pad = key.pixel_shader ? plain_fetches : 0u;  // sasrt-nx (2026-11-08, sasrt_gpu_plain_fetches)
     key.reserved = (key.reserved & ~8u) | clip_bit;  // sasrt-nx (2026-11-08, sasrt_gpu_clip_spec)
     std::memcpy(key.sasrt_words, spec_words.w, sizeof(spec_words.w));  // sasrt-nx (2026-11-08, the third round)
+    if (key.point_sprite == 1 && fable2::PointNativeMode())  // fable2-nx (2026-11-17): as the kept key above
+      key.point_sprite = 2;
     plume::RenderPipeline *made = GetPipelineLocked(key, {host_vs, draw_host_ps, &declaration->layout});
     if (std::memcmp(&key, f.kp, sizeof(key)) != 0 || made != f.pipeline) {
       static uint32_t logged = 0;
@@ -11259,9 +11872,15 @@ int FastDrawLocked(const u8 *device_state, const DrawCall &call, const ReplayCon
       }
     }
     SetIndexBuffer(cmd, index_view);
+#if defined(PLUME_DEKO3D)
+    plume::Deko3DCrumbLabel(vs->hash, ps ? ps->hash : 0);  // fable2-nx (2026-11-19, fable2_gpu_crumbs)
+#endif
     cmd->drawIndexedInstanced(geometry.index_count, geometry.instance_count, first_index,
                               base_draw ? int32_t(geometry.whole_base) : 0, 0);
   } else {
+#if defined(PLUME_DEKO3D)
+    plume::Deko3DCrumbLabel(vs->hash, ps ? ps->hash : 0);  // fable2-nx (2026-11-19, fable2_gpu_crumbs)
+#endif
     cmd->drawInstanced(geometry.vertex_count, geometry.instance_count, base_draw ? geometry.whole_base : 0u, 0);
   }
   f.seq = chain.seq;
@@ -11999,7 +12618,8 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   if (sasrt::gpu_round::On(sasrt::gpu_round::kInertDraws)) {
     const GuestDevice inert_device(device_state);
     const u32 dc = inert_device.valid() ? u32(inert_device.dev().m_ControlPacket.DepthControl) : 6u;
-    if ((dc & 6) != 6 && SasrtInertDrawLocked(device_state)) [[unlikely]] {
+    // fable2-nx (2026-11-23): not inside an occlusion query (its boxes write nothing; their samples are the count)
+    if ((dc & 6) != 6 && !OcclusionQueryActiveLocked() && SasrtInertDrawLocked(device_state)) [[unlikely]] {
       sasrt::gpu_round::Count(sasrt::gpu_round::kInertDraws);
       return true;
     }
@@ -12183,6 +12803,17 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     GatherMemExportStreams(vs->entry, vs_constants, exports, export_count);
   if (export_count && vs->export_only && SasrtExpNoExports()) [[unlikely]]
     return true;  // sasrt-nx (2026-11-08): an EXPERIMENT, not identical (sasrt_gpu_exp_no_exports)
+  // fable2-nx (2026-11-20): the terrain's tessellation factors on the CPU (fable2_cpu_terrain_tess).
+  // Only draws that write nothing but their exports (an export-mode vertex shader, or render state that writes nothing:
+  // SasrtInertDrawLocked, as sasrt_gpu_export_raster_discard tells them), so leaving one out (mode 2) leaves out nothing else.
+  if (export_count && fable2_cpu_tess::Mode()) [[unlikely]] {
+    const bool inert = !ps && (vs->export_only || SasrtInertDrawLocked(device_state, true));
+    const auto answer = fable2_cpu_tess::AtDraw(s.frame, device, call, *vs, vs_constants, inert);
+    if (answer == fable2_cpu_tess::kDone)
+      return true;
+    if (answer == fable2_cpu_tess::kDropExports)
+      export_count = 0;  // drawn, its output already in guest memory
+  }
   if (ps && DrawSummaryOf(*ps).exports)
     GatherMemExportStreams(ps->entry, ps_constants, exports, export_count);
   static const bool fast_census = REXCVAR_GET(banjo_renut_diag_fast_census);
@@ -12655,6 +13286,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   SetShared(sc, sc.depth_remap, viewport.depth_remap);  // sasrt-nx: g_DepthRemap
   SetShared(sc, sc.viewport_size, viewport.guest_size);
   SetShared(sc, sc.resolution_scale, targets.scale.Factor());
+  g_occlusion_scale = targets.scale.Factor();  // fable2-nx (2026-11-23): an occlusion query's samples in guest terms
   SetShared(sc, sc.pad_1352[1], std::bit_cast<float>(InternalHeightsWord()));  // banjo-nx (2026-10-21): the shaders' codes 4 and 6
   SetShared(sc, sc.pixel_origin, viewport.pixel_origin);  // Renut upstream 574b488
   if (call.primitive == kPointList) {
@@ -12752,6 +13384,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     g_fetch_record.count = 0;
     g_fetch_record.unusable = call.up_vertices != nullptr;
   } else {
+    g_census_vs = vs->hash;  // fable2-nx (2026-11-23): FetchCensusReport
     fetch_alloc = UploadVertexFetchData(device, call, fetch_mask, sc);
     // banjo-nx (2026-10-26): what it set: the mask's slots and the data's address and size.
     for (u32 bits = fetch_mask; bits; bits &= bits - 1)
@@ -13004,7 +13637,12 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   }
   key.fetch_pad = key.pixel_shader ? SasrtPlainFetchMask(sc, ps_entry, vs->entry) : 0u;  // sasrt-nx; vivapinata-nx: vs
   if (call.primitive == kPointList && State().point_sprite_gs) {  // sasrt-nx (2026-11-09, sasrt_gpu_export_no_point_gs)
-    key.point_sprite = sasrt_no_point_gs ? 0 : 1;  // (a reused key holds the decision of the draw it came from)
+    // fable2-nx (2026-11-17): 2 = the GPU's own point sprites (render/pipeline.cpp, fable2_point_native).
+    key.point_sprite = sasrt_no_point_gs ? 0 : (fable2::PointNativeMode() ? 2 : 1);  // (a reused key holds the decision of the draw it came from)
+    static std::atomic<uint32_t> point_logged{0};  // fable2-nx (2026-11-17): the first run logged no point pipeline
+    if (point_logged.fetch_add(1, std::memory_order_relaxed) < 6)
+      RGPU_INFO("[points] draw: VS {:016X} PS {:016X}, key point_sprite {} (fable2_point_native {}, export-only {})",
+                vs->hash, ps ? ps->hash : 0, key.point_sprite, fable2::PointNativeMode(), sasrt_no_point_gs);
     if (sasrt_no_point_gs)
       sasrt::gpu_round::Count(sasrt::gpu_round::kExportNoPointGs);
   }
@@ -13280,7 +13918,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   // banjo-nx (2026-10-20, from sa2-nx, banjo_renut_lean_diagnostics): the draw log's check once, not a call per draw.
   static const bool draw_log = !REXCVAR_GET(banjo_renut_lean_diagnostics) ||
                                REXCVAR_GET(banjo_renut_diag_draw_log_s) > 0;
-  if (draw_log)
+  if (draw_log || MarkerFrameOn())  // fable2-nx (2026-11-19): the marker
     DrawLog(call, geometry, vs, ps, targets, key, sc, export_count);
   // banjo-nx (2026-10-19, banjo_renut_resolve_skip): the targets this draw can write.
   for (u32 i = 0; i < targets.color_count && i < key.color_count; ++i)
@@ -13317,9 +13955,15 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     SetIndexBuffer(cmd, geometry.index_view);
     // banjo-nx: instanced for a tessellation grid (banjo_gpu_tess_grid); 1 for every other indexed draw.
     // banjo-nx (2026-10-26, stage 2): a whole draw from the game's first index, with its base vertex.
+#if defined(PLUME_DEKO3D)
+    plume::Deko3DCrumbLabel(vs->hash, ps ? ps->hash : 0);  // fable2-nx (2026-11-19, fable2_gpu_crumbs)
+#endif
     cmd->drawIndexedInstanced(geometry.index_count, geometry.instance_count, geometry.whole ? geometry.first_index : 0,
                               0, 0);
   } else {
+#if defined(PLUME_DEKO3D)
+    plume::Deko3DCrumbLabel(vs->hash, ps ? ps->hash : 0);  // fable2-nx (2026-11-19, fable2_gpu_crumbs)
+#endif
     cmd->drawInstanced(geometry.vertex_count, geometry.instance_count, 0, 0);
   }
   }
@@ -13384,6 +14028,43 @@ uint64_t g_resolve_readbacks_done = 0;
 bool TexelReadbackDestination(const HostTexture *dest) {
   return banjo::renut_gpu::ResolveReadbackOn() && dest && dest->width == 1 && dest->height == 1 &&
          dest->host_format == plume::RenderFormat::R32_FLOAT;
+}
+
+// fable2-nx (2026-11-19, the heap corruption: two crashes in the game's containers, 82BE5458 / 82BE7198 on the 3D
+// Engine thread, each a garbage pointer read out of a block of the game's heap whose header (ABCDABCD, the size, ...)
+// sat 64 bytes before the end of a 4 KB page, 0xF9EB0FC0 and 0xF9AF3FC0). The writes this renderer makes into guest
+// memory when a slot's fence is waited (the surface and resolve readbacks, the memory exports) are checked before they
+// are made: a heap block header (the word ABCDABCD) inside the range is logged with the write, the frame and the words
+// around it (24 at most). (The 4 KB before the start is not looked at: run of 2026-11-19 23:45, the memory exports'
+// targets are the game's heap blocks, 24 bytes after their header; see ExportHeader for those.)
+static void GuardGuestWrite(const char *kind, u32 guest_pa, const u8 *dst, size_t bytes) {
+  static std::atomic<uint32_t> hits{0};
+  if (!dst || !bytes || hits.load(std::memory_order_relaxed) >= 24)
+    return;
+  constexpr u32 kMarker = 0xCDABCDABu;  // ABCDABCD in guest (big-endian) byte order, read as a host word
+  const uintptr_t begin = uintptr_t(dst), end = begin + bytes;
+  auto report = [&](uintptr_t at, const char *where) {
+    if (hits.fetch_add(1, std::memory_order_relaxed) >= 24)
+      return;
+    u32 w[8] = {};
+    for (int i = 0; i < 8; ++i)
+      std::memcpy(&w[i], reinterpret_cast<const void *>(at + uintptr_t(i) * 4), 4);
+    const long long rel = (long long)(at) - (long long)(begin);
+    RGPU_WARN("[guard] {} write of {} bytes to guest {:08X} (frame {}): a heap block marker {} at {:+d} bytes (guest "
+              "{:08X}); words there {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+              kind, bytes, guest_pa, TextureFrameLocked(), where, rel, u32(int64_t(guest_pa) + rel),
+              __builtin_bswap32(w[0]), __builtin_bswap32(w[1]), __builtin_bswap32(w[2]), __builtin_bswap32(w[3]),
+              __builtin_bswap32(w[4]), __builtin_bswap32(w[5]), __builtin_bswap32(w[6]), __builtin_bswap32(w[7]));
+  };
+  // Inside the range (whole words only, so the eight words read stay in guest memory near the write).
+  for (uintptr_t p = (begin + 3) & ~uintptr_t(3); p + 32 <= end; p += 4) {
+    u32 v;
+    std::memcpy(&v, reinterpret_cast<const void *>(p), 4);
+    if (v == kMarker) {
+      report(p, "INSIDE the range");
+      return;
+    }
+  }
 }
 
 // fable2-nx (2026-11-14, the logo blinking): a 2D texture of 32-bit texels the game's CPU locks read-only (textures.h
@@ -13457,6 +14138,9 @@ void CompleteSurfaceReadbacksLocked(uint32_t slot) {
       // fable2-nx (2026-11-15): one copy out of the readback memory (uncached for the CPU: the texel-by-texel reads below
       // were 17% of the render thread in the profile's stack samples), then the tiling from the copy.
       static thread_local std::vector<u8> local;
+      // fable2-nx (2026-11-19): the extent the loop below writes (tiled: whole 32 x 32 tiles of the pitch)
+      GuardGuestWrite("surface readback", r.guest_pa, guest,
+                      size_t(r.pitch_texels) * (r.tiled ? ((r.height + 31) & ~31u) : r.height) * 4);
       local.resize(size_t(r.row_texels) * r.height * 4);
       std::memcpy(local.data(), data + r.offset, local.size());
       for (u32 y = 0; y < r.height; ++y) {
@@ -13564,6 +14248,7 @@ void CompleteResolveReadbacksLocked(uint32_t slot) {
       u32 bits;
       std::memcpy(&bits, data + r.offset, 4);
       if (u8 *guest = GuestPhysicalPtr<u8>(r.guest_pa)) {
+        GuardGuestWrite("resolve readback", r.guest_pa, guest, 4);  // fable2-nx (2026-11-19)
         const u32 big = __builtin_bswap32(bits);
         std::memcpy(guest, &big, 4);
       }
@@ -13582,8 +14267,13 @@ void CompleteResolveReadbacksLocked(uint32_t slot) {
 void CompleteMemExportsLocked(uint32_t slot) {
   CompleteResolveReadbacksLocked(slot);  // sasrt-nx (2026-10-30): before the exports' early return
   SlotExports &exports = g_exports[slot];
-  if (exports.pending.empty())
+  if (exports.pending.empty()) {
+    for (auto &e : g_export_snapshots[slot])  // fable2-nx (2026-11-20): emptied, their memory kept for the next frames
+      e.second.clear();
+    fable2_cpu_tess::g_unmatched += fable2_cpu_tess::g_checks[slot].size();  // fable2-nx (2026-11-20)
+    fable2_cpu_tess::g_checks[slot].clear();
     return;
+  }
   auto &s = State();
   plume::RenderBuffer *readback = s.memexport_readback[slot].get();
   // banjo-nx (2026-10-23, batch 6): the slot's windows only (the readback buffer is CPU-cached: map drops the lines read).
@@ -13593,14 +14283,146 @@ void CompleteMemExportsLocked(uint32_t slot) {
       if (banjo::renut_gpu::ExportsHeldOn())  // sasrt-nx (2026-10-21, sasrt_renut_exports_held)
         HoldExport(p.base & 0x1FFFFFFFu, data + p.offset, p.size, g_stream_cache_frame);
       if (u8 *guest = GuestPhysicalPtr<u8>(p.base)) {
-        std::memcpy(guest, data + p.offset, p.size);
+        GuardGuestWrite("memory export", p.base, guest, p.size);  // fable2-nx (2026-11-19)
+        // fable2-nx (2026-11-19): the heap block it lands in changed since the export was recorded (freed, or given to
+        // something else): the write goes into memory the game no longer holds for it. Logged (32 at most); a count.
+        if (p.header_pa) {
+          static std::atomic<uint32_t> changed{0};
+          u32 now[4] = {};
+          if (const u8 *h = GuestPhysicalPtr<u8>(p.header_pa))
+            std::memcpy(now, h, sizeof(now));
+          if (std::memcmp(now, p.header, sizeof(now)) != 0) {
+            const uint32_t n = changed.fetch_add(1, std::memory_order_relaxed);
+            if (n < 32 || (n & 1023) == 0)
+              RGPU_WARN("[guard] memory export of {} bytes to guest {:08X}, recorded in frame {}, written in frame {}: "
+                        "the heap block's header at {:08X} CHANGED since ({:08X} {:08X} {:08X} {:08X} -> {:08X} {:08X} "
+                        "{:08X} {:08X}); {} so far",
+                        p.size, p.base, p.frame, TextureFrameLocked(), p.header_pa, __builtin_bswap32(p.header[0]),
+                        __builtin_bswap32(p.header[1]), __builtin_bswap32(p.header[2]), __builtin_bswap32(p.header[3]),
+                        __builtin_bswap32(now[0]), __builtin_bswap32(now[1]), __builtin_bswap32(now[2]),
+                        __builtin_bswap32(now[3]), n + 1);
+          }
+        }
+        // fable2-nx (2026-11-20): only the words the GPU changed from the window's snapshot (g_export_snapshots); the
+        // whole window when there is none.
+        // fable2-nx (2026-11-20, fable2_export_heap_clip): the stream's size comes from its constant (elements times
+        // element size), and Fable 2's runs past the buffer the game allocated for it (86,740 bytes into a block of
+        // 8,064, the castle's crash): the write stops at the first heap block header inside the range (its marker,
+        // ABCDABCD, at a 16-byte boundary), which is the next block's. What the GPU changed past it is counted.
+        u32 limit = p.size;
+        if (ExportHeapClipOn()) {
+          const u32 pa = p.base & 0x1FFFFFFFu;
+          for (u32 o = (16u - (pa & 15u)) & 15u; o + 4 <= p.size; o += 16) {
+            u32 v;
+            std::memcpy(&v, guest + o, 4);
+            if (v == 0xCDABCDABu) {
+              limit = o;
+              break;
+            }
+          }
+          if (limit < p.size) {
+            const u8 *gpu = data + p.offset;
+            u32 changed_past = 0;
+            for (u32 o = limit; o < p.size; ++o)
+              changed_past += gpu[o] != guest[o];
+            static std::atomic<uint32_t> clipped{0};
+            const uint32_t n = clipped.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16 || (n & 1023) == 0)
+              RGPU_WARN("[guard] memory export of {} bytes to guest {:08X} written up to +{} only (a heap block header "
+                        "there, guest {:08X}); the GPU changed {} bytes past it; {} clipped so far",
+                        p.size, p.base, limit, p.base + limit, changed_past, n + 1);
+          }
+        }
+        const auto snap = g_export_snapshots[slot].find(p.offset);
+        if (snap != g_export_snapshots[slot].end() && snap->second.size() >= p.size) {
+          const u8 *gpu = data + p.offset, *was = snap->second.data();
+          u32 written = 0;
+          for (u32 at = 0; at < limit;) {
+            const u32 n = std::min<u32>(64, limit - at);
+            if (std::memcmp(gpu + at, was + at, n) != 0) {
+              for (u32 w = at; w < at + n; w += 4) {
+                const u32 len = std::min<u32>(4, at + n - w);
+                if (std::memcmp(gpu + w, was + w, len) != 0) {
+                  // fable2-nx (2026-11-20): a word written over a heap block's header (the marker ABCDABCD within the
+                  // 32 bytes up to it): logged, 24 at most; the export is the game's, so it is written still.
+                  static uint32_t header_writes = 0;
+                  if (header_writes < 24 && (p.base & 0x1FFFFFFFu) + w >= 32) {
+                    for (int back = 0; back <= 28; back += 4) {
+                      u32 v;
+                      std::memcpy(&v, guest + (int64_t(w) & ~int64_t(3)) - back, 4);
+                      if (v == 0xCDABCDABu) {
+                        ++header_writes;
+                        RGPU_WARN("[guard] memory export of {} bytes to guest {:08X} writes +{} (guest {:08X}), {} bytes "
+                                  "after a heap block marker: {:08X} -> {:08X}",
+                                  p.size, p.base, w, p.base + w, back, [&] { u32 o; std::memcpy(&o, guest + w, 4);
+                                  return __builtin_bswap32(o); }(), [&] { u32 n; std::memcpy(&n, gpu + w, 4);
+                                  return __builtin_bswap32(n); }());
+                        break;
+                      }
+                    }
+                  }
+                  std::memcpy(guest + w, gpu + w, len);
+                  written += len;
+                }
+              }
+            }
+            at += n;
+          }
+          g_export_bytes_written += written;
+          g_export_bytes_kept += p.size - written;
+          static uint32_t logged = 0;
+          if (written < p.size && logged < 6) {
+            ++logged;
+            RGPU_INFO("[renut] memory export to guest {:08X}: {} of its {} bytes written back (the words the GPU "
+                      "changed); the rest keeps what the game holds there now (fable2-nx, the heap corruption)",
+                      p.base, written, p.size);
+          }
+        } else {
+          ++g_export_whole_writes;
+          std::memcpy(guest, data + p.offset, limit);  // fable2-nx (2026-11-20): up to the clip
+        }
         rex::memory::MarkStoreCardsAt(StoreCards(), 0xA0000000u + (p.base & 0x1FFFFFFFu), p.size);  // store cards
+      }
+    }
+    // fable2-nx (2026-11-20, fable2_cpu_terrain_tess = 1): the CPU's results against the GPU's windows.
+    for (const auto &[pa, bytes] : fable2_cpu_tess::g_checks[slot]) {
+      const PendingExport *window = nullptr;
+      for (const PendingExport &p : exports.pending)
+        if ((p.base & 0x1FFFFFFFu) <= pa && uint64_t(pa) + bytes.size() <= uint64_t(p.base & 0x1FFFFFFFu) + p.size)
+          window = &p;
+      if (!window) {
+        ++fable2_cpu_tess::g_unmatched;
+        continue;
+      }
+      const u8 *gpu = data + window->offset + (pa - (window->base & 0x1FFFFFFFu));
+      ++fable2_cpu_tess::g_regions;
+      for (size_t at = 0; at + 4 <= bytes.size(); at += 4) {
+        ++fable2_cpu_tess::g_words;
+        if (std::memcmp(gpu + at, bytes.data() + at, 4) == 0)
+          continue;
+        ++fable2_cpu_tess::g_differ;
+        const float g = fable2_cpu_tess::BigEndianFloat(gpu + at), c = fable2_cpu_tess::BigEndianFloat(bytes.data() + at);
+        const float d = std::fabs(g - c);
+        if (!(d <= fable2_cpu_tess::g_max_diff))
+          fable2_cpu_tess::g_max_diff = d;
+        static uint32_t logged = 0;
+        if (logged < 24) {
+          ++logged;
+          RGPU_INFO("[cpu tess] guest {:08X} (vertex {}, component {}): GPU {:g}, CPU {:g}", pa + u32(at),
+                    at / fable2_cpu_tess::kOutputBytes, (at % fable2_cpu_tess::kOutputBytes) / 4, double(g),
+                    double(c));
+        }
       }
     }
     readback->unmap();
   }
+  fable2_cpu_tess::g_checks[slot].clear();
   g_pending_export_count -= u32(exports.pending.size());
   exports.pending.clear();
+  if (g_export_snapshots[slot].size() > 256)  // fable2-nx (2026-11-20): many windows: let their memory go
+    g_export_snapshots[slot].clear();
+  for (auto &e : g_export_snapshots[slot])  // fable2-nx (2026-11-20): emptied, their memory kept for the next frames
+    e.second.clear();
   exports.used = 0;
   RebuildExportGranules();
   // banjo-nx (2026-10-17): guest memory changed under the draws: cached copies are proven again
@@ -13908,7 +14730,7 @@ std::string WholeBuffersReport() {
                      whole, range, 100.0 * double(whole) / double(whole + range), base_draws, merged_draws, merged_ops, fetch_fill_mb, fetch_kept, literals_resident,
                      double(g_stream_cache_bytes) / 1048576.0, made_mb, dropped_mb, w[0], w[1], w[2], w[3], w[4], w[5],
                      w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13]) +
-         KindWhyReport();
+         KindWhyReport() + "; " + FetchCensusReport() + OcclusionQueryReport();
 }
 
 std::string RepeatCensusReport() {
@@ -14464,6 +15286,19 @@ bool ResolveDepth(HostSurface *surface, HostTexture *dest, const ClearRect &src,
   plume::RenderCommandList *cmd = s.command_list;
   static const uint32_t kProfileLabel = gpu_profile::Label("depth resolves");
   gpu_profile::Mark(s, kProfileLabel);
+  // fable2-nx (2026-11-20): with the shaders' breakdown (sasrt_gpu_diag_profile_vs), each depth resolve's own label: its
+  // source's size, whether multisampled, and whether it writes the guest words too.
+  if (banjo::renut_gpu::DiagGpuShadersOn() && SasrtProfileVsOn() && gpu_profile::Timed()) [[unlikely]] {
+    static std::unordered_map<uint64_t, uint32_t> labels;
+    const uint64_t k = uint64_t(surface->width) | uint64_t(surface->height) << 14 | uint64_t(variant) << 28 |
+                       uint64_t(words) << 29 | uint64_t(dest->width) << 30 | uint64_t(dest->height) << 44;
+    uint32_t &label = labels[k];
+    if (!label)
+      label = gpu_profile::Label(fmt::format("depth resolves | {}x{}{} into {}x{}{}", surface->width, surface->height,
+                                             variant ? " multisampled" : "", dest->width, dest->height,
+                                             words ? " with words" : "")) + 1;
+    gpu_profile::Mark(s, label - 1);
+  }
   TransitionSurfaceLocked(surface, plume::RenderTextureLayout::SHADER_READ);
   TransitionTextureLocked(dest, plume::RenderTextureLayout::COLOR_WRITE);
   TransitionTextureLocked(dest->words.get(), plume::RenderTextureLayout::COLOR_WRITE);
@@ -15416,6 +16251,24 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
   const u32 source_va = source == 4 ? device.U32(d3d::kDeviceOffsetDepthStencil)
                                     : device.U32(d3d::kDeviceOffsetRenderTargets + source * 4);
   HostSurface *surface = GetHostSurfaceLocked(source_va);
+  // fable2-nx (2026-11-20, the marker): every resolve of a marked frame, between its draws: from which target into which
+  // guest texture (the fetch slots' "header"/"base" of the draws after it).
+  if (MarkerFrameOn()) [[unlikely]] {
+    TextureFetch df;
+    if (dest_format)
+      for (u32 i = 0; i < 6; ++i)
+        df.dword[i] = dest_format->dword[i];
+    MarkerText(fmt::format(
+        "[mark {}] resolve before draw {}: from {:08X} {}x{} fmt {}{} gen {} writes {} into header {:08X} base {:05X}000 "
+        "{}x{} fmt {} at {},{} level {} slice {} flags {:X}{}",
+        g_marker_id, g_marker_draws, source_va, surface ? surface->width : 0, surface ? surface->height : 0,
+        surface ? int(surface->format) : -1, surface && surface->depth ? " depth" : "", surface ? surface->generation : 0,
+        surface ? surface->writes : 0, dest_texture_va, dest_format ? df.BasePage() : 0,
+        dest_format ? (df.dword[2] & 0x1FFFu) + 1 : 0, dest_format ? ((df.dword[2] >> 13) & 0x1FFFu) + 1 : 0,
+        dest_format ? u32(df.Format()) : 0, dest_x, dest_y, dest_level, dest_slice, flags,
+        source_rect ? fmt::format(" rect {},{}-{},{}", source_rect->x1, source_rect->y1, source_rect->x2, source_rect->y2)
+                    : std::string()));
+  }
   // sasrt-nx (2026-11-09, sasrt_gpu_diag_profile_vs; the fourth round): with the shaders' breakdown, each resolve's own
   // label: its source's size and format, colour or depth, and whether it clears after.
   if (surface && banjo::renut_gpu::DiagGpuShadersOn() && SasrtProfileVsOn() && gpu_profile::Timed()) [[unlikely]] {

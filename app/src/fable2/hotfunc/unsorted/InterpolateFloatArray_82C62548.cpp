@@ -6,7 +6,25 @@
 // first line makes tools/make_hotfunc_overrides.py skip this file.
 #include "renut_pch.h"  // fable2-nx: the generated project is "renut" (the base keeps its name)
 
-extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8_t* base) {
+#include <cmath>
+#include <bit>
+#include <cstring>
+
+#include <rex/cvar.h>
+
+// fable2-nx (2026-11-17, the town's CPU profile: one game audio thread at 44% of a core, 43% of it in this function).
+// One sample of a game audio filter: the circular history X (+12) of N (+36) samples at position +40, dotted with the
+// coefficients H (+16); while a count (+8) is above 0 also the adaptive step H[i] += G[i] (G at +20), the count
+// decremented. The recompiled body keeps every pointer of its loops in the context (a load and a store per register per
+// tap), and each fmadds is a double fma rounded to float and back, so the sum's chain is ~15 cycles a tap. The native
+// body does the same taps in the same order with the PowerPC's own single-precision operations (fmadds: one fused
+// rounding to float; fadds: a float add), the Xbox 360's results; the recompiled double-then-float rounding differs from
+// them in the last bit in rare cases. false = the recompiled body.
+REXCVAR_DEFINE_BOOL(fable2_native_audio_filter, true, "Fable2",
+                    "The game's per-sample audio filter (InterpolateFloatArray_82C62548) as native code: same taps, "
+                    "same order, the PowerPC's single-precision rounding (false: the recompiled body)");
+
+static void InterpolateFloatArray_82C62548_recomp(PPCContext& __restrict ctx, uint8_t* base) {
 	REX_FUNC_PROLOGUE();
 	PPCRegister temp{};
 	// lwz r11,8(r3)
@@ -304,4 +322,80 @@ extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8
 	REX_STORE_U32_C(ctx.r3.u32 + 8, ctx.r9.u32);
 	// blr 
 	return;
+}
+
+// The recompiled code's own accessors (renut_pch.h): the physical-window offset, and a store's card mark
+// (banjo_renut_store_cards: Renut proves its cached copies of guest memory by them).
+#define F2_LOAD_F(a) std::bit_cast<float>(uint32_t(REX_LOAD_U32(a)))
+#define F2_STORE_F(a, f) REX_STORE_U32_C((a), std::bit_cast<uint32_t>(float(f)))
+
+extern "C" void InterpolateFloatArray_82C62548(PPCContext& __restrict ctx, uint8_t* base) {
+	static const bool native = REXCVAR_GET(fable2_native_audio_filter);
+	if (!native) {
+		InterpolateFloatArray_82C62548_recomp(ctx, base);
+		return;
+	}
+	REX_FUNC_PROLOGUE();
+	const uint32_t s = ctx.r3.u32;
+	ctx.fpscr.disableFlushMode();
+	float acc = F2_LOAD_F(0x82000000u + 3084u);  // lis r11,-32256; lfs f0,3084(r11)
+	const float in = float(ctx.f1.f64);
+	const int32_t count = int32_t(uint32_t(REX_LOAD_U32(s + 8)));
+	const int32_t n = int32_t(uint32_t(REX_LOAD_U32(s + 36)));
+	const int32_t pos = int32_t(uint32_t(REX_LOAD_U32(s + 40)));
+	const uint32_t x = uint32_t(REX_LOAD_U32(s + 12));
+	const uint32_t h = uint32_t(REX_LOAD_U32(s + 16));
+	// The second loop's top index: pos after the first loop ran, N when it did not (r10 / r7 in the recompiled body).
+	int32_t top = n;
+	// ble cr6 (count <= 0): the plain filter; a positive count also adapts H and counts down.
+	if (count <= 0) {
+		if (pos < n) {
+			// for k in 0 .. N - pos - 1: acc += H[N - k] * X[pos + k]
+			uint32_t hp = h + uint32_t(n) * 4u, xp = x + uint32_t(pos) * 4u;
+			for (int32_t k = n - pos; k != 0; --k, hp -= 4u, xp += 4u)
+				acc = std::fmaf(F2_LOAD_F(hp), F2_LOAD_F(xp), acc);
+			top = pos;
+		}
+		if (pos > 0) {
+			// for j in 0 .. pos - 1: acc += H[top - j] * X[j]
+			uint32_t hp = h + uint32_t(top) * 4u, xp = x;
+			for (int32_t j = pos; j != 0; --j, hp -= 4u, xp += 4u)
+				acc = std::fmaf(F2_LOAD_F(hp), F2_LOAD_F(xp), acc);
+		}
+		F2_STORE_F(x + uint32_t(pos) * 4u, in);
+		const int32_t next = pos + 1;
+		REX_STORE_U32_C(s + 40, next < n ? uint32_t(next) : 0u);
+		const float out = std::fmaf(F2_LOAD_F(h), in, acc);
+		ctx.f0.f64 = double(acc);
+		ctx.f1.f64 = double(out);
+		return;
+	}
+	const uint32_t g = uint32_t(REX_LOAD_U32(s + 20));
+	if (pos < n) {
+		// for idx = N down to pos + 1: old = H[idx]; H[idx] = G[idx] + old; acc += X[pos + N - idx] * old
+		uint32_t off = uint32_t(n) * 4u, xp = x + uint32_t(pos) * 4u;
+		for (int32_t i = pos; i < n; ++i, off -= 4u, xp += 4u) {
+			const float old = F2_LOAD_F(h + off);
+			F2_STORE_F(h + off, F2_LOAD_F(g + off) + old);
+			acc = std::fmaf(F2_LOAD_F(xp), old, acc);
+		}
+		top = pos;
+	}
+	if (pos > 0) {
+		uint32_t off = uint32_t(top) * 4u, xp = x;
+		for (int32_t j = 0; j < pos; ++j, off -= 4u, xp += 4u) {
+			const float old = F2_LOAD_F(h + off);
+			F2_STORE_F(h + off, F2_LOAD_F(g + off) + old);
+			acc = std::fmaf(F2_LOAD_F(xp), old, acc);
+		}
+	}
+	F2_STORE_F(x + uint32_t(pos) * 4u, in);
+	const int32_t next = pos + 1;
+	REX_STORE_U32_C(s + 40, next < n ? uint32_t(next) : 0u);
+	const float h0 = F2_LOAD_F(h), g0 = F2_LOAD_F(g);
+	const float out = std::fmaf(h0, in, acc);
+	F2_STORE_F(h, g0 + h0);
+	REX_STORE_U32_C(s + 8, uint32_t(count - 1));
+	ctx.f0.f64 = double(acc);
+	ctx.f1.f64 = double(out);
 }
