@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="tools/switch/icon/fable2_icon.jpg" alt="Fable II for Nintendo Switch icon" width="112">
+
 # Fable II for Nintendo Switch
 
 **Fable II (Xbox 360), recompiled to run natively on the Nintendo Switch.**
