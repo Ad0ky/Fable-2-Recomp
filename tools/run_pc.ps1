@@ -10,7 +10,7 @@ param([int]$Seconds = 90, [string]$Name = "run", [int]$Every = 15, [string]$Extr
       [string]$Renderer = "renut", [string]$GameDir = "")
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $GameDir) { $GameDir = Join-Path (Split-Path -Parent $root) "Fable 2 1.5.0" }
-$gameRoot = $GameDir -replace "\\", "/"
+$gameRoot = $GameDir -replace "\\", "/"  # quoted below: Start-Process joins the arguments with spaces
 $dir = Join-Path $root "app\out\pc"
 $exe = Join-Path $dir "renut.exe"
 $logs = Join-Path $root "out\pc_runs\$Name"
@@ -19,9 +19,11 @@ $log = Join-Path $logs "$Name.log"
 Remove-Item $log -ErrorAction SilentlyContinue
 $min = if ($Visible) { "false" } else { "true" }
 $args = @("--log_file=$log", "--audio_mute=true", "--window_start_minimized=$min", "--fullscreen=false",
-          "--game_data_root=$gameRoot", "--banjo_renderer=$Renderer", "--user_data_root=$root/out/pc_user",
+          "--game_data_root=`"$gameRoot`"", "--banjo_renderer=$Renderer", "--user_data_root=$root/out/pc_user",
           "--nfsmw_captura_cada_s=$Every", "--nfsmw_captura_max=60", "--log_file_writer=false") +
         @($Extra -split ' ' | Where-Object { $_ })
+# The emulated GPU is the SDK's plugin (rexgpu-xenos.dll), loaded only when named.
+if ($Renderer -eq "emulated") { $args += "--gpu_plugin=xenos" }
 $style = if ($Visible) { "Normal" } else { "Minimized" }
 $p = Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $dir -PassThru -WindowStyle $style `
      -RedirectStandardError (Join-Path $logs "stderr.txt") -RedirectStandardOutput (Join-Path $logs "stdout.txt")

@@ -126,6 +126,9 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
 }  // namespace rex
 extern "C" {
 uint32_t g_rex_marker_count = 0;
+// fable2-nx (2026-11-24): the count for code outside the runtime (the renderer's marker frames): on Windows the runtime
+// is a DLL, whose data the app cannot link to by name; a function it can.
+uint32_t RexMarkerCount() { return __atomic_load_n(&g_rex_marker_count, __ATOMIC_RELAXED); }
 }
 namespace rex {
 namespace kernel {

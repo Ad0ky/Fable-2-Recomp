@@ -9876,7 +9876,7 @@ bool DrawsWithoutPixelShader(const GuestDevice &device, const Targets &t, const 
 // (2026-11-20: two, so a flicker shows as the difference between them): their draws go the full way (the fast path skips
 // the draw log) and each is logged ("frame K" sections, "[mark N] draw D"; plume adds each draw's textures). One relaxed
 // load a draw otherwise.
-extern "C" uint32_t g_rex_marker_count;
+extern "C" uint32_t RexMarkerCount();  // xam_input.cpp (a function: the runtime is a DLL on Windows)
 constexpr uint32_t kMarkerFrames = 2;
 static uint32_t g_marker_seen = 0, g_marker_id = 0, g_marker_draws = 0, g_marker_total = 0;
 static uint64_t g_marker_frame = UINT64_MAX, g_marker_section = UINT64_MAX;
@@ -9888,7 +9888,7 @@ static void MarkerText(const std::string &line) {
 #endif
 }
 static bool MarkerFrameOn() {
-  const uint32_t count = __atomic_load_n(&g_rex_marker_count, __ATOMIC_RELAXED);
+  const uint32_t count = RexMarkerCount();
   const uint64_t frame = TextureFrameLocked();
   if (count != g_marker_seen) [[unlikely]] {
     g_marker_seen = count;

@@ -48,3 +48,10 @@ pgo/*
 # 2026-11-11 (port 81): the in-place copies' form has a profile of its own (CMake BANJO_PGO_DIR_IN_PLACE), kept the same way
 pgo-inplace/*
 !pgo-inplace/*.gcda
+
+# fable2-nx (2026-11-24): the PC build's log, the DirectX shader compiler copied from the Windows SDK, scratch scripts
+pc-build.log
+switch-build.log
+app/thirdparty/reblue-XenosRecomp/thirdparty/dxc-bin/bin/
+app/thirdparty/reblue-XenosRecomp/thirdparty/dxc-bin/lib/
+zz-*
