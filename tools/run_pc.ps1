@@ -4,8 +4,13 @@
 # The log is written unbuffered (log_file_writer = false): the run is stopped by force, which would drop the buffer.
 # -Visible: the window is shown (not minimised): Renut presents (and so captures and paces by vsync) only with a
 # swapchain, which a minimised window does not get.
-param([int]$Seconds = 90, [string]$Name = "run", [int]$Every = 15, [string]$Extra = "", [switch]$Visible)
+# fable2-nx (2026-11-24): -Renderer renut (Renut's renderer, as on the Switch) or emulated (the SDK's emulated Xbox 360
+# GPU, the reference); -GameDir the folder with default.xex (default: ..\Fable 2 1.5.0 next to the repo).
+param([int]$Seconds = 90, [string]$Name = "run", [int]$Every = 15, [string]$Extra = "", [switch]$Visible,
+      [string]$Renderer = "renut", [string]$GameDir = "")
 $root = Split-Path -Parent $PSScriptRoot
+if (-not $GameDir) { $GameDir = Join-Path (Split-Path -Parent $root) "Fable 2 1.5.0" }
+$gameRoot = $GameDir -replace "\\", "/"
 $dir = Join-Path $root "app\out\pc"
 $exe = Join-Path $dir "renut.exe"
 $logs = Join-Path $root "out\pc_runs\$Name"
@@ -14,7 +19,7 @@ $log = Join-Path $logs "$Name.log"
 Remove-Item $log -ErrorAction SilentlyContinue
 $min = if ($Visible) { "false" } else { "true" }
 $args = @("--log_file=$log", "--audio_mute=true", "--window_start_minimized=$min", "--fullscreen=false",
-          "--game_data_root=D:/beautifulkatamari/game", "--user_data_root=$root/out/pc_user",
+          "--game_data_root=$gameRoot", "--banjo_renderer=$Renderer", "--user_data_root=$root/out/pc_user",
           "--nfsmw_captura_cada_s=$Every", "--nfsmw_captura_max=60", "--log_file_writer=false") +
         @($Extra -split ' ' | Where-Object { $_ })
 $style = if ($Visible) { "Normal" } else { "Minimized" }
