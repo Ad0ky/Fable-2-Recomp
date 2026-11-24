@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <string>
 #include <utility>
 
 #if REX_PLATFORM_MAC
@@ -1598,10 +1600,73 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
   return true;
 }
 
+#if REX_PLATFORM_SWITCH
+extern "C" char _start;  // the executable's first instruction (exception_handler_switch.cpp uses the same)
+#endif
+
+namespace {
+// fable2-nx (2026-11-24): a save load crashed 3 s after "BaseHeap::Alloc page count too big for requested range" and
+// "failed to find contiguous range" on the game thread, with nothing saying what was asked. The first failures are
+// logged with the request, the heap's state and the host call chain (image offsets, for addr2line on the ELF), so the
+// caller can be named. At most 24 such lines in a run.
+std::atomic<uint32_t> g_alloc_failure_lines{0};
+
+std::string HostCallChain() {
+  std::string out;
+#if REX_PLATFORM_SWITCH
+  const uint64_t base = reinterpret_cast<uint64_t>(&_start);
+  auto frame = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+  for (int i = 0; i < 16 && frame && (frame & 7) == 0; ++i) {
+    const uint64_t next = reinterpret_cast<const uint64_t*>(frame)[0];
+    const uint64_t ret = reinterpret_cast<const uint64_t*>(frame)[1];
+    if (ret < base || ret - base > 0x10000000ull) {
+      break;
+    }
+    out += fmt::format(" +{:x}", ret - base);
+    if (next <= frame || next - frame > 0x100000ull) {
+      break;
+    }
+    frame = next;
+  }
+#endif
+  return out;
+}
+}  // namespace
+
 bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t size,
                           uint32_t alignment, uint32_t allocation_type, uint32_t protect,
                           bool top_down, uint32_t* out_address) {
   *out_address = 0;
+  // fable2-nx (2026-11-24): see HostCallChain.
+  auto log_failure = [&](const char* why, uint32_t pages, uint32_t low_page, uint32_t high_page) {
+    if (g_alloc_failure_lines.fetch_add(1, std::memory_order_relaxed) >= 24) {
+      return;
+    }
+    uint32_t free_pages = 0, largest = 0, run = 0;
+    {
+      std::lock_guard<std::recursive_mutex> lock(heap_mutex_);
+      for (const auto& page : page_table_) {
+        if (page.state == 0) {
+          ++free_pages;
+          largest = std::max(largest, ++run);
+        } else {
+          run = 0;
+        }
+      }
+    }
+    uint32_t guest_lr = 0;
+    if (auto* ts = rex::runtime::ThreadState::Get(); ts && ts->context()) {
+      guest_lr = uint32_t(ts->context()->lr);
+    }
+    REXSYS_ERROR(
+        "[alloc] {}: heap {:08X} (size {:08X}, page {:#x}) asked {:#x} bytes ({} pages) aligned {:#x}, type {:#x}, "
+        "{}, range {:08X}-{:08X} (pages {}-{}); free {} pages ({} MB), largest free run {} pages ({} MB); guest lr "
+        "{:08X}; host chain{}",
+        why, heap_base_, heap_size_, page_size_, size, pages, alignment, allocation_type,
+        top_down ? "top down" : "bottom up", low_address, high_address, low_page, high_page, free_pages,
+        (uint64_t(free_pages) * page_size_) >> 20, largest, (uint64_t(largest) * page_size_) >> 20, guest_lr,
+        HostCallChain());
+  };
 
   alignment = rex::round_up(alignment, page_size_);
   uint32_t page_count = get_page_count(size, page_size_, page_size_shift_);
@@ -1623,6 +1688,7 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   uint32_t available_page_count = high_page_number - low_page_number + 1;
   if (!page_count || page_count > available_page_count) {
     REXSYS_ERROR("BaseHeap::Alloc page count too big for requested range");
+    log_failure("page count too big", page_count, low_page_number, high_page_number);
     return false;
   }
 
@@ -1738,6 +1804,7 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
     // Out of memory.
     REXSYS_ERROR("BaseHeap::Alloc failed to find contiguous range");
+    log_failure("no contiguous range", page_count, low_page_number, high_page_number);
     assert_always("Heap exhausted!");
     return false;
   }

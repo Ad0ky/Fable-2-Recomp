@@ -97,7 +97,7 @@ int PointNativeMode();  // render/pipeline.cpp (fable2_point_native)
 }
 REXCVAR_DEFINE_DOUBLE(fable2_diag_point_max_px, 0.0, "Banjo/Renut",
                       "Diagnostic: the largest point sprite in pixels (0 = the game's own); see PointStateOf");
-REXCVAR_DEFINE_INT32(fable2_cpu_terrain_tess, 1, "Fable2/GPU",
+REXCVAR_DEFINE_INT32(fable2_cpu_terrain_tess, 0, "Fable2/GPU",
                      "The terrain's tessellation factor pass (an export-only vertex shader) on the CPU (from himdo's port): "
                      "0 off; 1 verify (computed and compared with the GPU's result, [cpu tess] lines; the GPU's used); 2 "
                      "written to guest memory at the draw, the draw left out (the shaders fable2_cpu_terrain_vs lists)")

@@ -33,6 +33,13 @@ import sys
 import time
 
 TOOL = 'C:/devkitPro/devkitA64/bin/aarch64-none-elf-gcov-tool.exe'
+# fable2-nx (2026-11-24): in the Docker build (run-switch-build.bat pgo-merge) devkitA64 is Linux's; GCOV_TOOL overrides.
+if os.environ.get('GCOV_TOOL'):
+    TOOL = os.environ['GCOV_TOOL']
+elif not os.path.exists(TOOL):
+    _linux = os.path.join(os.environ.get('DEVKITPRO', '/opt/devkitpro'), 'devkitA64', 'bin', 'aarch64-none-elf-gcov-tool')
+    if os.path.exists(_linux):
+        TOOL = _linux
 
 
 def main():

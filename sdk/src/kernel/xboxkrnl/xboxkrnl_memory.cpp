@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -21,6 +22,7 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xtypes.h>
 
 namespace rex::kernel::xboxkrnl {
@@ -172,6 +174,19 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
     heap->Alloc(adjusted_size, page_size, allocation_type, protect, top_down, &address);
   }
   if (!address) {
+    // fable2-nx (2026-11-24): the game's own request, as it asked it (xmemory.cpp's [alloc] line has the heap's state).
+    static std::atomic<uint32_t> failures{0};
+    if (failures.fetch_add(1, std::memory_order_relaxed) < 24) {
+      uint32_t guest_lr = 0;
+      if (auto* ts = rex::runtime::ThreadState::Get(); ts && ts->context()) {
+        guest_lr = uint32_t(ts->context()->lr);
+      }
+      REXKRNL_ERROR(
+          "[alloc] NtAllocateVirtualMemory failed: base {:08X} size {:08X} (adjusted {:08X}), type {:#x}, protect "
+          "{:#x}; guest lr {:08X}",
+          uint32_t(*base_addr_ptr), uint32_t(region_size_ptr.value()), adjusted_size, uint32_t(alloc_type),
+          uint32_t(protect_bits), guest_lr);
+    }
     // Failed - assume no memory available.
     return X_STATUS_NO_MEMORY;
   }

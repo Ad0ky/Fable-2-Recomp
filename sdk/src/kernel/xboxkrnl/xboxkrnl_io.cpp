@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <unordered_map>  // fable2-nx (2026-11-24)
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -37,6 +38,8 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
 
+#include <cstdio>
+#include <algorithm>
 #include <cctype>
 #include <mutex>
 #include <string>
@@ -60,6 +63,10 @@ REXCVAR_DEFINE_INT32(masseffect_io_us_per_kb, 0, "Filesystem",
                      "emulate the Switch SD card (~100 = 13 ms per 128 KiB); 0 = off.");
 REXCVAR_DEFINE_INT32(masseffect_io_summary_s, 15, "Filesystem",
                      "How many seconds between [io] summaries (0 = never).");
+
+REXCVAR_DEFINE_BOOL(fable2_save_journal, true, "Filesystem",
+                    "Write every read and write of a save file, with its bytes, to save_journal.bin next to the NRO "
+                    "(the corrupt-save investigation, 2026-11-24)");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -441,6 +448,104 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
   return true;
 }
 
+// fable2-nx (2026-11-24, saves the game calls corrupted): the handles of files opened through a save drive ("save:"),
+// so their opens and writes are logged ([save] lines) and a failing save shows which step failed.
+namespace {
+std::mutex g_save_handles_mutex;
+std::unordered_map<uint32_t, std::string> g_save_handles;
+bool IsSavePath(std::string_view p) {
+  return p.size() >= 5 && (p[0] == 's' || p[0] == 'S') && (p[1] == 'a' || p[1] == 'A') &&
+         (p[2] == 'v' || p[2] == 'V') && (p[3] == 'e' || p[3] == 'E') && p[4] == ':';
+}
+std::string SaveHandlePath(uint32_t handle) {
+  std::lock_guard lock(g_save_handles_mutex);
+  const auto it = g_save_handles.find(handle);
+  return it == g_save_handles.end() ? std::string() : it->second;
+}
+
+// The handle's save path, only while the handle still names that file: handle numbers are reused after a close, and
+// a reused number on a game data file must not be taken for a save.
+std::string SaveFilePath(uint32_t handle, XFile* file) {
+  std::string save_path = SaveHandlePath(handle);
+  if (save_path.empty() || !file) {
+    return {};
+  }
+  auto tail = [](std::string_view p) {
+    const size_t cut = p.find_last_of("\\/:");
+    std::string t(cut == std::string_view::npos ? p : p.substr(cut + 1));
+    for (char& c : t) {
+      c = char(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return t;
+  };
+  return tail(save_path) == tail(file->path()) ? save_path : std::string();
+}
+
+/*
+ * fable2-nx (2026-11-24): the save journal. The Switch's mainsave.bin came out corrupt (its third zlib block is
+ * cut by other bytes from offset 5829) although every write the game made returned success, in order. The game
+ * writes the file in 2048-byte sectors plus pieces that go straight to the disk, and then writes again the sectors
+ * those pieces fell into: the bytes it puts there must come from somewhere (a read back through its first handle,
+ * or its own buffer), and the log said only offsets and sizes. Every read and write of a save file goes here with
+ * its bytes, so the file can be rebuilt on the PC step by step and the first wrong byte traced to the call that
+ * put it there (tools/fable2_save_journal.py). Off with fable2_save_journal = false; it stops at 32 MB.
+ */
+std::mutex g_save_journal_mutex;
+std::FILE* g_save_journal = nullptr;
+uint64_t g_save_journal_bytes = 0;
+bool g_save_journal_failed = false;
+
+void SaveJournal(char op, uint32_t handle, const std::string& path, int64_t offset, uint32_t length,
+                 uint32_t result, uint32_t done, const void* data, uint32_t data_length) {
+  if (!REXCVAR_GET(fable2_save_journal)) {
+    return;
+  }
+  std::lock_guard lock(g_save_journal_mutex);
+  if (g_save_journal_failed || g_save_journal_bytes > (uint64_t(32) << 20)) {
+    return;
+  }
+  if (!g_save_journal) {
+#if REX_PLATFORM_SWITCH
+    const char* journal_path = "/switch/fable2-nx/save_journal.bin";
+#else
+    const char* journal_path = "save_journal.bin";
+#endif
+    g_save_journal = std::fopen(journal_path, "ab");
+    if (!g_save_journal) {
+      g_save_journal_failed = true;
+      REXKRNL_WARN("[save] journal: cannot open {}", journal_path);
+      return;
+    }
+    REXKRNL_INFO("[save] journal: every read and write of a save file goes to {}", journal_path);
+  }
+  const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+  const uint16_t path_length = uint16_t(std::min<size_t>(path.size(), 1024));
+  if (!data) {
+    data_length = 0;
+  }
+  // Little-endian record: "F2SJ", op ('R'/'W'), handle, microseconds, offset (-1 = the file position), length asked,
+  // status, bytes done, path length, data length, path, data.
+  std::fwrite("F2SJ", 1, 4, g_save_journal);
+  std::fwrite(&op, 1, 1, g_save_journal);
+  std::fwrite(&handle, 4, 1, g_save_journal);
+  std::fwrite(&us, 8, 1, g_save_journal);
+  std::fwrite(&offset, 8, 1, g_save_journal);
+  std::fwrite(&length, 4, 1, g_save_journal);
+  std::fwrite(&result, 4, 1, g_save_journal);
+  std::fwrite(&done, 4, 1, g_save_journal);
+  std::fwrite(&path_length, 2, 1, g_save_journal);
+  std::fwrite(&data_length, 4, 1, g_save_journal);
+  std::fwrite(path.data(), 1, path_length, g_save_journal);
+  if (data_length) {
+    std::fwrite(data, 1, data_length, g_save_journal);
+  }
+  std::fflush(g_save_journal);
+  g_save_journal_bytes += 47u + path_length + data_length;
+}
+}  // namespace
+
 u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
                        ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
@@ -485,7 +590,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   // Attempt open (or create).
   rex::filesystem::File* vfs_file;
-  rex::filesystem::FileAction file_action;
+  rex::filesystem::FileAction file_action{};
   const uint64_t io_us_start = NowUs();
   X_STATUS result = REX_KERNEL_FS()->OpenFile(
       root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
@@ -514,9 +619,22 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   *handle_out = handle;
   if (XFAILED(result)) {
-    REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
+    // fable2-nx (2026-11-24, the saves the game calls corrupted: every save's 'save:\\mainsave.bin' open failed with
+    // 0xc000000f): what was asked, and whether the folder resolved (action: 3 the file is not there).
+    REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x} (access {:#x}, disposition {}, options {:#x}, action {})",
+                        target_path, result, (uint32_t)desired_access, (uint32_t)creation_disposition,
+                        (uint32_t)create_options, (uint32_t)file_action);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+  }
+  if (IsSavePath(target_path)) {  // fable2-nx (2026-11-24)
+    REXKRNL_INFO("[save] NtCreateFile '{}' access {:#x} disposition {} options {:#x} -> {:#x} (action {}, handle {:#x})",
+                 target_path, (uint32_t)desired_access, (uint32_t)creation_disposition, (uint32_t)create_options,
+                 (uint32_t)result, (uint32_t)file_action, (uint32_t)handle);
+    if (XSUCCEEDED(result)) {
+      std::lock_guard lock(g_save_handles_mutex);
+      g_save_handles[(uint32_t)handle] = std::string(target_path);
+    }
   }
   return result;
 }
@@ -658,6 +776,15 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   if (XFAILED(result) && io_status_block) {
     io_status_block->status = result;
     io_status_block->information = 0;
+  }
+
+  if (const std::string save_path = SaveFilePath(file_handle, file.get()); !save_path.empty()) {  // fable2-nx
+    const int64_t at = byte_offset_ptr ? int64_t(byte_offset) : int64_t(-1);
+    const uint32_t done = io_status_block ? (uint32_t)io_status_block->information : 0u;
+    REXKRNL_INFO("[save] NtReadFile '{}' (handle {:#x}): {} bytes at {} -> {:#x} ({} read)", save_path,
+                 (uint32_t)file_handle, (uint32_t)buffer_length, at, (uint32_t)result, done);
+    SaveJournal('R', (uint32_t)file_handle, save_path, at, (uint32_t)buffer_length, (uint32_t)result, done,
+                buffer.host_address(), done);
   }
 
   if (ev && signal_event) {
@@ -834,6 +961,14 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
   if (XFAILED(result) && io_status_block) {
     io_status_block->status = result;
     io_status_block->information = 0;
+  }
+  if (const std::string save_path = SaveFilePath(file_handle, file.get()); !save_path.empty()) {  // fable2-nx
+    const int64_t at = byte_offset_ptr ? int64_t(static_cast<uint64_t>(*byte_offset_ptr)) : int64_t(-1);
+    const uint32_t done = io_status_block ? (uint32_t)io_status_block->information : 0u;
+    REXKRNL_INFO("[save] NtWriteFile '{}' (handle {:#x}): {} bytes at {} -> {:#x} ({} written)", save_path,
+                 (uint32_t)file_handle, (uint32_t)buffer_length, at, (uint32_t)result, done);
+    SaveJournal('W', (uint32_t)file_handle, save_path, at, (uint32_t)buffer_length, (uint32_t)result, done,
+                buffer.host_address(), (uint32_t)buffer_length);
   }
 
   if (ev && signal_event) {

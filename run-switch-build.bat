@@ -7,6 +7,10 @@ rem   run-switch-build.bat codegen        run the code generator again (and ever
 rem   run-switch-build.bat postcodegen    the post-codegen passes again (a new machine-copy list), then build
 rem   run-switch-build.bat shaders        only the shaders and the DKSH cache (copied to the SD folder)
 rem   run-switch-build.bat clean          delete the Switch build folder first
+rem   run-switch-build.bat pgo-generate   PGO step 1: an instrumented LTO build (out\build\switch-pgo-gen); play it, it
+rem                                       writes sdmc:/switch/fable2-nx/pgo/banjo_pgo_<N>.stream
+rem   run-switch-build.bat pgo-merge      PGO step 2: the streams in the SD folder's pgo\ merged into pgo-inplace\
+rem   run-switch-build.bat pgo-use        PGO step 3: the optimised LTO build from pgo-inplace\ (out\build\switch-pgo)
 rem
 rem Your game folder (with default.xex): GAME_DIR below, or set GAME_DIR before running.
 rem Shader captures: the SD card's \switch\fable2-nx\shader_capture (the staging folder below) and fable2-nx's
@@ -20,6 +24,9 @@ if /i "%~1"=="codegen" set "EXTRA=-e CODEGEN=1"
 if /i "%~1"=="postcodegen" set "EXTRA=-e POSTCODEGEN=1"
 if /i "%~1"=="clean" set "EXTRA=-e CLEAN=1"
 if /i "%~1"=="shaders" set "EXTRA=-e SHADERS=1"
+rem fable2-nx (2026-11-24): PGO + LTO (docs/building.md, section 4; docs/hand-and-machine-optimising-guide.md, section 4).
+if /i "%~1"=="pgo-generate" set "EXTRA=-e BUILD_DIR=/work/out/build/switch-pgo-gen -e JOBS=8 -e "CMAKE_EXTRA=-DBANJO_PGO=generate -DBANJO_SWITCH_LTO=ON""
+if /i "%~1"=="pgo-use" set "EXTRA=-e BUILD_DIR=/work/out/build/switch-pgo -e JOBS=8 -e "CMAKE_EXTRA=-DBANJO_PGO=use -DBANJO_SWITCH_LTO=ON""
 echo Fable 2 NX (ultimate base) Switch build - %date% %time% > switch-build.log
 git log --oneline -1 >> switch-build.log 2>&1
 where docker >> switch-build.log 2>&1
@@ -56,6 +63,7 @@ if errorlevel 1 (
   docker build --progress=plain -t %IMAGE% -f tools\nx\Dockerfile tools\nx >> switch-build.log 2>&1
   if errorlevel 1 (echo RESULT: %IMAGE% image build failed >> switch-build.log & goto end)
 )
+if /i "%~1"=="pgo-merge" goto pgomerge
 echo Building Fable 2 NX for Switch (ultimate base)... the first run also runs the code generator and makes the shaders.
 echo === Switch build === >> switch-build.log
 docker run --rm %EXTRA% -v "%CD%:/work" -w /work %IMAGE% bash tools/nx/build-switch.sh >> switch-build.log 2>&1
@@ -69,6 +77,17 @@ if "%BUILDRC%"=="0" (
     copy /y out\switch\fable2-nx.elf "%SDCARD%\fable2-nx.elf" >> switch-build.log
   )
 )
+goto end
+:pgomerge
+rem fable2-nx (2026-11-24): every session's stream of ONE instrumented build (empty the console's pgo folder before
+rem playing a new instrumented build); pgo-inplace must hold no .gcda yet (move an older profile aside).
+if not exist "%SDCARD%\pgo\banjo_pgo_*.stream" (echo RESULT: no banjo_pgo_*.stream in "%SDCARD%\pgo" - copy the console's sdmc:/switch/fable2-nx/pgo folder there. >> switch-build.log & goto end)
+if exist out\pgo_streams rmdir /s /q out\pgo_streams
+mkdir out\pgo_streams
+copy /y "%SDCARD%\pgo\banjo_pgo_*.stream" out\pgo_streams\ >> switch-build.log
+echo === PGO merge into pgo-inplace === >> switch-build.log
+docker run --rm -v "%CD%:/work" -w /work %IMAGE% python3 tools/pgo_merge.py out/pgo_streams pgo-inplace --all >> switch-build.log 2>&1
+echo RESULT: merge exit code %errorlevel% >> switch-build.log
 :end
 echo Done. See switch-build.log
 pause

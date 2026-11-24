@@ -17,6 +17,10 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <string>
+#include <atomic>
+#include <unordered_map>
+#include <mutex>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -235,14 +239,48 @@ bool CreateEmptyFile(const std::filesystem::path& path) {
   return false;
 }
 
+#if defined(__SWITCH__)
+/*
+ * fable2-nx (2026-11-24, Fable II's saves "corrupted"): Horizon's file system refuses to open a file that is already
+ * open when one of the two opens writes (the open fails; here it reached the game as NO_SUCH_FILE). Fable II saves by
+ * opening mainsave.bin to create it (read access, FILE_OVERWRITE_IF) and, with that handle still open, again to write
+ * it (FILE_OPEN): the second open failed every time, nothing was written and every load said "corrupted". Windows and
+ * the Xbox 360 allow it (share modes). So the handles of one file share one host descriptor: an open that fails while
+ * another handle of the same file is open takes that descriptor, reopened read-write when the rights differ. Reads
+ * and writes keep their own offsets (pread / pwrite), each under the descriptor's lock.
+ */
+struct SharedHostFd {
+  std::mutex m;
+  int fd = -1;
+  int mode = O_RDONLY;
+};
+std::mutex g_shared_fds_mutex;
+std::unordered_map<std::string, std::weak_ptr<SharedHostFd>> g_shared_fds;
+std::shared_ptr<SharedHostFd> MakeSharedHostFd(int fd, int mode) {
+  std::shared_ptr<SharedHostFd> s(new SharedHostFd, [](SharedHostFd* p) {
+    if (p->fd >= 0) close(p->fd);
+    delete p;
+  });
+  s->fd = fd;
+  s->mode = mode;
+  return s;
+}
+#endif
+
 class PosixFileHandle : public FileHandle {
  public:
+#if defined(__SWITCH__)
+  PosixFileHandle(std::filesystem::path path, std::shared_ptr<SharedHostFd> shared)
+      : FileHandle(std::move(path)), shared_(std::move(shared)) {}
+  ~PosixFileHandle() override = default;  // the descriptor closes with its last handle
+#else
   PosixFileHandle(std::filesystem::path path, int handle)
       : FileHandle(std::move(path)), handle_(handle) {}
   ~PosixFileHandle() override {
     close(handle_);
     handle_ = -1;
   }
+#endif
 #if defined(__SWITCH__)
   /*
    * banjo-nx (2026-10-29, for the DLC; from peggle1-nx, 2026-10-21): on Horizon the file system never sees the caller's buffer. The buffers here are usually
@@ -263,6 +301,8 @@ class PosixFileHandle : public FileHandle {
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
             size_t* out_bytes_read) override {
     uint8_t* const bounce = Bounce();
+    std::lock_guard lock(shared_->m);
+    const int handle_ = shared_->fd;
     auto* out = static_cast<uint8_t*>(buffer);
     size_t total = 0;
     while (total < buffer_length) {
@@ -285,6 +325,8 @@ class PosixFileHandle : public FileHandle {
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
     uint8_t* const bounce = Bounce();
+    std::lock_guard lock(shared_->m);
+    const int handle_ = shared_->fd;
     const auto* in = static_cast<const uint8_t*>(buffer);
     size_t total = 0;
     while (total < buffer_length) {
@@ -326,11 +368,25 @@ class PosixFileHandle : public FileHandle {
     return true;
   }
 #endif
+#if defined(__SWITCH__)
+  bool SetLength(size_t length) override {
+    std::lock_guard lock(shared_->m);
+    return ftruncate(shared_->fd, length) >= 0;
+  }
+  void Flush() override {
+    std::lock_guard lock(shared_->m);
+    fsync(shared_->fd);
+  }
+
+ private:
+  std::shared_ptr<SharedHostFd> shared_;
+#else
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
   void Flush() override { fsync(handle_); }
 
  private:
   int handle_ = -1;
+#endif
 };
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
@@ -359,11 +415,60 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path
   // No O_APPEND for kFileAppendData: writes go through pwrite with an explicit
   // offset, which O_APPEND would override.
   int handle = open(path.c_str(), open_access);
+#if defined(__SWITCH__)
+  const std::string key = path.string();
+  if (handle != -1) {
+    auto shared = MakeSharedHostFd(handle, open_access);
+    {
+      std::lock_guard lock(g_shared_fds_mutex);
+      if (g_shared_fds.size() > 512) {  // the closed files' entries
+        for (auto it = g_shared_fds.begin(); it != g_shared_fds.end();)
+          it = it->second.expired() ? g_shared_fds.erase(it) : std::next(it);
+      }
+      g_shared_fds[key] = shared;
+    }
+    return std::make_unique<PosixFileHandle>(path, std::move(shared));
+  }
+  // fable2-nx (2026-11-24): refused while another handle of this file is open (SharedHostFd above): that handle's
+  // descriptor, read-write if this open asks for a right it lacks.
+  std::shared_ptr<SharedHostFd> shared;
+  {
+    std::lock_guard lock(g_shared_fds_mutex);
+    const auto it = g_shared_fds.find(key);
+    if (it != g_shared_fds.end())
+      shared = it->second.lock();
+  }
+  if (!shared)
+    return nullptr;
+  {
+    std::lock_guard lock(shared->m);
+    const bool has_read = shared->mode != O_WRONLY, has_write = shared->mode != O_RDONLY;
+    if ((want_read && !has_read) || (want_write && !has_write)) {
+      const int old_mode = shared->mode;
+      close(shared->fd);
+      const int fd = open(path.c_str(), O_RDWR);
+      if (fd == -1) {
+        shared->fd = open(path.c_str(), old_mode);
+        REXFS_WARN("[io] '{}': open refused while another handle holds it, and no read-write descriptor either",
+                   path.string());
+        return nullptr;
+      }
+      shared->fd = fd;
+      shared->mode = O_RDWR;
+    }
+  }
+  static std::atomic<uint32_t> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
+    REXFS_INFO("[io] '{}' opened again while open (Horizon refuses a second open with a writer): the open handle's "
+               "descriptor is shared, read-write", path.string());
+  return std::make_unique<PosixFileHandle>(path, std::move(shared));
+#else
   if (handle == -1) {
     // TODO(benvanik): pick correct response.
     return nullptr;
   }
   return std::make_unique<PosixFileHandle>(path, handle);
+#endif
 }
 
 bool GetInfo(const std::filesystem::path& path, FileInfo* out_info) {

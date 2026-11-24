@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>  // fable2-nx (2026-11-24)
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/string.h>
@@ -219,6 +220,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   if (!base_path.empty()) {
     parent_entry = !root_entry ? ResolvePath(base_path) : root_entry->ResolvePath(base_path);
     if (!parent_entry) {
+      // fable2-nx (2026-11-24): a folder that does not resolve (a device not mounted, a stale link) said nothing.
+      static std::atomic<uint32_t> logged{0};
+      if (logged.fetch_add(1, std::memory_order_relaxed) < 32)
+        REXFS_WARN("[io] open '{}': its folder '{}' does not resolve (no device or link for it)", path, base_path);
       *out_action = FileAction::kDoesNotExist;
       return X_STATUS_NO_SUCH_FILE;
     }

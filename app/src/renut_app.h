@@ -312,12 +312,24 @@ public:
             if (paths.user_data_root == old_root) {
                 const auto new_root = rex::filesystem::GetExecutableFolder() / "profile";
                 std::error_code ec;
-                if (std::filesystem::is_directory(old_root, ec) && !std::filesystem::exists(new_root, ec)) {
+                // fable2-nx (2026-11-24): the checks with their own error codes: is_directory's on a missing folder
+                // may set one on the Switch's file system, which made every later run keep the renut folder (a new,
+                // empty profile: no saves, the game's default options, subtitles off). The profile folder is made
+                // when neither exists.
+                std::error_code probe;
+                const bool old_there = std::filesystem::is_directory(old_root, probe);
+                const bool new_there = std::filesystem::is_directory(new_root, probe);
+                if (old_there && !new_there) {
                     std::filesystem::rename(old_root, new_root, ec);
                     std::fprintf(stderr, "[fable2] user data: %s renamed to %s (%s)\n", old_root.string().c_str(),
                                  new_root.string().c_str(), ec ? ec.message().c_str() : "done");
+                } else if (!new_there) {
+                    std::filesystem::create_directories(new_root, ec);
                 }
-                if (!ec || std::filesystem::is_directory(new_root, ec)) {
+                if (old_there && new_there)
+                    std::fprintf(stderr, "[fable2] user data: both %s and %s exist; %s is used\n",
+                                 old_root.string().c_str(), new_root.string().c_str(), new_root.string().c_str());
+                if (std::filesystem::is_directory(new_root, probe)) {
                     if (paths.cache_root == old_root / "cache")
                         paths.cache_root = new_root / "cache";
                     paths.user_data_root = new_root;

@@ -1075,7 +1075,7 @@ void QueueResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 de
 // a visible answer held for 2 frames, no popping.
 } // namespace renut::gpu
 
-REXCVAR_DEFINE_INT32(fable2_occlusion_queries, 2, "Fable2/GPU",
+REXCVAR_DEFINE_INT32(fable2_occlusion_queries, 1, "Fable2/GPU",
                      "Occlusion queries: 0 every query answered fully visible (before); 1 measured on the GPU, the "
                      "sun glare's queries answered with their counts, the rest visible; 2 every query answered with its "
                      "count (the game culls what is hidden), a visible answer held for fable2_occlusion_hold counts")
