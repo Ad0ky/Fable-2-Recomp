@@ -134,7 +134,7 @@ It reads your extracted game from `GAME_DIR` (by default `..\Fable 2 1.5.0`, a f
 
 ## Credits
 
-- **Switch port:** [Ad0ky](https://github.com/Ad0ky).
+- **Switch port:** [Ad0ky](https://github.com/Ad0ky) and [StevensND](https://github.com/StevensND).
 - **Fable 2 Recomp (PC):** [himdo](https://github.com/himdo/Fable-2-Recomp) and its contributors; the CPU terrain
   tessellation pass comes from its SDK fork ([himdo/rexglue-sdk](https://github.com/himdo/rexglue-sdk)).
 - **Base and renderer:** [renut_nx_ultimate_base](https://github.com/ChanseyIsTheBest/renut_nx_ultimate_base) by

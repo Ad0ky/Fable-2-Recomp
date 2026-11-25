@@ -1022,7 +1022,7 @@ if(REXGLUE_PLATFORM_SWITCH)
     # fable2-nx (2026-11-12): Fable II on renut_nx_ultimate_base; the icon from fable2-nx (assets/switch-icon.jpg).
     rexglue_switch_add_nro(renut
         NAME "${RENUT_GAME_NAME}"  # port 193: set once, above
-        AUTHOR "Ad0ky"
+        AUTHOR "Ad0ky & StevensND"
         VERSION "1.5.0"
         ${RENUT_ICON_ARG})
 endif()
