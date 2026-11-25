@@ -34,8 +34,10 @@ import re
 import sys
 
 R1 = re.compile(r'(?<![\w.])(?:ctx\.r1|r1l|l_r1|ll_r1|r1)\.[us](?:32|64)\b')
+# blur-nx (2026-11-13, M-23): and tools/float_loads.py's single stores from the vector unit (REX_STORE_(D_)F32ANY).
 STORE = re.compile(r'\b(REX_STORE_D_U(?:8|16|32|64)|REX_STORE_U(?:8|16|32|64)|REX_STVLX|REX_STVRX|'
-                   r'REX_MM_STORE_U(?:8|16|32|64)|BANJO_HOT_STORE_(?:D_)?U(?:8|16|32|64))\(')
+                   r'REX_MM_STORE_U(?:8|16|32|64)|BANJO_HOT_STORE_(?:D_)?U(?:8|16|32|64)|'
+                   r'REX_STORE_(?:D_)?F32ANY|BANJO_HOT_STORE_(?:D_)?F32ANY)\(')
 VEC = 'simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea),'
 DCBZ = re.compile(r'(?<![\w,] )\bmemset\(\(void\*\)REX_RAW_ADDR\(ea\), 0, (?:32|128)\);')
 CAS = 'REX_GUEST_CAS(reinterpret_cast<'
@@ -52,9 +54,25 @@ MACROS = MARKER + '''
 #ifndef REX_CARD
 #if defined(REX_STORE_CARDS_OFF)
 #define REX_CARD(ea) ((void)0)
+#elif defined(REX_NX_CENSUS_ON)  // blur-nx (2026-11-13, near-exact #38's census: card marks of the generated tree)
+#define REX_CARD(ea) ((void)(REX_NX_CENSUS(25), *(u8*)(base + ((u32)(ea) >> 12)) = 0))
+#elif defined(REX_CARD_VIEWS_ONLY)
+// blur-nx (2026-11-13, with near-exact #38; exact): the copies' rule (cpu/banjo_hot_prelude.h, VS-11 / VS-12 of
+// 2026-11-11) for the generated tree too: only the pages whose cards Renut reads (its views 0xA0000000 and up and
+// 0x7F000000-0x7FFFFFFF, and the page in front of each), and the card byte written only when it is not zero yet (a
+// zero card is the result either way; the card lines stay shared between the cores).
+[[gnu::always_inline]] static inline void rex_card_gen_(uint8_t* base_, u32 page) {
+  if (page - 0x9FFFFu <= 0x60000u || page - 0x7EFFFu <= 0x1000u) {
+    u8* const card = (u8*)(base_ + page);
+    if (*card) *card = 0;
+  }
+}
+#define REX_CARD(ea) rex_card_gen_(base, ((u32)(ea)) >> 12)
 #else
 #define REX_CARD(ea) ((void)(*(u8*)(base + ((u32)(ea) >> 12)) = 0))
 #endif
+#if defined(REX_CARD_ADDR_TWICE)
+// The forms before port 160 (A/B only): the address written twice.
 #define REX_STORE_D_U8_C(r, d, y) (REX_STORE_D_U8(r, d, y), REX_CARD((u32)(r) + (u32)(d)))
 #define REX_STORE_D_U16_C(r, d, y) (REX_STORE_D_U16(r, d, y), REX_CARD((u32)(r) + (u32)(d)))
 #define REX_STORE_D_U32_C(r, d, y) (REX_STORE_D_U32(r, d, y), REX_CARD((u32)(r) + (u32)(d)))
@@ -63,12 +81,38 @@ MACROS = MARKER + '''
 #define REX_STORE_U16_C(x, y) (REX_STORE_U16(x, y), REX_CARD(x))
 #define REX_STORE_U32_C(x, y) (REX_STORE_U32(x, y), REX_CARD(x))
 #define REX_STORE_U64_C(x, y) (REX_STORE_U64(x, y), REX_CARD(x))
-#define REX_STVLX_C(ea, v) do { REX_STVLX(ea, v); REX_CARD(ea); } while (0)
-#define REX_STVRX_C(ea, v) do { REX_STVRX(ea, v); REX_CARD(ea); } while (0)
 #define REX_MM_STORE_U8_C(a, v) do { REX_MM_STORE_U8(a, v); REX_CARD(a); } while (0)
 #define REX_MM_STORE_U16_C(a, v) do { REX_MM_STORE_U16(a, v); REX_CARD(a); } while (0)
 #define REX_MM_STORE_U32_C(a, v) do { REX_MM_STORE_U32(a, v); REX_CARD(a); } while (0)
 #define REX_MM_STORE_U64_C(a, v) do { REX_MM_STORE_U64(a, v); REX_CARD(a); } while (0)
+#else
+// Port 160 (from fnxf_xiii, its note of 2026-10-24): each form evaluates its address once. The stores are volatile
+// and, with -fno-strict-aliasing, may change ctx as far as the compiler knows, so an address written twice was loaded
+// from ctx and added again for the card (fnxf_xiii: 2.3 MB of .text, about 250k extra ldr / add). The same address
+// and the same card; -DREX_CARD_ADDR_TWICE gives the old forms back.
+#define REX_STORE_D_U8_C(r, d, y) \
+  ({ const u32 rex_card_r_ = (u32)(r); REX_STORE_D_U8(rex_card_r_, d, y); REX_CARD(rex_card_r_ + (u32)(d)); })
+#define REX_STORE_D_U16_C(r, d, y) \
+  ({ const u32 rex_card_r_ = (u32)(r); REX_STORE_D_U16(rex_card_r_, d, y); REX_CARD(rex_card_r_ + (u32)(d)); })
+#define REX_STORE_D_U32_C(r, d, y) \
+  ({ const u32 rex_card_r_ = (u32)(r); REX_STORE_D_U32(rex_card_r_, d, y); REX_CARD(rex_card_r_ + (u32)(d)); })
+#define REX_STORE_D_U64_C(r, d, y) \
+  ({ const u32 rex_card_r_ = (u32)(r); REX_STORE_D_U64(rex_card_r_, d, y); REX_CARD(rex_card_r_ + (u32)(d)); })
+#define REX_STORE_U8_C(x, y) ({ const u32 rex_card_ea_ = (u32)(x); REX_STORE_U8(rex_card_ea_, y); REX_CARD(rex_card_ea_); })
+#define REX_STORE_U16_C(x, y) ({ const u32 rex_card_ea_ = (u32)(x); REX_STORE_U16(rex_card_ea_, y); REX_CARD(rex_card_ea_); })
+#define REX_STORE_U32_C(x, y) ({ const u32 rex_card_ea_ = (u32)(x); REX_STORE_U32(rex_card_ea_, y); REX_CARD(rex_card_ea_); })
+#define REX_STORE_U64_C(x, y) ({ const u32 rex_card_ea_ = (u32)(x); REX_STORE_U64(rex_card_ea_, y); REX_CARD(rex_card_ea_); })
+#define REX_MM_STORE_U8_C(a, v) \
+  do { const u32 rex_card_ea_ = (u32)(a); REX_MM_STORE_U8(rex_card_ea_, v); REX_CARD(rex_card_ea_); } while (0)
+#define REX_MM_STORE_U16_C(a, v) \
+  do { const u32 rex_card_ea_ = (u32)(a); REX_MM_STORE_U16(rex_card_ea_, v); REX_CARD(rex_card_ea_); } while (0)
+#define REX_MM_STORE_U32_C(a, v) \
+  do { const u32 rex_card_ea_ = (u32)(a); REX_MM_STORE_U32(rex_card_ea_, v); REX_CARD(rex_card_ea_); } while (0)
+#define REX_MM_STORE_U64_C(a, v) \
+  do { const u32 rex_card_ea_ = (u32)(a); REX_MM_STORE_U64(rex_card_ea_, v); REX_CARD(rex_card_ea_); } while (0)
+#endif
+#define REX_STVLX_C(ea, v) do { REX_STVLX(ea, v); REX_CARD(ea); } while (0)
+#define REX_STVRX_C(ea, v) do { REX_STVRX(ea, v); REX_CARD(ea); } while (0)
 #define REX_GUEST_CAS_C(ea, p, e, d) (REX_CARD(ea), REX_GUEST_CAS(p, e, d))
 #endif  // REX_CARD
 ''' + END
@@ -161,7 +205,9 @@ def apply_line(lines, k, counts):
         out.append(line[pos:m.start()])
         out.append(name + '_C(')
         pos = m.end()
-        key = 'BANJO_HOT' if name.startswith('BANJO_HOT') else (name.split('_U')[0] if '_U' in name else name)
+        key = ('BANJO_HOT' if name.startswith('BANJO_HOT') else
+               'REX_STORE_D' if name == 'REX_STORE_D_F32ANY' else 'REX_STORE' if name == 'REX_STORE_F32ANY' else
+               (name.split('_U')[0] if '_U' in name else name))
         counts[key] += 1
     out.append(line[pos:])
     line = ''.join(out)
@@ -189,7 +235,8 @@ def apply_line(lines, k, counts):
 
 UNDO = [
     (re.compile(r'\b(REX_STORE_D_U(?:8|16|32|64)|REX_STORE_U(?:8|16|32|64)|REX_STVLX|REX_STVRX|'
-                r'REX_MM_STORE_U(?:8|16|32|64)|BANJO_HOT_STORE_(?:D_)?U(?:8|16|32|64))_C\('), r'\1('),
+                r'REX_MM_STORE_U(?:8|16|32|64)|BANJO_HOT_STORE_(?:D_)?U(?:8|16|32|64)|'
+                r'REX_STORE_(?:D_)?F32ANY|BANJO_HOT_STORE_(?:D_)?F32ANY)_C\('), r'\1('),
     (re.compile(r'REX_CARD\(ea\), (?=simde_mm_store_si128|memset\()'), ''),
     (re.compile(r'REX_GUEST_CAS_C\(ea, '), 'REX_GUEST_CAS('),
 ]

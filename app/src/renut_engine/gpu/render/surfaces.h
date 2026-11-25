@@ -69,6 +69,9 @@ struct HostSurface : plume::Recycled<HostSurface> {
   // pitch that could be its restore's source, as of the target table's epoch 'sasrt_candidates_epoch' (0: not found yet).
   std::vector<HostSurface *> sasrt_restore_candidates;
   uint64_t sasrt_candidates_epoch = 0;
+  // sasrt-nx (2026-11-20, sasrt_rt2_color_alias_memo): ColorAliasesLocked's answer as of the target table's epoch.
+  mutable uint64_t sasrt_alias_epoch = 0;
+  mutable std::vector<HostSurface *> sasrt_aliases;
   // halo3-nx (2026-11-03): when it was last bound to draw to, and what of another format's target over the same EDRAM view it
   // holds (SyncColorViewLocked).
   uint64_t bound_serial = 0;
@@ -94,6 +97,10 @@ struct HostSurface : plume::Recycled<HostSurface> {
   // blur-nx (2026-11-10, port 76; its key 216: blur_renut_sample_grid_resolve): g_surface_write_seq at the last draw into
   // it (not its clears).
   uint64_t blur_draw_seq = 0;
+  // Port 179 (from fnxf_xiii, 2026-10-31; banjo_renut_edram_carry, off): the frame a colour target was first drawn in and
+  // the frame it was last cleared in, and the order of those writes (render/draw.cpp CarryEdramBeforeDrawLocked).
+  uint64_t carry_drawn_frame = UINT64_MAX, carry_cleared_frame = UINT64_MAX;
+  uint64_t carry_order = 0;
   // vivapinata-nx (2026-11-11, vivapinata_resolve_from_sibling / A/B 87): the last multisampled colour resolve of this target
   // that the API drew (ResolveStateLocked): its destination, that destination's resolve signature then, this target's
   // generation and writes then, and the rect in host pixels (the destination's texels at the same coordinates). A later
@@ -244,6 +251,9 @@ uint64_t FramebufferEpochLocked();
 
 // Only if one exists already.
 HostSurface *FindHostSurfaceLocked(u32 surface_va);
+// renut-ultimate (2026-11-16, port 145; tw2de_nx's): kept unused targets past their time released (once a frame;
+// banjo_renut_keep_unused_targets).
+void SweepUnusedTargetsLocked();
 
 // The other color targets over the same EDRAM view as 'surface' (base tile,
 // pitch, samples and scale), in another host format: on the console one

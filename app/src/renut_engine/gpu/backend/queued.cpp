@@ -2,8 +2,10 @@
  * @file    gpu/backend/queued.cpp
  */
 #include "renut_engine/gpu/backend/queued.h"
+#include "renut_engine/gpu/host_batch.h"  // blur-nx (2026-11-18, the Renut host batch)
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstddef>
@@ -20,13 +22,18 @@
 #include <rex/cvar.h>
 
 #include "renut_engine/gpu/guest/callbacks.h"
+#include "renut_engine/gpu/guest/guest_records.h"  // blur-nx (2026-11-13, #13): records::Lookup
+#include "renut_engine/gpu/guest/resources.h"      // blur-nx (2026-11-13, #13): ShaderRecord
+#include "renut_engine/gpu/shaders/shader_cache.h"  // blur-nx (2026-11-13, #13): ShaderCacheEntry::floatConstants
 #include "renut_engine/gpu/guest/command_buffers.h"
 #include "renut_engine/gpu/d3d/d3d.h"
 #include "renut_engine/gpu/d3d/d3d_native.h"  // fable2-nx: ApplyRingRegisters
+#include "renut_engine/gpu/d3d/d3d_native.h"  // banjo-nx (2026-11-23): TileCount, Flags (banjo_renut_tile_twin_merge)
 #include "renut_engine/gpu/guest/guest_memory.h"
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/render/surfaces.h"  // blur-nx (2026-11-10, port 76; its key 215): StackHeaderSet
 #include "renut_engine/gpu/backend/render_thread.h"
+#include "renut_engine/gpu/banjo_renut_record.h"  // fable2-nx (2026-11-25): record::ReportCounter (occlusion queries)
 #include "renut_engine/gpu/banjo_renut_tuning.h"
 #include "renut_engine/gpu/line_compare.h"
 #include "renut_engine/gpu/backend/video.h"  // fable2-nx (2026-11-23): occlusion queries
@@ -35,6 +42,8 @@
 #if defined(PLUME_DEKO3D)
 #include <plume_deko3d.h>
 #endif
+
+REXCVAR_DECLARE(bool, blur_renut_flush_fast_local);  // blur-nx (2026-11-17): defined in guest/command_buffers.cpp
 
 // banjo-nx (2026-10-20, from sa2-nx): see SnapshotKind below.
 REXCVAR_DEFINE_BOOL(banjo_renut_snapshot_deltas, true, "Banjo/Enhancements",
@@ -77,6 +86,28 @@ REXCVAR_DEFINE_BOOL(banjo_renut_delta_prefetch, true, "Banjo/Enhancements",
                     "other work instead of stalling the compare (CaptureDelta's samples were its loads in the v5 console "
                     "storm). A hint only: the same data. In-run A/B target 84 (74 in bangaio-nx)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// blur-nx (2026-11-13, #13 of Blur's docs/cpu-near-exact-50-1113.md, found exact): a Begin*Vertices draw's capture (a
+// whole device, queued later than made) copies of the float constants only the registers its two shaders read. The
+// render thread reads a whole capture's state for that draw alone (DeviceForDraw), and of the 8 KB of float constants
+// only the registers in the bound shaders' cache entries (ShaderCacheEntry::floatConstants: UploadFloatConstants'
+// vs_used / ps_used, all of them when the shader indexes the register file); every other byte is copied. A shader
+// missing from the cache, or neither a renderer record nor an in-place XGRegister shader: the whole device as before.
+// (The first census found none narrowed: every shader of Blur's is an in-place one, which only the render thread's map
+// held; the game threads now keep their own, InPlaceShaderEntry.) Blur's console races: ~3,000 such draws a second at 12.9 KB each on the Game Master.
+REXCVAR_DEFINE_BOOL(banjo_renut_deferred_narrow, true, "Banjo/Enhancements",
+                    "Renut's renderer: a Begin*Vertices draw's device capture copies of the float constants only the "
+                    "registers its vertex and pixel shaders read (their cache entries' masks; the whole device when a "
+                    "shader has none). Exact: the render thread reads no other register of that capture. Off: the "
+                    "whole device, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_renut_deferred_narrow_groups, true, "Banjo/Enhancements",
+                    "banjo_renut_deferred_narrow (blur-nx #53): the float constants copied by the 64-byte groups "
+                    "(four registers) the shaders read, not up to their highest register. Exact either way")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_renut_deferred_narrow_poison, false, "Banjo/Debug",
+                    "banjo_renut_deferred_narrow's check: the float constant registers a narrowed capture leaves out "
+                    "are filled with NaNs (a render path that read them would draw visibly wrong)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(banjo_renut_snapshot_deltas_narrow, true, "Banjo/Enhancements",
                     "Renut's renderer (banjo_renut_snapshot_deltas): the game thread compares only the device chunks the "
                     "render thread reads (39 of 71 in N&B, 40 of 77 in SA2: not the dirty masks, ring pointers and call tables before the fetch "
@@ -100,7 +131,9 @@ REXCVAR_DEFINE_BOOL(banjo_renut_deferred_chain, false, "Banjo/Enhancements",
                     "FlushDeferredVertices, before any other draw of the device). OFF by default since package 36q: the "
                     "chain is one for every device, and N&B draws on two (from two threads): a draw of the other device "
                     "made and queued between a Begin*Vertices delta and its queueing puts that delta on the wrong device "
-                    "(emulator hangs in 4 of 8 runs with it on, 0 before). Off: a whole copy, as sa2-nx has it")
+                    "(emulator hangs in 4 of 8 runs with it on, 0 before). Off: a whole copy, as sa2-nx has it. blur-nx (2026-11-13, "
+                    "#51): while a Begin*Vertices delta waits for its vertices, a draw of any other device is a whole "
+                    "capture outside the chain, so two devices keep the chain's order (Blur draws on one)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace renut::gpu {
@@ -140,10 +173,20 @@ struct DrawCapture {
   u32 dest_texture_va = 0, dest_level = 0, dest_slice = 0;
   i32 dest_x = 0, dest_y = 0;
   d3d::TextureFetchConstant dest_format{};
+  u32 resolve_targets[kResolveTargetWords] = {};  // blur-nx (2026-11-13, M-35): a resolve's device words (draw.h)
+  float clear_viewport[4] = {};                    // blur-nx (2026-11-13, #55): a clear's viewport (draw.h)
   u32 held = 0;  // bangaio-nx (2026-10-29): the bytes it holds, set when it goes back to the pool (CapturePool::Give)
   // blur-nx (2026-11-10, port 76; its key 215: blur_renut_stack_surface_headers): the headers of the stack surfaces bound
   // as targets when this draw, clear or resolve was captured (render/surfaces.h); count 0 nearly always.
   StackHeaderSet stack_headers;
+  // blur-nx (2026-11-13, #13, banjo_renut_deferred_narrow): a narrowed whole capture's device (allocated once per
+  // pooled capture, not initialised: a narrowed capture writes every byte the render thread reads); 'narrowed' says the
+  // draw reads it instead of 'state' (cleared when the capture goes back to the pool).
+  std::unique_ptr<u8[]> narrow;
+  bool narrowed = false;
+  // blur-nx (2026-11-13, #13's fix): the cache entries whose registers a narrowed capture holds (NarrowCheckLocked).
+  const ShaderCacheEntry *narrow_vs = nullptr;
+  const ShaderCacheEntry *narrow_ps = nullptr;
 };
 
 // banjo-nx (banjo_renut_capture_pool): a draw's capture comes from a pool and goes back to it once the render thread
@@ -219,6 +262,7 @@ public:
     if (banjo::renut_gpu::CapturePoolOn()) {
       capture->vertices.clear();
       capture->indices.clear();
+      capture->narrowed = false;  // blur-nx (2026-11-13, #13)
       capture->held = HeldBytes(*capture);  // its lines are this thread's now: not read again under the lock
       if (CaptureBatchesOn() && render_thread) {
         std::vector<DrawCapture *> &given = render_given_;
@@ -262,7 +306,7 @@ private:
 
   static u32 HeldBytes(const DrawCapture &c) {
     return u32(sizeof(DrawCapture) + c.state.capacity() + c.vertices.capacity() + c.indices.capacity() +
-               c.verify.capacity());
+               c.verify.capacity() + (c.narrow ? d3d::kDeviceSnapshotSize : 0));
   }
   // Under mutex_; 'small': SmallCapturesOn().
   bool KeepLocked(DrawCapture *c, bool small) {
@@ -354,6 +398,15 @@ DeferredSlots g_deferred;
 // (FlushDeferredVertices: every hook calls it first). A Begin*Vertices draw is flushed by the next hook of its device,
 // on the thread that made it, which sees the count in program order.
 std::atomic<size_t> g_deferred_count{0};
+// blur-nx (2026-11-17, the 24-hour run; blur_renut_flush_fast_local): the same count per device, hashed (a collision
+// only sends a hook through the locks), so one device's hooks are not sent through the chain's lock and the deferred
+// map's by another device's Begin*Vertices draw. Changed under g_deferred_mutex with the map; read without it by the
+// thread that flushes its own device, as the count above.
+constexpr u32 kDeferredSlots = 64;
+std::atomic<u32> g_deferred_by_device[kDeferredSlots];
+inline std::atomic<u32> &DeferredOf(u32 device_va) { return g_deferred_by_device[(device_va * 2654435761u) >> 26]; }
+// blur-nx (2026-11-13, #52's census): FlushDeferredVertices' copies, for the snapshot report.
+std::atomic<uint64_t> g_deferred_vertex_bytes{0}, g_deferred_vertex_draws{0};
 
 // banjo-nx (2026-10-20, from sa2-nx, banjo_renut_snapshot_deltas): the delta chain's layout. Of the device's first kDeviceSnapshotSize
 // bytes, the float constants (VertexShaderF, PixelShaderF: 8 KB, two thirds) go by the groups m_Pending marks dirty
@@ -513,6 +566,15 @@ struct DeltaChain {
   uint64_t vs = 0, ps = 0;              // groups whole captures consumed since its last draw: they follow
   uint64_t deltas = 0, rebases = 0, bytes = 0, chunks = 0, groups = 0;  // the 10 s report's
   uint64_t whole = 0;  // banjo-nx (from sa2-nx): whole captures outside the chain (Begin*Vertices draws), under the lock too
+  uint64_t narrowed = 0, narrowed_bytes = 0;  // blur-nx (2026-11-13, #13): of those, narrowed, and the bytes they copied
+  uint64_t narrowed_prefix_bytes = 0;         // ... what #13's prefixes alone would have copied (#53 / #54's census)
+  // blur-nx (2026-11-13, #51, banjo_renut_deferred_chain): the device whose Begin*Vertices delta of the chain waits for
+  // its vertices (0: none). While one waits, a draw of any other device is a whole capture outside the chain: queued
+  // before that delta, it would have been applied ahead of it on the render thread (N&B's hangs with the chain on and
+  // two devices drawing from two threads), so the chain's order stays its queue order however many devices draw.
+  // 'cross': the draws made whole that way (the 10 s report's).
+  u32 deferred_device = 0;
+  uint64_t cross = 0;
   alignas(64) u8 shadow[d3d::kDeviceSnapshotSize];  // the device at its last draw (the chunks)
   // bangaio-nx (2026-10-29, banjo_renut_small_captures): each delta is written here, then copied into its capture at its
   // size. The same lines every draw: they stay in the game thread's cache.
@@ -523,6 +585,48 @@ DeltaChain g_delta;
 // The render thread's side: the device the chain's draws rebuild.
 alignas(64) u8 g_delta_device[d3d::kDeviceSnapshotSize];
 std::atomic<uint64_t> g_delta_verified{0}, g_delta_differ{0};
+
+// blur-nx (2026-11-13, M-31 of docs/cpu-moonshots-50-1113.md and its audit: the census first). The devices that draw and
+// the threads they draw from, since the start (at most four of each; more counted apart): banjo_renut_deferred_chain is
+// off by default because one chain serves every device and N&B drew on two devices from two threads. A thread notes
+// itself and a device only when its device changes, so a draw pays one thread-local compare.
+std::atomic<uint64_t> g_census_devices[4]{}, g_census_threads[4]{};
+std::atomic<uint32_t> g_census_more_devices{0}, g_census_more_threads{0};
+void CensusNote(std::atomic<uint64_t> (&set)[4], std::atomic<uint32_t> &more, uint64_t value) {
+  for (auto &slot : set) {
+    uint64_t seen = slot.load(std::memory_order_relaxed);
+    if (seen == value)
+      return;
+    if (seen == 0 && (slot.compare_exchange_strong(seen, value, std::memory_order_relaxed) || seen == value))
+      return;
+  }
+  more.fetch_add(1, std::memory_order_relaxed);
+}
+void NoteDrawer(u32 device_va) {
+  thread_local u32 last_device = 0;
+  if (last_device == device_va)
+    return;
+  if (last_device == 0) {
+    static thread_local char tag;  // (its address: one per thread)
+    CensusNote(g_census_threads, g_census_more_threads, uint64_t(reinterpret_cast<uintptr_t>(&tag)));
+  }
+  last_device = device_va;
+  CensusNote(g_census_devices, g_census_more_devices, device_va);
+}
+std::string DrawerCensus() {
+  std::string devices;
+  uint32_t n_devices = 0, n_threads = 0;
+  for (auto &slot : g_census_devices)
+    if (const uint64_t v = slot.load(std::memory_order_relaxed)) {
+      devices += fmt::format("{}{:08X}", n_devices ? " " : "", uint32_t(v));
+      ++n_devices;
+    }
+  for (auto &slot : g_census_threads)
+    n_threads += slot.load(std::memory_order_relaxed) != 0;
+  return fmt::format("; drawing since the start: {} devices ({}{}), {} threads{}", n_devices, devices,
+                     g_census_more_devices.load(std::memory_order_relaxed) ? " and more" : "", n_threads,
+                     g_census_more_threads.load(std::memory_order_relaxed) ? " and more" : "");
+}
 // banjo_renut_snapshot_deltas_constants: the chain as a replay of the constant uploads' tracking (draw.h,
 // ReplayConstants): its id (a new one at each whole copy; the top bit keeps it apart from the command buffers'
 // replays, numbered from 1) and the float constant groups written since the upload last consumed them.
@@ -597,7 +701,7 @@ const u8 *DeviceForDraw(const DrawCapture &capture) {
       g_chain_hint.changed[0] = g_chain_hint.changed[1] = ~uint64_t(0);
       g_chain_hint.fields = kFieldsAll;
     }
-    return capture.state.data();
+    return capture.narrowed ? capture.narrow.get() : capture.state.data();  // blur-nx (2026-11-13, #13)
   }
   if (capture.snapshot == SnapshotKind::Rebase) {
     std::memcpy(g_delta_device, capture.state.data(), d3d::kDeviceSnapshotSize);
@@ -670,16 +774,39 @@ const u8 *DeviceForDraw(const DrawCapture &capture) {
   return g_delta_device;
 }
 
+// blur-nx (2026-11-13, #13's fix): a narrowed capture's shaders as the render thread finds them for its draw. One whose
+// cache entry is not the one the capture was narrowed for (the guest re-registering a shader in the memory of one a
+// queued draw uses) reads registers the capture may have left out: counted, and reported every 10 s.
+std::atomic<uint64_t> g_narrow_checked{0}, g_narrow_differ{0};
+
+void NarrowCheckLocked(const DrawCapture &capture, const u8 *device) {
+  auto word = [device](u32 offset) {
+    u32 v;
+    std::memcpy(&v, device + offset, 4);
+    return __builtin_bswap32(v);
+  };
+  const ShaderRecord *vs = FindShaderLocked(word(d3d::kDeviceOffsetVertexShader), RecordKind::VertexShader);
+  const ShaderRecord *ps = FindShaderLocked(word(d3d::kDeviceOffsetPixelShader), RecordKind::PixelShader);
+  // A shader the draw cannot use (none found, or no cache entry: GetHostShader gives none) reads no register.
+  const bool vs_differs = vs && vs->entry && vs->entry != capture.narrow_vs;
+  const bool ps_differs = ps && ps->entry && ps->entry != capture.narrow_ps;
+  g_narrow_checked.fetch_add(1, std::memory_order_relaxed);
+  if (vs_differs || ps_differs)
+    g_narrow_differ.fetch_add(1, std::memory_order_relaxed);
+}
+
 void QueueCapture(DrawCapture *capture) {
   // banjo-nx (2026-10-20, from sa2-nx, banjo_renut_prefetch_next): the capture and its device bytes, written on the game thread's core,
   // are fetched into the render thread's cache while it does the item before this one.
-  render_thread::QueuePrefetched(capture, capture->state.data(), [capture] {
+  render_thread::QueuePrefetched(capture, capture->narrowed ? capture->narrow.get() : capture->state.data(), [capture] {
     DrawCall call = capture->call;
     if (!capture->vertices.empty())
       call.up_vertices = capture->vertices.data();
     if (!capture->indices.empty())
       call.up_indices = capture->indices.data();
     const u8 *device = DeviceForDraw(*capture);
+    if (capture->narrowed)  // blur-nx (2026-11-13, #13's fix)
+      NarrowCheckLocked(*capture, device);
     banjo::renut_gpu::CountDrawSource(0);
     // blur-nx (2026-11-10, port 76; its key 215)
     SetReplayStackHeaders(capture->stack_headers.count ? &capture->stack_headers : nullptr);
@@ -703,6 +830,171 @@ void QueueCapture(DrawCapture *capture) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// banjo-nx (2026-11-23, the Nutty Acres GPU work): banjo_renut_tile_twin_merge (render/draw.cpp says what is drawn)
+// ---------------------------------------------------------------------------
+// On the game thread: a tessellated draw predicated to one tile that is not the last (N&B's sea, sub_82386BF8: the
+// upper tile's draw) is held back instead of queued. The next draw, when it is the same call for another single tile
+// of the same device, goes with it as one item; anything else first queues the held one alone: another draw (here,
+// under the chain's lock, before it is queued), any other queue or wait (render_thread's before-push hook), so the
+// render thread gets the draws and everything else in the order the game made them. The pair's item rebuilds both
+// devices from the chain, draws the first for both tiles when DrawStateLocked can, and else draws the two as before.
+struct HeldTwin {
+  DrawCapture *capture = nullptr;
+  u32 device_va = 0;
+  int tile = -1;
+};
+std::mutex g_twin_mutex;
+HeldTwin g_twin_held;                    // under g_twin_mutex
+std::atomic<bool> g_twin_holding{false};  // a capture is held (the hook's check without the lock)
+thread_local bool t_twin_queueing = false;  // this thread queues under g_twin_mutex: its hook call has nothing to do
+std::atomic<uint64_t> g_twin_pairs_queued{0};
+// banjo-nx (2026-11-23, the first console run): the holds and how each ended (the 10 s twin line, TwinQueueCensus).
+std::atomic<uint64_t> g_twin_holds{0}, g_twin_flush_hook{0}, g_twin_flush_draw{0}, g_twin_flush_draw_tess{0};
+
+// The one tile the device's draws are predicated to while tiling (vivapinata_tiles_once's test), or -1.
+int TwinTileOf(u32 device_va, u32 &tiles) {
+  const u8 *device = GuestPtr<const u8>(device_va);
+  if (!device)
+    return -1;
+  tiles = *reinterpret_cast<const be_u32 *>(device + native::off::TileCount);
+  if (!(device[native::off::Flags] & 0x20) || tiles < 2 || tiles > 16)
+    return -1;
+  const u32 mask = *reinterpret_cast<const be_u32 *>(device + d3d::kDeviceOffsetPredication);
+  if (!mask)
+    return -1;
+  int tile = -1;
+  for (u32 i = 0; i < tiles; ++i) {
+    if (!(mask & (3u << (2 * i))))
+      continue;
+    if (tile >= 0)
+      return -1;
+    tile = int(i);
+  }
+  return tile;
+}
+
+// The render thread's item for a held draw and its twin.
+void QueueTwinPair(DrawCapture *a, DrawCapture *b) {
+  g_twin_pairs_queued.fetch_add(1, std::memory_order_relaxed);
+  render_thread::QueuePrefetched(a, a->narrowed ? a->narrow.get() : a->state.data(), [a, b] {
+    // The first's device kept: the chain's device moves on to the second's.
+    static std::array<u8, d3d::kDeviceSnapshotSize> image;  // render thread
+    const u8 *device_a = DeviceForDraw(*a);
+    if (a->narrowed)
+      NarrowCheckLocked(*a, device_a);
+    std::memcpy(image.data(), device_a, image.size());
+    const u8 *device_b = DeviceForDraw(*b);
+    if (b->narrowed)
+      NarrowCheckLocked(*b, device_b);
+    banjo::renut_gpu::CountDrawSource(0);
+    banjo::renut_gpu::CountDrawSource(0);
+    const auto draw = [](DrawCapture *c, const u8 *device) {
+      // No chain hint: the second's delta is in the chain's device already, so the first is not the next of the chain's
+      // draws, and the second's draw follows a draw of another device image (the reuses then make everything again).
+      g_chain_hint = {};
+      SetReplayStackHeaders(c->stack_headers.count ? &c->stack_headers : nullptr);
+      if (c->binding) {
+        ApplyBindingLocked(c->binding);
+        c->binding = 0;
+      }
+      if (c->snapshot != SnapshotKind::Whole && ChainConstantsOn()) {
+        const ReplayConstants chain{nullptr, ~uint64_t(0), ~uint64_t(0), &g_chain_vs_dirty, &g_chain_ps_dirty,
+                                    g_chain_id};
+        DrawStateLocked(device, c->call, &chain);
+      } else {
+        DrawStateLocked(device, c->call);
+      }
+      // The constant uploads compare every group at the next draw: the first's draw took the groups the second's delta
+      // wrote with the first's values.
+      g_chain_vs_dirty = g_chain_ps_dirty = ~uint64_t(0);
+      g_chain_hint = {};
+      SetReplayStackHeaders(nullptr);
+    };
+    g_tile_twin.device_b = device_b;
+    g_tile_twin.call_b = b->call;
+    g_tile_twin.active = true;
+    g_tile_twin.merged = false;
+    draw(a, image.data());
+    const bool merged = g_tile_twin.merged;
+    g_tile_twin = {};
+    if (!merged)
+      draw(b, device_b);
+    g_capture_pool.Give(a, true);
+    g_capture_pool.Give(b, true);
+  });
+}
+
+// The held draw queued alone (render_thread's before-push hook: before anything else is queued or waited for).
+void FlushHeldTwin() {
+  if (t_twin_queueing || !g_twin_holding.load(std::memory_order_acquire))
+    return;
+  std::lock_guard lock(g_twin_mutex);
+  if (!g_twin_held.capture)
+    return;
+  DrawCapture *held = g_twin_held.capture;
+  g_twin_held = {};
+  g_twin_holding.store(false, std::memory_order_release);
+  g_twin_flush_hook.fetch_add(1, std::memory_order_relaxed);
+  t_twin_queueing = true;
+  QueueCapture(held);
+  t_twin_queueing = false;
+}
+
+// QueueDraw's capture (made under the chain's lock): true when it was taken (held, or queued with the held one).
+bool TakeTwinCapture(u32 device_va, const DrawCall &call, DrawCapture *capture) {
+  static const bool on = [] {
+    const bool v = TileTwinMergeOn() && DeltasOn();
+    if (v)
+      render_thread::SetBeforePushHook2(&FlushHeldTwin);
+    return v;
+  }();
+  if (!on)
+    return false;
+  u32 tiles = 0;
+  // A/B 204 (banjo-nx's 320, numbered below 256 here: port 188; banjo_renut_ab_target): the off half holds nothing (a draw held when it starts goes alone).
+  const int tile = call.tessellation && !call.up_vertices && !call.up_indices && capture->vertices.empty() &&
+                           capture->indices.empty() && banjo::renut_gpu::g_ab_off_plain != 204
+                       ? TwinTileOf(device_va, tiles)
+                       : -1;
+  if (tile < 0 && !g_twin_holding.load(std::memory_order_acquire))
+    return false;
+  // A tile run vivapinata_tiles_once holds (queued before this draw) goes first: at most one thing held at a time.
+  if (tile >= 0) {
+    t_twin_queueing = true;
+    render_thread::RunBeforePushHook(1);
+    t_twin_queueing = false;
+  }
+  std::lock_guard lock(g_twin_mutex);
+  t_twin_queueing = true;
+  if (DrawCapture *held = g_twin_held.capture) {
+    const HeldTwin h = g_twin_held;
+    g_twin_held = {};
+    g_twin_holding.store(false, std::memory_order_release);
+    const DrawCall &c = held->call;
+    if (tile >= 0 && h.device_va == device_va && h.tile != tile && c.primitive == call.primitive &&
+        c.indexed == call.indexed && c.start_vertex == call.start_vertex && c.count == call.count &&
+        c.base_vertex == call.base_vertex && c.start_index == call.start_index && c.tessellation) {
+      QueueTwinPair(held, capture);
+      t_twin_queueing = false;
+      return true;
+    }
+    g_twin_flush_draw.fetch_add(1, std::memory_order_relaxed);
+    if (call.tessellation)
+      g_twin_flush_draw_tess.fetch_add(1, std::memory_order_relaxed);
+    QueueCapture(held);
+  }
+  if (tile >= 0 && u32(tile) + 1 < tiles) {
+    g_twin_holds.fetch_add(1, std::memory_order_relaxed);
+    g_twin_held = {capture, device_va, tile};
+    g_twin_holding.store(true, std::memory_order_release);
+    t_twin_queueing = false;
+    return true;
+  }
+  t_twin_queueing = false;
+  return false;
+}
+
 DrawCapture *Capture(u32 device_va, const DrawCall &call) {
   auto *device = GuestPtr<d3d::Device>(device_va);
   if (!device)
@@ -719,6 +1011,125 @@ DrawCapture *Capture(u32 device_va, const DrawCall &call) {
   capture->call = call;
   capture->call.up_vertices = nullptr;
   capture->call.up_indices = nullptr;
+  return capture;
+}
+
+// blur-nx (2026-11-13, #13, banjo_renut_deferred_narrow): the float constant registers the bound shader at 'offset' reads,
+// as a count from register 0 (its highest one + 1); false when it is neither a renderer record of 'kind' nor an in-place
+// shader of 'kind' (FindShaderLocked's order: the record registry, then the in-place shaders), or has no cache entry.
+// 'none_ok': a null shader reads none (the pixel shader: the render thread then uses kNoRegisters). 'out': the entry.
+bool ShaderRegisters(const u8 *device, u32 offset, RecordKind kind, bool none_ok, u32 &count, uint64_t &groups,
+                     const ShaderCacheEntry *&out) {
+  const u32 va = (u32(device[offset]) << 24) | (u32(device[offset + 1]) << 16) | (u32(device[offset + 2]) << 8) |
+                 u32(device[offset + 3]);
+  groups = 0;
+  out = nullptr;
+  if (!va) {
+    count = 0;
+    return none_ok;
+  }
+  RecordKind found;
+  const ShaderCacheEntry *entry = nullptr;
+  if (records::Lookup(va, &found) && found == kind) {
+    const auto *record = GuestPtr<const ShaderRecord>(va);
+    if (!record)
+      return false;
+    entry = record->entry;
+  } else if (!InPlaceShaderEntry(va, kind, &entry)) {  // blur-nx (2026-11-13, #13's fix): Blur's shaders
+    return false;
+  }
+  if (!entry)
+    return false;
+  out = entry;
+  count = 0;
+  for (int w = 7; w >= 0; --w) {
+    if (const u32 bits = entry->floatConstants[w]) {
+      count = u32(w) * 32 + 32 - u32(__builtin_clz(bits));
+      break;
+    }
+  }
+  // blur-nx (2026-11-13, #53): the 64-byte groups (four registers) holding a register it reads.
+  for (u32 w = 0; w < 8; ++w) {
+    const u32 bits = entry->floatConstants[w];
+    for (u32 g = 0; g < 8; ++g)
+      if ((bits >> (4 * g)) & 0xFu) groups |= uint64_t(1) << (w * 8 + g);
+  }
+  return true;
+}
+
+// blur-nx (2026-11-13, #53): the groups of 'groups' (bit g = registers 4g..4g+3, 64 bytes) copied in runs; the bytes.
+size_t CopyGroups(u8 *out, const u8 *bytes, u32 base, uint64_t groups) {
+  size_t copied = 0;
+  while (groups) {
+    const u32 first = u32(__builtin_ctzll(groups));
+    const uint64_t rest = groups >> first;
+    const u32 run = rest == ~uint64_t(0) >> first ? 64 - first : u32(__builtin_ctzll(~rest));
+    std::memcpy(out + base + first * 64, bytes + base + first * 64, size_t(run) * 64);
+    copied += size_t(run) * 64;
+    groups = first + run >= 64 ? 0 : groups & ~((uint64_t(1) << (first + run)) - 1);
+  }
+  return copied;
+}
+
+// The capture of a Begin*Vertices draw: Capture()'s, with only the float constant registers its shaders read (the
+// rest of the device whole); Capture() itself when a shader's registers are not known.
+DrawCapture *CaptureDeferred(u32 device_va, const DrawCall &call) {
+  static const bool narrow_on = REXCVAR_GET(banjo_renut_deferred_narrow);
+  if (!narrow_on)
+    return Capture(device_va, call);
+  auto *device = GuestPtr<d3d::Device>(device_va);
+  if (!device)
+    return nullptr;
+  const auto *bytes = reinterpret_cast<const u8 *>(device);
+  u32 vs_regs = 0, ps_regs = 0;
+  uint64_t vs_groups = 0, ps_groups = 0;
+  const ShaderCacheEntry *vs_entry = nullptr, *ps_entry = nullptr;
+  if (!ShaderRegisters(bytes, d3d::kDeviceOffsetVertexShader, RecordKind::VertexShader, false, vs_regs, vs_groups,
+                       vs_entry) ||
+      !ShaderRegisters(bytes, d3d::kDeviceOffsetPixelShader, RecordKind::PixelShader, true, ps_regs, ps_groups,
+                       ps_entry))
+    return Capture(device_va, call);
+  ClearPending(device);
+  DrawCapture *capture = g_capture_pool.Take();
+  capture->narrow_vs = vs_entry;  // blur-nx (2026-11-13, #13's fix): checked on the render thread (NarrowCheckLocked)
+  capture->narrow_ps = ps_entry;
+  if (!capture->narrow)
+    capture->narrow.reset(new u8[d3d::kDeviceSnapshotSize]);
+  u8 *out = capture->narrow.get();
+  static const bool poison = REXCVAR_GET(banjo_renut_deferred_narrow_poison);
+  if (poison)  // NaNs (0xFF bytes) in every byte left out
+    std::memset(out, 0xFF, d3d::kDeviceSnapshotSize);
+  // blur-nx (2026-11-13, #54): the device's never-read ranges left out too (the delta chain's narrow map, which
+  // banjo_renut_snapshot_deltas_verify checks: the dirty masks, ring pointers and call tables before the fetch
+  // constants, the private words 10880-11775); banjo_renut_deferred_narrow_groups: #53's groups, else the prefixes.
+  static const bool groups_on = REXCVAR_GET(banjo_renut_deferred_narrow_groups);
+  size_t copied = 0;
+  std::memcpy(out + kDeltaUnreadEnd, bytes + kDeltaUnreadEnd, kDeltaVertexF - kDeltaUnreadEnd);
+  copied += kDeltaVertexF - kDeltaUnreadEnd;
+  if (groups_on) {
+    copied += CopyGroups(out, bytes, kDeltaVertexF, vs_groups);
+    copied += CopyGroups(out, bytes, kDeltaPixelF, ps_groups);
+  } else {
+    std::memcpy(out + kDeltaVertexF, bytes + kDeltaVertexF, size_t(vs_regs) * 16);
+    std::memcpy(out + kDeltaPixelF, bytes + kDeltaPixelF, size_t(ps_regs) * 16);
+    copied += size_t(vs_regs + ps_regs) * 16;
+  }
+  std::memcpy(out + kDeltaTailBegin, bytes + kDeltaTailBegin, kDeltaPrivateUnreadBegin - kDeltaTailBegin);
+  std::memcpy(out + kDeltaPrivateUnreadEnd, bytes + kDeltaPrivateUnreadEnd,
+              d3d::kDeviceSnapshotSize - kDeltaPrivateUnreadEnd);
+  copied += (kDeltaPrivateUnreadBegin - kDeltaTailBegin) + (d3d::kDeviceSnapshotSize - kDeltaPrivateUnreadEnd);
+  capture->narrowed = true;
+  capture->snapshot = SnapshotKind::Whole;
+  CaptureStackHeaders(bytes, capture->stack_headers);  // blur-nx (2026-11-10, port 76; its key 215)
+  capture->verify.clear();
+  capture->call = call;
+  capture->call.up_vertices = nullptr;
+  capture->call.up_indices = nullptr;
+  if (DeltasOn()) {  // (the caller holds g_delta.mutex then)
+    ++g_delta.narrowed;
+    g_delta.narrowed_bytes += copied;
+    g_delta.narrowed_prefix_bytes += d3d::kDeviceSnapshotSize - size_t(512 - vs_regs - ps_regs) * 16;  // #13's alone
+  }
   return capture;
 }
 
@@ -829,6 +1240,16 @@ DrawCapture *CaptureDelta(u32 device_va, const DrawCall &call) {
 
 } // namespace
 
+// banjo-nx (2026-11-23, banjo_renut_tile_twin_merge): the game thread's side, for render/draw.cpp's 10 s twin line.
+std::string TwinQueueCensus() {
+  return fmt::format("; held {}: queued with its twin {}, alone before another draw {} ({} tessellated), alone before "
+                     "other work {}",
+                     g_twin_holds.load(std::memory_order_relaxed), g_twin_pairs_queued.load(std::memory_order_relaxed),
+                     g_twin_flush_draw.load(std::memory_order_relaxed),
+                     g_twin_flush_draw_tess.load(std::memory_order_relaxed),
+                     g_twin_flush_hook.load(std::memory_order_relaxed));
+}
+
 void SnapshotDeltasNewFrame() {
   if (!DeltasOn())
     return;
@@ -852,11 +1273,17 @@ void ForgetSnapshotDeltas(const void *device) {
 std::string SnapshotDeltaReport() {
   if (!DeltasOn())
     return {};
-  uint64_t deltas, rebases, bytes, chunks, groups, whole;
+  uint64_t deltas, rebases, bytes, chunks, groups, whole, narrowed, narrowed_bytes, narrowed_prefix, cross;
   {
     std::lock_guard lock(g_delta.mutex);
     whole = g_delta.whole;
     g_delta.whole = 0;
+    cross = g_delta.cross;  // blur-nx (2026-11-13, #51)
+    g_delta.cross = 0;
+    narrowed = g_delta.narrowed;  // blur-nx (2026-11-13, #13)
+    narrowed_bytes = g_delta.narrowed_bytes;
+    narrowed_prefix = g_delta.narrowed_prefix_bytes;
+    g_delta.narrowed = g_delta.narrowed_bytes = g_delta.narrowed_prefix_bytes = 0;
     deltas = g_delta.deltas;
     rebases = g_delta.rebases;
     bytes = g_delta.bytes;
@@ -871,9 +1298,21 @@ std::string SnapshotDeltaReport() {
   std::string line = fmt::format(
       "device snapshots (banjo_renut_snapshot_deltas): {} draws, {:.0f} bytes kept a draw on average (the whole device "
       "is {}); {:.1f} chunks and {:.1f} constant groups a delta; {} whole copies (the frames' first draws); {} "
-      "Begin*Vertices draws as whole copies",
+      "Begin*Vertices draws as whole copies ({} of them narrowed to their shaders' float constants, {:.0f} bytes a "
+      "copy, {:.0f} with the prefixes alone; banjo_renut_deferred_narrow; {} checked on the render thread, {} drawn "
+      "with other shaders since the start); their vertex data {} draws, {:.0f} KB (#52's census)",
       draws, double(bytes) / double(draws), d3d::kDeviceSnapshotSize, double(chunks) / per_delta,
-      double(groups) / per_delta, rebases, whole);
+      double(groups) / per_delta, rebases, whole, narrowed,
+      narrowed ? double(narrowed_bytes) / double(narrowed) : 0.0,
+      narrowed ? double(narrowed_prefix) / double(narrowed) : 0.0,
+      g_narrow_checked.exchange(0, std::memory_order_relaxed),  // blur-nx (2026-11-13, #13's fix)
+      g_narrow_differ.load(std::memory_order_relaxed),
+      g_deferred_vertex_draws.exchange(0, std::memory_order_relaxed),
+      double(g_deferred_vertex_bytes.exchange(0, std::memory_order_relaxed)) / 1024.0);
+  if (DeferredChainOn())  // blur-nx (2026-11-13, #51)
+    line += fmt::format("; Begin*Vertices deltas in the chain (banjo_renut_deferred_chain), {} draws of another device "
+                        "made whole while one waited", cross);
+  line += DrawerCensus();  // blur-nx (2026-11-13, M-31)
   if (DeltasVerifyOn()) {
     line += fmt::format("; verify: {} draws checked, {} differ", g_delta_verified.exchange(0, std::memory_order_relaxed),
                         g_delta_differ.exchange(0, std::memory_order_relaxed));
@@ -899,6 +1338,19 @@ void PrefetchDeltaLines(u32 device_va) {
 }
 
 void QueueDraw(u32 device_va, const DrawCall &call, u32 up_vertex_bytes, u32 up_index_bytes) {
+  // blur-nx (2026-11-18, the census's #29): the immediate draws and their queueing time on the game threads.
+  struct HbScope {
+    bool on;
+    uint64_t t0;
+    ~HbScope() {
+      if (on) {
+        ::renut::gpu::host_batch::Add(::renut::gpu::host_batch::kImmediateDraws);
+        ::renut::gpu::host_batch::Add(::renut::gpu::host_batch::kImmediateTicks, ::renut::gpu::host_batch::Ticks() - t0);
+      }
+    }
+  } hb_scope{::renut::gpu::host_batch::CensusOn(),
+             ::renut::gpu::host_batch::CensusOn() ? ::renut::gpu::host_batch::Ticks() : 0};
+  NoteDrawer(device_va);  // blur-nx (2026-11-13, M-31's census)
   const bool deltas = DeltasOn();  // bangaio-nx (2026-10-29, ARM): its static's guard read once, not three times
   if (deltas && DeltaPrefetchOn())
     PrefetchDeltaLines(device_va);  // bangaio-nx (2026-10-29, v6)
@@ -908,7 +1360,11 @@ void QueueDraw(u32 device_va, const DrawCall &call, u32 up_vertex_bytes, u32 up_
   std::unique_lock<std::mutex> chain;
   if (deltas)
     chain = std::unique_lock<std::mutex>(g_delta.mutex);
-  DrawCapture *capture = deltas ? CaptureDelta(device_va, call) : Capture(device_va, call);
+  // blur-nx (2026-11-13, #51): another device's Begin*Vertices delta waiting: this draw whole, outside the chain.
+  const bool cross = deltas && g_delta.deferred_device && g_delta.deferred_device != device_va;
+  if (cross)
+    ++g_delta.cross;
+  DrawCapture *capture = deltas && !cross ? CaptureDelta(device_va, call) : Capture(device_va, call);
   if (!capture)
     return;
   if (call.up_vertices)
@@ -920,11 +1376,16 @@ void QueueDraw(u32 device_va, const DrawCall &call, u32 up_vertex_bytes, u32 up_
     std::memcpy(&vs_word, guest_device + d3d::kDeviceOffsetVertexShader, 4);
     capture->binding = LastBindingOf(__builtin_bswap32(vs_word));
   }
+  // banjo-nx (2026-11-23, banjo_renut_tile_twin_merge): an upper tile's tessellated draw held for its twin, or queued
+  // with the one held (a draw of the chain only: under its lock, in its order).
+  if (deltas && !cross && TakeTwinCapture(device_va, call, capture))
+    return;
   QueueCapture(capture);
 }
 
 void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u32 bytes, const u8 *index_scratch,
                        u32 index_bytes) {
+  NoteDrawer(device_va);  // blur-nx (2026-11-13, M-31's census)
   FlushDeferredVertices(device_va);
   RunReadyCallbacks();
   // banjo-nx (2026-10-20, from futari-nx, banjo_renut_deferred_chain): a Begin*Vertices draw of the chain too. Made under
@@ -932,26 +1393,36 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
   // (every hook flushes its device's deferred draw first), so the render thread still applies the chain in order. A
   // recorded op made meanwhile (NewOp: ForgetSnapshotDeltas) only makes the next capture a whole one, queued after this
   // draw. A draw that will not be queued (no scratch) stays a whole capture outside the chain.
+  // blur-nx (2026-11-13, #51): not while another device's delta waits (then a whole capture below, outside the chain).
   if (DeltasOn() && DeferredChainOn() && scratch) {
     std::unique_lock<std::mutex> chain(g_delta.mutex);
-    {
-      std::lock_guard lock(g_deferred_mutex);
-      if (DeferredDraw *it = g_deferred.find(device_va)) {
-        // One not flushed (FlushDeferredVertices above queued it, so none is expected): dropped as the original
-        // replaced it; its delta never reaches the render thread, so the chain rebases.
-        g_capture_pool.Give(it->capture);
-        g_deferred.erase(it);
-        g_deferred_count.store(g_deferred.size(), std::memory_order_release);
-        g_delta.device.store(nullptr, std::memory_order_relaxed);
+    if (g_delta.deferred_device && g_delta.deferred_device != device_va) {
+      ++g_delta.cross;  // blur-nx (2026-11-13, #51): the whole capture below
+    } else {
+      {
+        std::lock_guard lock(g_deferred_mutex);
+        if (DeferredDraw *it = g_deferred.find(device_va)) {
+          // One not flushed (FlushDeferredVertices above queued it, so none is expected): dropped as the original
+          // replaced it; its delta never reaches the render thread, so the chain rebases.
+          g_capture_pool.Give(it->capture);
+          g_deferred.erase(it);
+          DeferredOf(device_va).fetch_sub(1, std::memory_order_acq_rel);  // blur-nx (2026-11-17)
+          g_deferred_count.store(g_deferred.size(), std::memory_order_release);
+          g_delta.device.store(nullptr, std::memory_order_relaxed);
+        }
       }
-    }
-    DrawCapture *capture = CaptureDelta(device_va, call);
-    if (!capture)
+      DrawCapture *capture = CaptureDelta(device_va, call);
+      if (!capture)
+        return;
+      std::lock_guard lock(g_deferred_mutex);
+      if (!g_deferred.find(device_va))
+        DeferredOf(device_va).fetch_add(1, std::memory_order_acq_rel);  // blur-nx (2026-11-17)
+      // fable2-nx: DeferredSlots (find / set) and BeginIndexedVertices' indices kept through the base's port 138.
+      g_deferred.set(device_va, {capture, scratch, bytes, index_scratch, index_bytes});
+      g_deferred_count.store(g_deferred.size(), std::memory_order_release);
+      g_delta.deferred_device = device_va;  // blur-nx (2026-11-13, #51): cleared when FlushDeferredVertices queues it
       return;
-    std::lock_guard lock(g_deferred_mutex);
-    g_deferred.set(device_va, {capture, scratch, bytes, index_scratch, index_bytes});
-    g_deferred_count.store(g_deferred.size(), std::memory_order_release);
-    return;
+    }
   }
   DrawCapture *capture = nullptr;
   {
@@ -960,7 +1431,7 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
     std::unique_lock<std::mutex> chain;
     if (DeltasOn())
       chain = std::unique_lock<std::mutex>(g_delta.mutex);
-    capture = Capture(device_va, call);
+    capture = CaptureDeferred(device_va, call);  // blur-nx (2026-11-13, #13): Capture() unless narrowed
     if (DeltasOn())
       ++g_delta.whole;
   }
@@ -973,14 +1444,20 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
   std::lock_guard lock(g_deferred_mutex);
   if (DeferredDraw *old = g_deferred.find(device_va))
     g_capture_pool.Give(old->capture);  // one not flushed (the original replaced it the same way)
+  else
+    DeferredOf(device_va).fetch_add(1, std::memory_order_acq_rel);  // blur-nx (2026-11-17)
   g_deferred.set(device_va, {capture, scratch, bytes, index_scratch, index_bytes});
   g_deferred_count.store(g_deferred.size(), std::memory_order_release);
 }
 
 void FlushDeferredVertices(u32 device_va) {
   FlushRecordedVertices(device_va);
-  if (HookFastPathsOn() && g_deferred_count.load(std::memory_order_acquire) == 0)
-    return;  // banjo-nx (2026-10-20, from sa2-nx): none waiting, no lock
+  // banjo-nx (2026-10-20, from sa2-nx): none waiting, no lock. blur-nx (2026-11-17, blur_renut_flush_fast_local): none of
+  // this device's (the find below looks for nothing else).
+  static const bool local = REXCVAR_GET(blur_renut_flush_fast_local);
+  if (HookFastPathsOn() && (local ? DeferredOf(device_va).load(std::memory_order_acquire) == 0
+                                  : g_deferred_count.load(std::memory_order_acquire) == 0))
+    return;
   // banjo-nx (2026-10-20, from futari-nx, banjo_renut_deferred_chain): a chain draw is queued under the chain's lock
   // (taken before the deferred map's, as QueueDeferredDraw takes them), so no draw of the chain is made or queued between.
   std::unique_lock<std::mutex> chain;
@@ -994,12 +1471,18 @@ void FlushDeferredVertices(u32 device_va) {
       return;
     deferred = *it;
     g_deferred.erase(it);
+    DeferredOf(device_va).fetch_sub(1, std::memory_order_acq_rel);  // blur-nx (2026-11-17)
     g_deferred_count.store(g_deferred.size(), std::memory_order_release);
   }
   deferred.capture->vertices.assign(deferred.scratch, deferred.scratch + deferred.bytes);
   if (deferred.index_scratch)  // fable2-nx: BeginIndexedVertices
     deferred.capture->indices.assign(deferred.index_scratch, deferred.index_scratch + deferred.index_bytes);
+  // blur-nx (2026-11-13, #52's census): the vertex bytes the flush copies (a scratch ring could leave them in place).
+  g_deferred_vertex_bytes.fetch_add(deferred.bytes, std::memory_order_relaxed);
+  g_deferred_vertex_draws.fetch_add(1, std::memory_order_relaxed);
   QueueCapture(deferred.capture);
+  if (chain.owns_lock() && g_delta.deferred_device == device_va)
+    g_delta.deferred_device = 0;  // blur-nx (2026-11-13, #51): its delta queued; the chain is free for any device
 }
 
 void QueueClear(u32 device_va, u32 flags, const ClearRect *rect, const float color[4], float depth,
@@ -1010,7 +1493,9 @@ void QueueClear(u32 device_va, u32 flags, const ClearRect *rect, const float col
   if (!device)
     return;
   DrawCapture *args = g_capture_pool.Take();  // banjo-nx (2026-10-19): pooled, see DrawCapture
-  args->state.assign(device, device + d3d::kDeviceSnapshotSize);
+  // blur-nx (2026-11-13, #55): the target words and the viewport the clear reads, not the whole device.
+  ReadResolveTargets(device, args->resolve_targets);
+  ReadClearViewport(device, args->clear_viewport);
   args->has_rect = rect != nullptr;
   args->rect = rect ? *rect : ClearRect{};
   std::memcpy(args->color, color, sizeof(args->color));
@@ -1020,8 +1505,8 @@ void QueueClear(u32 device_va, u32 flags, const ClearRect *rect, const float col
   CaptureStackHeaders(device, args->stack_headers);  // blur-nx (2026-11-10, port 76; its key 215)
   render_thread::Queue([args] {
     SetReplayStackHeaders(args->stack_headers.count ? &args->stack_headers : nullptr);
-    ClearStateLocked(args->state.data(), args->flags, args->has_rect ? &args->rect : nullptr, args->color,
-                     args->depth, args->stencil);
+    ClearTargetsLocked(args->resolve_targets, args->clear_viewport, args->flags,
+                       args->has_rect ? &args->rect : nullptr, args->color, args->depth, args->stencil);
     SetReplayStackHeaders(nullptr);
     g_capture_pool.Give(args, true);
   });
@@ -1038,7 +1523,9 @@ void QueueResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 de
   // The destination header as it is now: the game often builds it on the
   // stack (as for recorded resolves).
   DrawCapture *args = g_capture_pool.Take();  // banjo-nx (2026-10-19): pooled, see DrawCapture
-  args->state.assign(device, device + d3d::kDeviceSnapshotSize);
+  // blur-nx (2026-11-13, M-35): the eight target words the resolve reads, not the whole device (12.9 KB a resolve on the
+  // Game Master); args->state is left as the pool had it (not read).
+  ReadResolveTargets(device, args->resolve_targets);
   args->has_rect = source_rect != nullptr;
   args->rect = source_rect ? *source_rect : ClearRect{};
   args->has_color = clear_color != nullptr;
@@ -1059,10 +1546,10 @@ void QueueResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 de
   CaptureStackHeaders(device, args->stack_headers);  // blur-nx (2026-11-10, port 76; its key 215)
   render_thread::Queue([args] {
     SetReplayStackHeaders(args->stack_headers.count ? &args->stack_headers : nullptr);
-    ResolveStateLocked(args->state.data(), args->flags, args->has_rect ? &args->rect : nullptr,
-                       args->dest_texture_va, args->has_dest_format ? &args->dest_format : nullptr,
-                       args->dest_x, args->dest_y, args->dest_level, args->dest_slice,
-                       args->has_color ? args->color : nullptr, args->depth, args->stencil);
+    ResolveTargetsLocked(args->resolve_targets, args->flags, args->has_rect ? &args->rect : nullptr,
+                         args->dest_texture_va, args->has_dest_format ? &args->dest_format : nullptr,
+                         args->dest_x, args->dest_y, args->dest_level, args->dest_slice,
+                         args->has_color ? args->color : nullptr, args->depth, args->stencil);
     SetReplayStackHeaders(nullptr);
     g_capture_pool.Give(args, true);
   });
@@ -1107,11 +1594,19 @@ struct EndedQuery {
   u32 begin = 0, end = 0;
   bool failed = false;
   float scale = 1.0f;
+  u32 issue = 0;  // fable2-nx (2026-11-25): which end of the query object this is (g_query_issues)
 };
 struct QueryResult {
   u32 samples = 0;
   u32 history = 0;  // bit 0: the newest count was not 0, bit 1 the one before, ...
+  u32 issue = 0;    // fable2-nx (2026-11-25): the end the count is for
 };
+// fable2-nx (2026-11-25, the Switch's flickering castle, houses and roofs): the ends issued of each query object, counted
+// on the game's thread at D3DQuery_Issue(END) (under g_query_results_mutex). GetData answers about the object's latest
+// end, as the console's waits for that end's counts; the counts the GPU gave here are for an earlier end (a frame or
+// more before, the camera elsewhere, or the object reused for another mesh), so only a count for the same end is given
+// (OcclusionQueryAnswer) and an earlier one is answered visible, as on the PC.
+std::unordered_map<u32, u32> g_query_issues;
 std::unique_ptr<plume::RenderQueryPool> g_query_pool;
 u32 g_query_next = 0, g_query_in_use = 0;
 std::vector<OpenQuery> g_query_open;
@@ -1121,6 +1616,7 @@ std::unordered_map<u32, QueryResult> g_query_results;
 // The 10 s line's counts.
 std::atomic<uint64_t> g_q_issued{0}, g_q_counted{0}, g_q_zero{0}, g_q_failed{0}, g_q_real{0}, g_q_visible{0},
     g_q_held{0};
+std::atomic<uint64_t> g_q_stale{0};  // fable2-nx (2026-11-25): answered visible, the count being for an earlier end
 
 volatile uint64_t *QueryWords() {
 #if defined(PLUME_DEKO3D)
@@ -1149,7 +1645,12 @@ u32 ReportSamplesLocked() {
   g_query_next = (g_query_next + 1) % kQueryEntries;
   ++g_query_in_use;
   words[e * 2] = kQuerySentinel;
-  plume::Deko3DReportCounter(Video::CommandListLocked(), g_query_pool.get(), e, 2);  // DkCounter_SamplesPassed
+  // fable2-nx (2026-11-25, crashes and flickering buildings on the Switch): through the recorder, as gpu_profile.cpp
+  // reports its counters. Video::CommandListLocked() is the recorder's proxy when banjo_renut_record_worker is on (the
+  // Switch's default), and plume::Deko3DReportCounter casts its list to plume's own: it read the proxy's fields as the
+  // command buffer and wrote the report wherever they pointed (an exception in dkCmdBufReportCounter at a query's
+  // begin, or a count landing elsewhere: counts of 0 that hid the castle and the houses for frames at a time).
+  banjo::renut_gpu::record::ReportCounter(Video::CommandListLocked(), g_query_pool.get(), e, 2);  // SamplesPassed
   return e;
 #else
   return UINT32_MAX;
@@ -1179,11 +1680,17 @@ void QueueQueryEnd(u32 device_va, u32 query_va) {
   if (!OcclusionQueriesMode() || !State().host_ready)
     return;
   FlushDeferredVertices(device_va);
-  render_thread::Queue([query_va] {
+  u32 issue;
+  {
+    std::lock_guard lock(g_query_results_mutex);
+    issue = ++g_query_issues[query_va];
+  }
+  render_thread::Queue([query_va, issue] {
     for (auto it = g_query_open.begin(); it != g_query_open.end(); ++it) {
       if (it->query != query_va)
         continue;
-      EndedQuery e{query_va, it->begin, UINT32_MAX, it->dropped || it->begin == UINT32_MAX, g_occlusion_scale};
+      EndedQuery e{query_va, it->begin, UINT32_MAX, it->dropped || it->begin == UINT32_MAX, g_occlusion_scale,
+                   issue};
       if (!e.failed) {
         e.end = ReportSamplesLocked();
         if (e.end == UINT32_MAX)
@@ -1241,6 +1748,7 @@ void OcclusionQueriesCollectLocked() {
     }
     std::lock_guard lock(g_query_results_mutex);
     QueryResult &r = g_query_results[e.query];
+    r.issue = e.issue;
     if (known) {
       r.samples = samples;
       r.history = (r.history << 1) | (samples ? 1u : 0u);
@@ -1269,6 +1777,17 @@ bool OcclusionQueryAnswer(u32 query_va, bool sun, u32 &samples) {
     return true;
   }
   const QueryResult &r = it->second;
+  // fable2-nx (2026-11-25): a count for an earlier end than the one GetData asks about (g_query_issues) is not this
+  // end's: visible. The queries read with fewer than 16 bytes too ('sun': the glare's, and those that decide whether a
+  // light is applied, with its shadows): with their earlier ends' counts the light on the walls and the shadows on the
+  // ground flickered on the Switch, and answered visible they did not.
+  {
+    const auto issued = g_query_issues.find(query_va);
+    if (issued != g_query_issues.end() && issued->second != r.issue) {
+      ++g_q_stale;
+      return false;
+    }
+  }
   if (!sun && !r.samples && hold && (r.history & (((1u << hold) - 1u) << 1))) {
     ++g_q_held;
     return false;
@@ -1282,9 +1801,11 @@ std::string OcclusionQueryReport() {
   if (!OcclusionQueriesMode())
     return {};
   return fmt::format("; occlusion queries (fable2_occlusion_queries {}): {} issued, {} counted ({} of them 0), {} not "
-                     "measured; answers: {} counts, {} visible (no count yet), {} held visible",
+                     "measured; answers: {} counts, {} visible (no count yet), {} visible (count for an earlier end), {} "
+                     "held visible",
                      OcclusionQueriesMode(), g_q_issued.exchange(0), g_q_counted.exchange(0), g_q_zero.exchange(0),
-                     g_q_failed.exchange(0), g_q_real.exchange(0), g_q_visible.exchange(0), g_q_held.exchange(0));
+                     g_q_failed.exchange(0), g_q_real.exchange(0), g_q_visible.exchange(0), g_q_stale.exchange(0),
+                     g_q_held.exchange(0));
 }
 
 } // namespace renut::gpu

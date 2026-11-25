@@ -26,6 +26,12 @@
 #include <switch.h>  // viGetDisplayVsyncEvent
 #endif
 
+// Port 258 (sasrt-nx's sync note, 2026-11-22): the FPS overlay's "Shown" counter (port 196) through a function, so a port
+// without the base's overlay (renut_engine/Fps.h, hooks.h) builds this file unchanged: renut_engine/FPS.cpp has the real
+// one, and this weak empty one stands in where it is missing.
+void RenutCountShownFrame();
+__attribute__((weak)) void RenutCountShownFrame() {}
+
 REXCVAR_DEFINE_BOOL(banjo_display_sync, false, "Banjo/Enhancements",
                     "OFF by default (2026-10-19): in Ryujinx every run with the thread active stalled or hung (runs 65, "
                     "67, 68), the runs without it did not; to be tried on the console with configs/"
@@ -126,6 +132,11 @@ void __nx_win_exit(void) {
 
 namespace banjo::display_sync {
 namespace {
+// Port 172 (from fnxf_xiii, its notes of 2026-10-27 and 10-29; banjo_vblank_from_display): the display's refreshes, for
+// the SDK's guest vblank worker (sdk/src/graphics/graphics_system.cpp, rex::graphics::g_display_refresh_wait).
+std::atomic<uint64_t> g_refresh_count{0};
+std::mutex g_refresh_mutex;
+std::condition_variable g_refresh_cv;
 
 uint64_t NowNs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -367,6 +378,10 @@ void AtRefresh(uint64_t now, uint64_t period) {
   if (newest < 0)
     return;  // dropped meanwhile (eight presents without a refresh)
   ++g_refreshes_with_image;
+  // renut-ultimate (2026-11-20, port 196): S4ep1-nx's of 2026-11-15 (github.com/FurryLilManChild/S4ep1-nx, GPL-3.0).
+  // The FPS counter counts what the player sees: refreshes that showed a new image. The overlay's only other counter
+  // ("Tick", renut_engine/FPS.cpp) is N&B's appMainTickPreDraw hook, built for no other game, so it showed nothing.
+  RenutCountShownFrame();  // port 258
   g_superseded += uint64_t(newest);
   const Shown s = g_shown[(g_shown_head + uint32_t(newest)) % kShown];
   g_shown_head = (g_shown_head + uint32_t(newest) + 1) % kShown;
@@ -435,6 +450,11 @@ void Run() {
     last = now;
     g_period.store(uint64_t(period), std::memory_order_relaxed);
     g_last_vsync.store(now, std::memory_order_release);
+    {
+      std::lock_guard lock(g_refresh_mutex);  // port 172: a refresh for the vblank worker
+      g_refresh_count.fetch_add(1, std::memory_order_release);
+    }
+    g_refresh_cv.notify_all();
     // sa2-nx (2026-10-28, sa2_renut_queue_drain): the newest image at this refresh, before AtRefresh's own fence tests.
     const uint64_t presented = renut::gpu::Video::PresentCount();
     const bool new_image = presented != g_presented_at_vsync;
@@ -494,7 +514,7 @@ void WaitForFrameStart() {
   // the game thread waiting, not its work: frame_stats' CPU time (the FPS overlay's, and sasrt_dynamic_cpu_aware's
   // budget, port 52) leaves it out. It had counted it, so a paced game's CPU side was its whole frame.
   renut::frame_stats::OnGameThreadWait(
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waiting).count());
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waiting).count(), 2);
 }
 
 bool QueueDrainOn() {
@@ -512,15 +532,39 @@ uint32_t LateInputGuardUs() {
   return g_guard_us.load(std::memory_order_relaxed);
 }
 
+// Port 172: the refreshes counted so far, once one past 'seen' has come or 'timeout_ns' has passed (0: at once).
+uint64_t WaitRefresh(uint64_t seen, uint64_t timeout_ns) {
+  std::unique_lock lock(g_refresh_mutex);
+  if (timeout_ns)
+    g_refresh_cv.wait_for(lock, std::chrono::nanoseconds(timeout_ns),
+                          [&] { return g_refresh_count.load(std::memory_order_acquire) != seen; });
+  return g_refresh_count.load(std::memory_order_acquire);
+}
+
 void Start() {
 #if REX_PLATFORM_SWITCH
   static std::once_flag once;
   std::call_once(once, [] {
-    if (REXCVAR_GET(banjo_display_sync))
+    if (REXCVAR_GET(banjo_display_sync)) {
       banjo::renut_gpu::StartLongLivedThread(&Run, 128 * 1024);
+      rex::graphics::g_display_refresh_wait = &WaitRefresh;  // port 172 (used with banjo_vblank_from_display)
+    }
   });
 #endif
 }
+
+// banjo-nx (2026-11-23): see NextRelease (banjo_display_sync_no_late_snap).
+REXCVAR_DEFINE_BOOL(banjo_display_sync_no_late_snap, true, "Banjo/Enhancements",
+                    "Frame cap with the display's refresh (2026-11-23): a frame is never held past its own time (the "
+                    "previous release plus the frame) to meet the refresh grid: after a late frame went off the grid, "
+                    "the next one waited up to a whole refresh more (Nutty Acres' 1 % lows below the cap)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+std::atomic<uint64_t> g_late_snaps_avoided{0};
+bool NoLateSnapOn() {
+  static const bool on = REXCVAR_GET(banjo_display_sync_no_late_snap);
+  return on && banjo::renut_gpu::g_ab_off_plain != 205;  // A/B 205 (banjo-nx's 322, port 188): the off half as before
+}
+uint64_t LateSnapsAvoided() { return g_late_snaps_avoided.load(std::memory_order_relaxed); }
 
 uint64_t NextRelease(uint64_t now, uint64_t previous, uint64_t frame_ns, bool *anchored) {
   *anchored = false;
@@ -542,7 +586,19 @@ uint64_t NextRelease(uint64_t now, uint64_t previous, uint64_t frame_ns, bool *a
   const int64_t from = int64_t(earliest) - int64_t(vsync + phase);
   const int64_t n = from <= 0 ? -((-from) / int64_t(period)) : (from + int64_t(period) - 1) / int64_t(period);
   const int64_t at = int64_t(vsync + phase) + n * int64_t(period);
-  const uint64_t release = uint64_t(std::max<int64_t>(at, int64_t(now)));
+  uint64_t release = uint64_t(std::max<int64_t>(at, int64_t(now)));
+  // banjo-nx (2026-11-23, the Nutty Acres work, banjo_display_sync_no_late_snap): never held past the frame's own time
+  // (the previous release plus the frame) for the grid. Below the cap the game's frames end late and go at once, off the
+  // grid; a frame that then ends a little early (14 ms after such a release, at a 60 cap) was held to the grid's next
+  // point at or after it: up to a whole refresh more (the console's slowest frames in Nutty Acres, 2026-11-23: 27-33 ms
+  // with 15-17 ms of that in the limiter, the GPU 18 ms, the 1 % lows 33-35 fps). It goes at its own time instead; at or
+  // above the cap the releases are the grid's (the previous one on it, the frame a whole number of refreshes), the same.
+  // A frame of one refresh only (a 60 cap at 60 Hz: each image is shown at the refresh after it, on the grid or not); a
+  // cap of two refreshes or more keeps its cadence by the grid, as before.
+  if (previous && refreshes == 1 && release > previous + frame && NoLateSnapOn()) {
+    g_late_snaps_avoided.fetch_add(1, std::memory_order_relaxed);
+    return std::max(now, previous + frame);  // not anchored: off the grid, as a late frame's release
+  }
   const uint64_t wait = release - now;
   if (wait > g_release_wait_max_ns.load(std::memory_order_relaxed))
     g_release_wait_max_ns.store(wait, std::memory_order_relaxed);
@@ -567,8 +623,12 @@ void NoteRelease(uint64_t at, bool anchored) {
 }
 
 void NotePresented(uint64_t swap) {
-  if (!g_running.load(std::memory_order_acquire))
+  if (!g_running.load(std::memory_order_acquire)) {
+    // Port 196: without the display thread (it starts with the frame limiter; Katamari uncapped, the PC) the FPS
+    // counter counts each image presented, since no refresh says which were shown (Ryujinx, 2026-11-20: "0 FPS").
+    RenutCountShownFrame();  // port 258
     return;
+  }
   const uint64_t now = NowNs();
   const uint64_t index = renut::gpu::Video::PresentCount();
   const uint64_t input = rex::latency::InputTimeOf(swap);
@@ -606,6 +666,8 @@ std::string Report() {
       g_misses_total, g_phase_ups, double(g_fence_test_max_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
       double(g_release_wait_max_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
       g_release_clamped.exchange(0, std::memory_order_relaxed));
+  line += fmt::format("; frames not held past their time for the grid (banjo_display_sync_no_late_snap) {} since the start",
+                      LateSnapsAvoided());
   g_present_display = g_input_display = g_release_display = Sum{};
   g_refreshes = g_refreshes_with_image = g_superseded = g_misses = g_phase_ups = 0;
   // sa2-nx (2026-10-28): with double buffering, the queue drain's counts (pacman_renut_queue_drain).

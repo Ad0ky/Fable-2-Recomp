@@ -4,6 +4,7 @@
  *          list management for the native renderer.
  */
 #include "renut_engine/gpu/backend/video.h"
+#include "renut_engine/gpu/host_batch.h"  // blur-nx (2026-11-18, the Renut host batch)
 
 #include <cstdio>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <system_error>
 #include <vector>
+#include <algorithm>  // blur-nx (2026-11-17, audit #4): std::max
 #include <atomic>
 #include <chrono>  // banjo-nx (2026-10-20): banjo_deko3d_latency_trim
 #include <string>
@@ -115,6 +117,13 @@
 // waiting for the ring cleaner's range in progress, the cleaner at 0x3B on the system core kept off it by other work
 // there). A clean (dc cvac, plume Deko3DBuffer::unmap) can be repeated and run on two cores at once: the render thread
 // cleans that range itself instead of waiting for the thread to finish it (RingCleaner::Wait).
+// banjo-nx (2026-11-21, the next batch's item 5): banjo_renut_record.h StageCall.
+REXCVAR_DEFINE_BOOL(banjo_deko3d_stage_submit, true, "Banjo/Enhancements",
+                    "deko3d command stage (banjo_deko3d_command_stage): the stage ends the frame's list, submits it "
+                    "(once the ring cleaner has its ranges) and presents, in stream order: the render thread hands the "
+                    "frame over and goes on, instead of waiting for the stage to play the frame's last commands. "
+                    "In-run A/B target 183 (its off half: the render thread drains, ends and submits as before)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(sasrt_ring_cleaner_take_over, true, "Banjo/Enhancements",
                     "From sasrt-nx: a submit that needs the range the ring cleaner thread is cleaning cleans it itself (a "
                     "cache clean by address, repeatable) instead of waiting for the thread, which runs at the lowest "
@@ -565,10 +574,41 @@ bool BuildSwapChainTargets(VideoState &s) {
   return count != 0;
 }
 
+namespace {
+// banjo-nx (2026-11-21, batch 2): WaitSlotLocked waited for the slot's submitted frame (DrainSlot's RetiredFreeScope).
+bool g_slot_played[kFramesInFlight] = {};
+}  // namespace
+
 void DrainSlot(VideoState &s, uint32_t slot) {
+  // banjo-nx (2026-11-21, batch 2, banjo_deko3d_stage_retired_free): see WaitSlotLocked.
+  const banjo::renut_gpu::record::RetiredFreeScope retired_free(g_slot_played[slot]);
+  g_slot_played[slot] = false;
   s.retired_framebuffers[slot].clear();
   s.retired_views[slot].clear();
   s.retired_textures[slot].clear();
+  // blur-nx (2026-11-17, audit #4, blur_renut_texture_pool): the slot's frame is done with its given-back images: into
+  // the pool (after the views above, which name them), the oldest dropped past kTexturePoolBytes or kTexturePoolCount.
+  if (!s.retired_pool[slot].empty()) {
+    constexpr uint64_t kTexturePoolBytes = 96ull << 20;
+    constexpr size_t kTexturePoolCount = 48;
+    for (VideoState::PooledTexture &p : s.retired_pool[slot]) {
+      s.texture_pool_bytes += p.bytes;
+      s.texture_pool.push_back(std::move(p));
+    }
+    s.retired_pool[slot].clear();
+    size_t drop = 0;
+    while (drop < s.texture_pool.size() &&
+           (s.texture_pool_bytes > kTexturePoolBytes || s.texture_pool.size() - drop > kTexturePoolCount)) {
+      s.texture_pool_bytes -= s.texture_pool[drop].bytes;
+      ++drop;
+    }
+    if (drop) {
+      s.texture_pool.erase(s.texture_pool.begin(), s.texture_pool.begin() + ptrdiff_t(drop));
+      s.texture_pool_dropped.fetch_add(drop, std::memory_order_relaxed);
+    }
+    s.texture_pool_kept.store(s.texture_pool.size(), std::memory_order_relaxed);
+    s.texture_pool_kept_bytes.store(s.texture_pool_bytes, std::memory_order_relaxed);
+  }
   s.retired_buffers[slot].clear();
   s.retired_sets[slot].clear();
   ReleaseCacheCopiesLocked(slot);
@@ -610,6 +650,16 @@ constexpr uint32_t kKickListsAFrame = 3;
 // banjo-nx (2026-10-20, banjo_deko3d_eager_kicks): smaller lists, more of them, each submitted at its own kick.
 constexpr uint32_t kEagerKickDraws = 100;
 static_assert(kKickListsAFrame <= VideoState::kKickLists);
+// Port 164 (from fnxf_xiii, its note of 2026-11-05; banjo_deko3d_progressive_submit): the piece was 200 draws, at most
+// 3 a frame; fnxf_xiii's gameplay frame had ~195 (up to ~400), so a frame almost never split and the GPU started it
+// only at the present (submit -> GPU done 17-18 of its 19 ms; a late Swap or a render-thread spike then missed the
+// refresh). Now a quarter of the previous frame's draws (40 at least), up to kKickLists pieces: the GPU works on the
+// frame while the game and the render thread still make the rest.
+constexpr uint32_t kPiecesAFrame = 4;
+constexpr uint32_t kPieceMinDraws = 40;
+uint32_t PieceDraws(const VideoState &s) {
+  return std::max(kPieceMinDraws, s.last_frame_draws / kPiecesAFrame);
+}
 
 class RingCleaner {
 public:
@@ -679,9 +729,25 @@ private:
 
   void Run() {
     banjo::renut_gpu::OnBackgroundThreadStart("ring cleaner");
+    // blur-nx (2026-11-18, the Renut host batch's #11, blur_renut_ring_cleaner_priority / A/B 233): above the game
+    // threads on the background core, so that the ranges are clean before a submit needs them (the race: the render
+    // thread cleaned 835 of 1,946 ranges a 10 s itself, the cleaner behind the game threads there). Set again when the
+    // A/B half changes it.
+    int priority = ::renut::gpu::host_batch::BackgroundPriority();
+    const auto follow = [&priority] {
+      const int want = ::renut::gpu::host_batch::On(::renut::gpu::host_batch::kCleanerPriority)
+                           ? ::renut::gpu::host_batch::CleanerPriority()
+                           : ::renut::gpu::host_batch::BackgroundPriority();
+      if (want != priority) {
+        ::renut::gpu::host_batch::SetThisThreadPriority(want);
+        priority = want;
+      }
+    };
+    follow();
     std::unique_lock lock(mutex_);
     for (;;) {
       cv_.wait(lock, [this] { return !queue_.empty(); });
+      follow();
       const Job job = queue_.front();
       queue_.pop_front();
       working_ = job.ticket;
@@ -714,6 +780,40 @@ bool UseRingCleaner() {
   return IsDeko3D() && banjo::renut_gpu::RingCleanerOn();
 }
 
+// banjo-nx (2026-11-21, item 5): the frame's end and submit made by the command stage (StageSubmitCall, in stream order),
+// when its list is the stage's and the ring cleaner takes the ranges (no latency trim: its fence copies follow the
+// render thread's submit). g_stage_submit[slot]: the StageCall of the slot's last such submit (WaitSlotLocked waits for
+// it before the slot's fence).
+uint64_t g_stage_submit[kFramesInFlight] = {};
+bool StageSubmitOn(VideoState &s) {
+#if defined(PLUME_DEKO3D)
+  static const bool on = REXCVAR_GET(banjo_deko3d_stage_submit);
+  return on && banjo::renut_gpu::record::IsProxy(s.command_list) && UseRingCleaner() &&
+         !banjo::renut_gpu::LatencyTrimOn() && banjo::renut_gpu::g_ab_off_plain != 183;
+#else
+  (void)s;
+  return false;
+#endif
+}
+struct StageSubmitArgs {
+  plume::RenderCommandQueue *queue;
+  const plume::RenderCommandList *lists[2];
+  uint32_t count;
+  plume::RenderCommandSemaphore *wait, *signal;
+  plume::RenderCommandFence *fence;
+  uint64_t ticket;  // the ring cleaner's, for the frame's ranges
+};
+void StageSubmitCall(const void *a) {
+  StageSubmitArgs args;
+  std::memcpy(&args, a, sizeof(args));
+  RingCleaner::Instance().Wait(args.ticket);
+  const_cast<plume::RenderCommandList *>(args.lists[args.count - 1])->end();
+  plume::RenderCommandSemaphore *waits[] = {args.wait};
+  plume::RenderCommandSemaphore *signals[] = {args.signal};
+  args.queue->executeCommandLists(args.lists, args.count, args.wait ? waits : nullptr, args.wait ? 1 : 0,
+                                  args.signal ? signals : nullptr, args.signal ? 1 : 0, args.fence);
+}
+
 // Every range written so far is clean (handed to the cleaner and waited for, the rest by Publish).
 void PublishAll(VideoState &s, uint32_t slot) {
   if (UseRingCleaner()) {
@@ -730,6 +830,9 @@ plume::RenderCommandList *SlotList(VideoState &s, uint32_t slot) {
 }
 
 } // namespace
+
+// banjo-nx (2026-11-21, item 5): video_internal.h.
+bool SubmitWasStaged(uint32_t slot) { return g_stage_submit[slot] != 0; }
 
 namespace {
 
@@ -898,6 +1001,14 @@ std::string LatencyTrimReport() {
 void WaitSlotLocked(VideoState &s, uint32_t slot) {
   if (!s.submitted[slot])
     return;
+  // banjo-nx (2026-11-21, batch 2): every command of the slot's frame is played once this returns (its staged submit
+  // waited for below, or the stage drained at its submit): its retired objects go at DrainSlot without a drain.
+  g_slot_played[slot] = true;
+  // banjo-nx (2026-11-21, item 5): a submit the command stage makes: made before its fence is waited for.
+  if (g_stage_submit[slot]) {
+    banjo::renut_gpu::record::WaitStageCall(g_stage_submit[slot]);
+    g_stage_submit[slot] = 0;
+  }
   NoteGpuDoneSeenLocked(slot, false);  // banjo-nx (2026-10-20): done already (seen now)
   {
     render_thread::WaitScope wait;
@@ -960,7 +1071,34 @@ void SubmitAndWaitLocked(VideoState &s) {
 void SubmitAndAdvance(VideoState &s, plume::RenderCommandSemaphore *wait,
                       plume::RenderCommandSemaphore *signal) {
   const uint32_t cur = s.frame;
-  if (s.list_open) {
+  if (s.list_open && StageSubmitOn(s)) {
+    // banjo-nx (2026-11-21, item 5): the stage ends and submits the frame after its last commands; the render thread
+    // hands the ring's ranges to the cleaner (the stage waits for them) and goes on.
+    FinishRecordingLocked(s);
+    EndListTiming(s, true);
+    plume::RenderCommandList *current = SlotList(s, cur);
+    std::vector<UploadRing::Range> ranges;
+    s.uploads[cur].HandOff(ranges);
+    StageSubmitArgs args{};
+    args.queue = s.queue.get();
+    args.lists[0] = s.pending_list ? s.pending_list : current;
+    args.lists[1] = current;
+    args.count = s.pending_list ? 2 : 1;
+    args.wait = wait;
+    args.signal = signal;
+    args.fence = s.fences[cur].get();
+    args.ticket = RingCleaner::Instance().Enqueue(std::move(ranges));
+    s.pending_list = nullptr;
+    g_stage_submit[cur] = banjo::renut_gpu::record::StageCall(&StageSubmitCall, &args, sizeof(args));
+    banjo::renut_gpu::record::Hand();
+    s.list_open = false;
+    s.command_list = nullptr;
+    s.submitted[cur] = true;
+    g_slot_swap[cur] = g_presenting_swap;
+    g_gpu_done_noted[cur] = g_presenting_swap == 0;
+    s.last_frame_draws = s.frame_draws;  // port 164 (banjo_deko3d_progressive_submit)
+    s.frame_draws = 0;
+  } else if (s.list_open) {
     FinishRecordingLocked(s);
     EndListTiming(s, true);
     banjo::renut_gpu::record::Drain();  // banjo-nx (banjo_renut_record_worker)
@@ -982,6 +1120,8 @@ void SubmitAndAdvance(VideoState &s, plume::RenderCommandSemaphore *wait,
     // banjo-nx (2026-10-20, input latency): the guest Swap this frame ends, for the probe's "input -> GPU done".
     g_slot_swap[cur] = g_presenting_swap;
     g_gpu_done_noted[cur] = g_presenting_swap == 0;
+    s.last_frame_draws = s.frame_draws;  // port 164 (banjo_deko3d_progressive_submit)
+    s.frame_draws = 0;
 #if defined(PLUME_DEKO3D)
     g_trim.frame_end[cur] = plume::Deko3DCopyFence(s.fences[cur].get());
     FirstGpuWorkLocked(cur);
@@ -1177,6 +1317,7 @@ bool Video::EnsureCommandListLocked() {
 
 void Video::NoteDrawLocked() {
   ++State().list_draws;
+  ++State().frame_draws;  // port 164
 }
 
 void Video::NotePresentingSwap(uint64_t swap) {
@@ -1236,9 +1377,12 @@ void Video::KickLocked() {
   }
   // The open list ends here when it holds enough draws; the frame goes on in a kick list of the slot.
   const bool eager = banjo::renut_gpu::EagerKicksOn();
-  if (!banjo::renut_gpu::KickSubmitOn() ||
-      s.list_draws < (eager ? detail::kEagerKickDraws : detail::kKickSubmitDraws) ||
-      s.kick_lists_used[cur] >= (eager ? VideoState::kKickLists : detail::kKickListsAFrame))
+  const bool progressive = !eager && banjo::renut_gpu::ProgressiveSubmitOn();  // port 164
+  // banjo-nx (2026-11-21, A/B 179's off half: no list ends at a kick, the frame goes at the present: the render thread's
+  // submits a frame against the input latency banjo_deko3d_kick_submit buys).
+  if (!banjo::renut_gpu::KickSubmitOn() || banjo::renut_gpu::g_ab_off_plain == 179 ||
+      s.list_draws < (eager ? detail::kEagerKickDraws : progressive ? detail::PieceDraws(s) : detail::kKickSubmitDraws) ||
+      s.kick_lists_used[cur] >= (eager || progressive ? VideoState::kKickLists : detail::kKickListsAFrame))
     return;
   std::unique_ptr<plume::RenderCommandList> &next = s.kick_lists[cur][s.kick_lists_used[cur]];
   if (!next) {
@@ -1335,6 +1479,79 @@ void Video::RetireLocked(std::unique_ptr<plume::RenderTexture> texture) {
     auto &s = State();
     s.retired_textures[s.frame].push_back(std::move(texture));
   }
+}
+
+// blur-nx (2026-11-17, audit #4, blur_renut_texture_pool).
+namespace {
+bool SamePoolDesc(const plume::RenderTextureDesc &a, const plume::RenderTextureDesc &b) {
+  return a.dimension == b.dimension && a.width == b.width && a.height == b.height && a.depth == b.depth &&
+         a.mipLevels == b.mipLevels && a.arraySize == b.arraySize && a.format == b.format &&
+         a.multisampling.sampleCount == b.multisampling.sampleCount && !a.multisampling.sampleLocationsEnabled &&
+         !b.multisampling.sampleLocationsEnabled && a.textureArrangement == b.textureArrangement &&
+         a.optimizedClearValue == nullptr && b.optimizedClearValue == nullptr && a.flags == b.flags &&
+         a.committed == b.committed;
+}
+uint64_t PoolBytes(const plume::RenderTextureDesc &d) {
+  // An estimate for the pool's cap: 8 bytes a texel at most, the levels' third more.
+  const uint64_t texels = uint64_t(d.width) * d.height * std::max(d.depth, 1u) * std::max(d.arraySize, 1u) *
+                          std::max<uint64_t>(uint64_t(d.multisampling.sampleCount), 1);
+  return texels * 8 * (d.mipLevels > 1 ? 4 : 3) / 3;
+}
+}  // namespace
+
+void Video::RetirePooledLocked(std::unique_ptr<plume::RenderTexture> texture, const plume::RenderTextureDesc &desc) {
+  if (!texture)
+    return;
+  auto &s = State();
+  s.retired_pool[s.frame].push_back({desc, std::move(texture), PoolBytes(desc)});
+}
+
+std::unique_ptr<plume::RenderTexture> Video::TakePooledLocked(const plume::RenderTextureDesc &desc) {
+  auto &s = State();
+  // Newest first: the image the same destination gave back a frame or two ago.
+  for (size_t i = s.texture_pool.size(); i-- > 0;) {
+    if (SamePoolDesc(s.texture_pool[i].desc, desc)) {
+      std::unique_ptr<plume::RenderTexture> t = std::move(s.texture_pool[i].texture);
+      s.texture_pool_bytes -= s.texture_pool[i].bytes;
+      s.texture_pool.erase(s.texture_pool.begin() + ptrdiff_t(i));
+      s.texture_pool_hits.fetch_add(1, std::memory_order_relaxed);
+      s.texture_pool_kept.store(s.texture_pool.size(), std::memory_order_relaxed);
+      s.texture_pool_kept_bytes.store(s.texture_pool_bytes, std::memory_order_relaxed);
+      return t;
+    }
+  }
+  s.texture_pool_misses.fetch_add(1, std::memory_order_relaxed);
+  return nullptr;
+}
+
+size_t Video::DropTexturePoolLocked() {
+  // renut-ultimate (2026-11-17, port 148): the pool holds up to 96 MB of images that Retire would have destroyed; with
+  // the heap or the GPU budget short they go before any cold texture does. The images of retired_pool, still in a frame
+  // in flight, join the pool at their DrainSlot and go at the next check.
+  auto &s = State();
+  const size_t n = s.texture_pool.size();
+  if (!n)
+    return 0;
+  s.texture_pool.clear();
+  s.texture_pool_bytes = 0;
+  s.texture_pool_dropped.fetch_add(n, std::memory_order_relaxed);
+  s.texture_pool_kept.store(0, std::memory_order_relaxed);
+  s.texture_pool_kept_bytes.store(0, std::memory_order_relaxed);
+  return n;
+}
+
+std::string Video::TexturePoolReportLocked() {
+  // (Called by the 10 s report on the game thread: only the atomics.)
+  auto &s = State();
+  const uint64_t hits = s.texture_pool_hits.exchange(0, std::memory_order_relaxed);
+  const uint64_t misses = s.texture_pool_misses.exchange(0, std::memory_order_relaxed);
+  const uint64_t dropped = s.texture_pool_dropped.exchange(0, std::memory_order_relaxed);
+  if (!hits && !misses)
+    return {};
+  return fmt::format("texture pool (blur_renut_texture_pool): {} images reused, {} made new, {} dropped; {} kept "
+                     "({:.1f} MB)",
+                     hits, misses, dropped, s.texture_pool_kept.load(std::memory_order_relaxed),
+                     double(s.texture_pool_kept_bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0));
 }
 
 void Video::RetireLocked(std::unique_ptr<plume::RenderTextureView> view) {

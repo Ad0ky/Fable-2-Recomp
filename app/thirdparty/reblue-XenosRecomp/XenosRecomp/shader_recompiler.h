@@ -103,6 +103,10 @@ struct ShaderRecompiler : StringBuffer
     // sets PA_CL_CLIP_CNTL.vtx_kill_or). The grass kills its blades where the density map is
     // below their threshold.
     bool hasVertexKill = false;
+    // fable2-nx (2026-11-25, the black seams at Bowerstone's kerbs): a vertex shader's literal registers whose four
+    // components are NaN. Fable 2's terrain layers move one into the position to discard a vertex where the layer is
+    // absent; recompile(const AluInstruction&) turns that move into a vertex kill (oPts.z), as the console treats it.
+    std::unordered_set<uint32_t> nanLiteralRegisters;
     // fable2-nx (2026-11-15, the big snowflakes): the vertex shader writes the point size (oPts.x). Its size then counts
     // even when it is zero (Xenia: "4D5307F1 has zero-size snowflakes, drop them"), not the render state's.
     bool writesPointSize = false;

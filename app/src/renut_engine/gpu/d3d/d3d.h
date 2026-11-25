@@ -283,6 +283,10 @@ constexpr u32 kDeviceOffsetStreamStrides = 0x30F0;      // SetStreamSource, u8[1
 constexpr u32 kDeviceOffsetTextures = 0x3100;           // SetTexture, [kTextureFetchSlots] (fable2-nx (N&B TU3->Fable 2): 0x3108->0x3100)
 constexpr u32 kDeviceOffsetPixelShader = 0x3194;        // SetPixelShader (fable2-nx (N&B TU3->Fable 2): 0x319C->0x3194)
 constexpr u32 kDeviceOffsetVertexShader = 0x3198;       // SetVertexShader (fable2-nx (N&B TU3->Fable 2): 0x31A0->0x3198)
+// renut-ultimate (2026-11-14, port 138; blur-nx's #55): CDevice's viewport floats (x, y, width, height), which D3D
+// clamps a clear to (katamari-nx: 0x3170->0x3160; blur-nx's XDK: 0x3218). A port at another XDK sets its own.
+// fable2-nx: 0x3168, as ClearStateLocked read it before the port (N&B TU3->Fable 2: 0x3170->0x3168).
+constexpr u32 kDeviceOffsetViewport = 0x3168;
 // In m_TessellatorPacket, which holds registers 0x2280 on: VGT_HOS_CNTL
 // (tessellation mode in bits 0-1: 0 discrete, 1 continuous, 2 adaptive) and
 // the float VGT_HOS_MAX_TESS_LEVEL / VGT_HOS_MIN_TESS_LEVEL.

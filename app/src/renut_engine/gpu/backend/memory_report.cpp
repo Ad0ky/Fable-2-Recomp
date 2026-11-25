@@ -19,6 +19,9 @@
 #include <unistd.h>  // banjo-nx (2026-10-28): sbrk (the heap's room, O(1))
 extern "C" size_t __nx_heap_size;  // libnx; the SDK's runtime_switch.cpp sets it
 extern "C" char *fake_heap_start, *fake_heap_end;  // libnx: the malloc heap's bounds
+// banjo-nx (2026-11-01): the guest memory core (sdk guest_memory_switch.cpp): the backing committed from the heap.
+extern "C" size_t RexGmCommittedBytes(void);
+extern "C" size_t RexGmChunkCount(void);
 #endif
 
 #include <rex/cvar.h>
@@ -172,16 +175,29 @@ void MaybeReportMemory() {
     plume::Deko3DGpuRegionInfo r;
     plume::Deko3DGpuRegionFigures(r);
     if (r.on)
+      // sasrt-nx 1.0.1 (2026-11-24): and its free bottom (what the heap can have back) and the CPU side's reserve's
+      // refusals (sasrt_region_cpu_reserve_mb)
       RGPU_INFO("Memory: GPU region {:.0f} MB at the heap's top: {} blocks {:.0f} MB (peak {:.0f}), {:.0f} MB free in {} "
-                "ranges (largest {:.0f} MB); grown {} times, {} times given back ({:.0f} MB), {} blocks not placed in it",
+                "ranges (largest {:.0f} MB, {:.0f} MB at its bottom); grown {} times, {} times given back ({:.0f} MB), "
+                "{} blocks not placed in it, {} refused for the CPU side's reserve",
                 Mb(r.size), r.blocks, Mb(r.used), Mb(r.peak), Mb(r.freeBytes), r.freeRanges, Mb(r.largestFree),
-                r.growths, r.givebacks, Mb(r.givenBack), r.refused);
+                Mb(r.freeBottom), r.growths, r.givebacks, Mb(r.givenBack), r.refused, r.reserveRefused);
     // sasrt-nx (2026-11-11, sasrt_target_block_cache_mb)
     plume::Deko3DTargetCacheInfo c;
     plume::Deko3DTargetCacheFigures(c);
     RGPU_INFO("Memory: kept target blocks {} ({:.0f} MB); so far {} targets took one, {} made a new one, {} kept, {} "
               "dropped over the cap, {} given back (sasrt_target_block_cache_mb)",
               c.blocks, Mb(c.bytes), c.hits, c.misses, c.kept, c.evicted, c.released);
+  }
+  // banjo-nx (2026-11-01, the console's out-of-memory crash): the heap's biggest users that the lines above do not
+  // name: the game's own memory (its committed backing), and deko3d's shader objects with the GLSL they hold (unpacked
+  // on demand now: plume::Deko3DGlslSource) and its pipeline objects.
+  {
+    uint64_t shaders = 0, glsl = 0;
+    plume::Deko3DShaderMemory(shaders, glsl);
+    RGPU_INFO("Memory: heap users: guest memory {:.0f} MB committed in {} chunks; deko3d {} shader objects, {:.1f} MB "
+              "of GLSL alive, {} graphics pipeline objects",
+              Mb(RexGmCommittedBytes()), RexGmChunkCount(), shaders, Mb(glsl), plume::Deko3DPipelineCount());
   }
 #endif
 #endif

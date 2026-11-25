@@ -355,7 +355,7 @@ void Inflate(const Zlib& z, PPCContext& ctx, uint8_t* base) {
 
   const uint32_t used_in = static_cast<uint32_t>(in - in_start);
   const uint32_t made_out = static_cast<uint32_t>(out - out_start);
-  rex::memory::MarkStoreCards(g_out, made_out);  // fable2-nx (2026-11-14): a host writer marks its pages (NativeMemory.cpp)
+  rex::memory::MarkStoreCardsAt(base, g_out, made_out);  // fable2-nx (2026-11-14): a host writer marks its pages (NativeMemory.cpp)
   if (((used_in == 0 && made_out == 0) || flush == Z_FINISH_) && ret == Z_OK_) ret = Z_BUF_ERROR_;
 
   S32(base, strm + kNextIn, g_in + used_in);
