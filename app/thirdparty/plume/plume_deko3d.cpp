@@ -22,6 +22,12 @@
 
 #include <uam_api.h>
 
+// blur-nx (2026-11-13): libnx's nvservices transfer memory size (weak, 8 MB by default), logged at device creation.
+extern "C" u32 __nx_nv_transfermem_size;
+// blur-nx (2026-11-23, the boot crash): switch_perf.cpp's nvMapCreate / GPU-mapping retries report through it (set at
+// device creation to this log).
+extern "C" void (*RexSwitchNvRetryLogHook)(const char *line);
+
 namespace plume {
     // ---- helpers
 
@@ -44,6 +50,27 @@ namespace plume {
     // Free memory, for the log lines that may be about running out of it: the heap's free bytes (newlib) and the
     // process's unused memory (the system's figures).
     extern "C" char *fake_heap_end; // libnx: the heap's end (sbrk grows towards it)
+    // Port 161 (from fnxf_xiii, its note of 2026-11-05): newlib's malloc bins (devkitA64 libc.a mallocr.c; the third word
+    // is the top chunk) and lock, for the heap's room without mallinfo in the logs made while the game runs. mallinfo
+    // takes the malloc lock and walks every free chunk (newlib's __malloc_update_mallinfo; fnxf_xiii: 13-20 ms with the
+    // game's heap): the "memory block" line of the first 24 blocks of 8 MB or more (the upload ring's chunks, the stream
+    // buffers) cost the render thread about 20 ms each, and every thread's malloc waited meanwhile. The room: newlib's
+    // top chunk (__malloc_av_[2], its size word masked, what mallinfo calls keepcost) and what sbrk can still give; free
+    // chunks inside the heap are not counted.
+    extern "C" void *__malloc_av_[];  // (__malloc_lock / __malloc_unlock: malloc.h, as regionMoveHeapEnd uses them)
+    static void memoryFiguresQuick(uint64_t &heapRoom, uint64_t &processFree) {
+        __malloc_lock(_REENT);
+        const size_t *top = static_cast<const size_t *>(__malloc_av_[2]);
+        const size_t keepcost = top ? top[1] & ~size_t(3) : 0;
+        __malloc_unlock(_REENT);
+        char *brk = static_cast<char *>(sbrk(0));
+        heapRoom = uint64_t(keepcost) + (fake_heap_end > brk ? uint64_t(fake_heap_end - brk) : 0);
+        uint64_t total = 0, used = 0;
+        svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        processFree = total > used ? total - used : 0;
+    }
+
     static void memoryFigures(uint64_t &heapFree, uint64_t &processFree) {
         // Free chunks inside what malloc has taken, and what sbrk can still give.
         struct mallinfo mi = mallinfo();
@@ -57,11 +84,79 @@ namespace plume {
 
     static constexpr uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 
+    // blur-nx (2026-11-13, the console crash of 21:16: deko3d aborted the process when dkMemBlockCreate failed to map a
+    // GPU-region block during a race load, with 1.8 GB of the heap free): the blocks live and their bytes, and before
+    // every dkMemBlockCreate a breadcrumb in this thread's TLS (the IPC buffer below 0x100 is what deko3d's own calls
+    // overwrite), which Atmosphère's crash report dumps with the thread: the request that failed, the blocks live then,
+    // the GPU region's size and the process's system resource (the kernel memory its mappings use).
+    // renut-ultimate (2026-11-17, port 153): at 0x138-0x17B. libnx's thread-local slots (threadTlsGet / Set, which
+    // pthread keys and libstdc++'s thread-exit destructors use) are 0x180-0x1DF (its threadTlsGet: tpidrro_el0 + 0x180
+    // + 8 * slot, twelve slots), and the kernel's preemption words 0x100-0x107: Blur's 0x140 put the crumb's last four
+    // bytes over slot 0.
+    static std::atomic<uint32_t> g_blocksLive{0}, g_blocksMade{0}, g_blockCrumbSeq{0};
+    static std::atomic<uint64_t> g_blocksLiveBytes{0};
+    static std::atomic<uint64_t> g_regionBytesNow{0};  // set where the region changes (makeBlock)
+    struct BlockCrumb {
+        char magic[8];  // "DKBLOCK1"
+        uint32_t size, flags, path;  // path: 0 the heap, 1 the GPU region, 2 the guarded storage
+        uint32_t live, liveMb, regionMb;
+        uint32_t sysUsedKb, sysTotalKb, seq;
+        char what[24];
+    };
+    static constexpr size_t kBlockCrumbAt = 0x138;  // renut-ultimate (2026-11-17): see above
+    static_assert(kBlockCrumbAt >= 0x108 && kBlockCrumbAt + sizeof(BlockCrumb) <= 0x180,
+                  "the crumb stays between the kernel's words and libnx's TLS slots");
+    static void systemResource(uint64_t &used, uint64_t &total) {
+        used = total = 0;
+        svcGetInfo(&total, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&used, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
+    }
+    static void leaveBlockCrumb(uint32_t size, uint32_t flags, uint32_t path, const char *what) {
+        BlockCrumb c{};
+        std::memcpy(c.magic, "DKBLOCK1", 8);
+        c.size = size;
+        c.flags = flags;
+        c.path = path;
+        c.live = g_blocksLive.load(std::memory_order_relaxed);
+        c.liveMb = uint32_t(g_blocksLiveBytes.load(std::memory_order_relaxed) >> 20);
+        c.regionMb = uint32_t(g_regionBytesNow.load(std::memory_order_relaxed) >> 20);
+        uint64_t used = 0, total = 0;
+        systemResource(used, total);
+        c.sysUsedKb = uint32_t(used >> 10);
+        c.sysTotalKb = uint32_t(total >> 10);
+        c.seq = g_blockCrumbSeq.fetch_add(1, std::memory_order_relaxed);
+        std::strncpy(c.what, what ? what : "", sizeof(c.what) - 1);
+        auto *tls = static_cast<volatile uint8_t *>(armGetTls()) + kBlockCrumbAt;
+        const auto *from = reinterpret_cast<const uint8_t *>(&c);
+        for (size_t i = 0; i < sizeof(c); ++i)
+            tls[i] = from[i];
+    }
+    // A block made: counted, and every 32nd (and the first 8) logged with the live figures.
+    static void blockMade(DkMemBlock block, const char *what) {
+        if (!block)
+            return;
+        const uint64_t bytes = dkMemBlockGetSize(block);
+        const uint32_t live = g_blocksLive.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint64_t liveBytes = g_blocksLiveBytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+        const uint32_t made = g_blocksMade.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (made <= 8 || (made & 31) == 0) {
+            uint64_t used = 0, total = 0;
+            systemResource(used, total);
+            logf("blocks: %u made, %u live (%" PRIu64 " MB; this one a %s of %" PRIu64 " KiB); GPU region %" PRIu64
+                 " MB; system resource %" PRIu64 " of %" PRIu64 " KiB used",
+                 made, live, liveBytes >> 20, what ? what : "?", bytes >> 10,
+                 g_regionBytesNow.load(std::memory_order_relaxed) >> 20, used >> 10, total >> 10);
+        }
+    }
+
     // sasrt-nx (2026-11-09; port 58): the device for Deko3DReleaseEmptyImageChunks (one device), and
     // Deko3DSetDedicatedTargets.
     static Deko3DDevice *g_imageDevice = nullptr;
     static std::atomic<bool> g_dedicatedTargets{true};
     static std::atomic<uint32_t> g_imagePoolMb{64};  // fable2-nx (2026-11-17): Deko3DSetImagePoolMb
+    // banjo-nx (2026-11-20, Deko3DHurryCompiles): threads waiting for a pipeline a background thread builds; while any
+    // does, the blocking compiles skip the compile rest (banjo_deko3d_background_compile_share).
+    static std::atomic<int> g_compileHurry{0};
     uint64_t Deko3DHeapFreeBytes() {  // plume_deko3d.h
         uint64_t heapFree = 0, processFree = 0;
         memoryFigures(heapFree, processFree);
@@ -101,13 +196,24 @@ namespace plume {
     static std::unordered_map<DkMemBlock, std::pair<uintptr_t, uint64_t>> g_regionBlocks;
     static uint64_t g_regionRefused = 0;
 
-    // newlib's end moved to 'end' under malloc's lock; lowering keeps kRegionNewlibSlack above its break.
+    // sasrt-nx 1.0.1 (2026-11-24): the room left to newlib (plume_deko3d.h, Deko3DSetRegionCpuReserve); kRegionNewlibSlack
+    // until set. g_regionReserveRefused counts the growths and newlib fallbacks it refused.
+    static std::atomic<uint64_t> g_regionCpuReserve{kRegionNewlibSlack};
+    static std::atomic<uint64_t> g_regionReserveRefused{0};
+    void Deko3DSetRegionCpuReserve(uint64_t bytes) {
+        g_regionCpuReserve.store(std::max<uint64_t>(bytes, kRegionNewlibSlack), std::memory_order_relaxed);
+    }
+
+    // newlib's end moved to 'end' under malloc's lock; lowering keeps the CPU side's reserve (kRegionNewlibSlack before
+    // sasrt-nx 1.0.1) above its break.
     static bool regionMoveHeapEnd(uintptr_t end, bool lowering) {
         __malloc_lock(_REENT);
         const uintptr_t brk = reinterpret_cast<uintptr_t>(sbrk(0));
-        const bool ok = !lowering || end >= brk + kRegionNewlibSlack;
+        const bool ok = !lowering || end >= brk + g_regionCpuReserve.load(std::memory_order_relaxed);
         if (ok)
             fake_heap_end = reinterpret_cast<char *>(end);
+        else
+            g_regionReserveRefused.fetch_add(1, std::memory_order_relaxed);
         __malloc_unlock(_REENT);
         return ok;
     }
@@ -119,8 +225,27 @@ namespace plume {
         return g_region.giveBackBottom(kRegionStep, [](uintptr_t low) { return regionMoveHeapEnd(low, false); });
     }
 
+    // sasrt-nx 1.0.1 (2026-11-24): newlib's last chance. The app's _sbrk_r (app/src/blur_small_alloc.cpp, under malloc's
+    // lock) calls this when a move of the break would pass the heap's end: the region's free bottom goes back to newlib
+    // and the move is tried again. The region's lock is only tried: its holders take malloc's lock inside it
+    // (regionMoveHeapEnd), so waiting for it here, under malloc's lock, could deadlock; held (another thread, or this one
+    // allocating inside the region's code: libnx's mutex refuses a try by its owner too), nothing is given and malloc
+    // fails as before. regionMoveHeapEnd takes malloc's lock again on this thread: it is recursive.
+    // giveBackBottomInPlace, not giveBackBottom (sasrt-nx, 2026-11-24, after 1.0.1): this runs inside newlib's
+    // malloc_extend_top, which keeps the old top chunk's address and size across its sbrk call; giveBackBottom's map
+    // erase and emplace would free and malloc a node there, and a node freed into the top chunk or carved from it leaves
+    // the top chunk's recorded size wrong.
+    extern "C" uint64_t plume_region_give_back_for_sbrk(void) {
+        std::unique_lock<std::mutex> lock(g_regionMutex, std::try_to_lock);
+        if (!lock.owns_lock() || !g_regionOn || !g_region.high)
+            return 0;
+        return g_region.giveBackBottomInPlace(kRegionStep, [](uintptr_t low) { return regionMoveHeapEnd(low, false); });
+    }
+
     static std::atomic<bool> g_imageBestFit{true};  // sasrt-nx (2026-11-09 night; port 58): Deko3DSetImageBestFit
     void Deko3DSetImageBestFit(bool on) { g_imageBestFit.store(on, std::memory_order_relaxed); }
+    static std::atomic<bool> g_imageSpare{true};  // blur-nx (2026-11-18): Deko3DSetImageSpareChunk
+    void Deko3DSetImageSpareChunk(bool on) { g_imageSpare.store(on, std::memory_order_relaxed); }
 
     void Deko3DSetRegionBestFit(bool on) {  // sasrt-nx (2026-11-09 night; port 58): plume_deko3d.h
         std::lock_guard<std::mutex> lock(g_regionMutex);
@@ -141,6 +266,8 @@ namespace plume {
         out.givebacks = g_region.givebacks;
         out.givenBack = g_region.givenBack;
         out.refused = g_regionRefused;
+        out.freeBottom = g_region.freeBottom();  // sasrt-nx 1.0.1
+        out.reserveRefused = g_regionReserveRefused.load(std::memory_order_relaxed);
     }
 
     // FNV-1a 64: the variant cache key (tools/deko3d_shaders.py computes the same over the same text).
@@ -170,6 +297,7 @@ namespace plume {
 
 
     Deko3DOptions g_deko3dOptions;
+    bool g_deko3dCounts = true;  // banjo-nx (2026-11-20): see plume_deko3d.h
     // sasrt-nx (2026-11-11, port 82; its GPU list's row 2; UNTESTED): preciseStencilWrite's count.
     std::atomic<uint64_t> g_deko3dPreciseStencilSaved{0};
     void Deko3DSetOptions(const Deko3DOptions &options) { g_deko3dOptions = options; }
@@ -225,6 +353,10 @@ namespace plume {
         // sasrt-nx (2026-11-11, port 75; its formats batch, rows 6, 8, 10, 74, 93 and 7, 66, 73, 95, 96)
         case RenderFormat::R10G10B10A2_UNORM: return DkImageFormat_RGB10A2_Unorm;
         case RenderFormat::R11G11B10_FLOAT: return DkImageFormat_RG11B10_Float;
+        // renut-ultimate (2026-11-16, port 145; tw2de_nx's of 2026-10-25): banjo_deko3d_native_16bit.
+        case RenderFormat::R5G6B5_UNORM: return DkImageFormat_RGB565_Unorm;
+        case RenderFormat::R5G5B5A1_UNORM: return DkImageFormat_RGB5A1_Unorm;
+        case RenderFormat::R4G4B4A4_UNORM: return DkImageFormat_RGBA4_Unorm;
         case RenderFormat::R32_UINT: return DkImageFormat_R32_Uint;
         case RenderFormat::R32_SINT: return DkImageFormat_R32_Sint;
         case RenderFormat::R8G8_TYPELESS:
@@ -541,6 +673,7 @@ namespace plume {
     }
 
     Deko3DBuffer::~Deko3DBuffer() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
         if (block) {
             {
                 std::lock_guard<std::mutex> lock(device->bufferMutex);
@@ -694,6 +827,7 @@ namespace plume {
     }
 
     Deko3DTexture::~Deko3DTexture() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
         if (valid && ownsMemory) {
             g_deko3dStats.imageBytes -= alloc.size;
             if (g_imagePoolMb.load(std::memory_order_relaxed) && alloc.chunk >= 0 && poolKey[0])
@@ -810,6 +944,8 @@ namespace plume {
         }
         if (images) {
             imageCount = images;
+            imageSizes.resize(images);  // banjo-nx (2026-11-21): sized once (see imageTextures)
+            imageTextures.resize(images, nullptr);
             imageBlock = device->makeBlock(alignUp(images * 32, DK_MEMBLOCK_ALIGNMENT), DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "image descriptors");
             if (imageBlock)
                 memset(dkMemBlockGetCpuAddr(imageBlock), 0, images * 32);
@@ -824,6 +960,7 @@ namespace plume {
     }
 
     Deko3DDescriptorSet::~Deko3DDescriptorSet() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
         if (imageBlock)
             device->retire({}, imageBlock);
         if (samplerBlock)
@@ -860,6 +997,9 @@ namespace plume {
 
     // renut-ultimate (2026-11-10, port 59, from LostOdysseyRecomp ff013164; Deko3DOptions::relaxedDescriptorCounters): the
     // count and the epoch of a descriptor write. Relaxed, nothing waits for the uncached descriptor store to drain.
+    static Deko3DImageTrackHook g_deko3dImageTrackHook = nullptr;  // banjo-nx (2026-11-21): Deko3DSetImageTrackHook
+    void (*g_deko3dBeforeDestroyHook)() = nullptr;  // banjo-nx (2026-11-21): plume_deko3d.h
+
     static void noteDescriptorWrite(Deko3DDevice *device) {
         if (g_deko3dOptions.relaxedDescriptorCounters) {
             g_deko3dStats.descriptorWrites.fetch_add(1, std::memory_order_relaxed);
@@ -906,8 +1046,6 @@ namespace plume {
             // size at the view's first level; the depth of a 3D image there, else the view's layers (all from its first
             // when it names no count). tools/deko3d_glsl_opt.py's txq verify (constant 908 = 2) checks it on the GPU.
             const uint32_t id = descriptorIndex - imageFirst;
-            if (imageSizes.size() <= id)
-                imageSizes.resize(id + 1);
             const uint32_t m = view.mipLevelOffset;
             const uint32_t w = std::max(1u, t->desc.width >> m), h = std::max(1u, t->desc.height >> m);
             const DkImageType type = view.type != DkImageType_None ? view.type : t->type;
@@ -917,17 +1055,38 @@ namespace plume {
             else
                 z = view.layerCount ? view.layerCount
                                     : (t->desc.arraySize > view.layerOffset ? t->desc.arraySize - view.layerOffset : 1u);
-            imageSizes[id] = {w, h, z};
-            if (imageTextures.size() <= id)  // sasrt-nx (2026-11-08, Deko3DOptions::trackedImageInvalidate)
-                imageTextures.resize(id + 1, nullptr);
-            imageTextures[id] = t;
+            // banjo-nx (2026-11-21, the core-3 command stage): the tables' update through the hook when it takes it.
+            const Deko3DImageTrack track{this, id, t, {w, h, z}, true};
+            if (!g_deko3dImageTrackHook || !g_deko3dImageTrackHook(track))
+                Deko3DApplyImageTrack(track);
         }
         if (t == nullptr || !t->valid) {  // sasrt-nx (2026-11-08): an emptied slot names no texture
-            const uint32_t id = descriptorIndex - imageFirst;
-            if (id < imageTextures.size())
-                imageTextures[id] = nullptr;
+            const Deko3DImageTrack track{this, descriptorIndex - imageFirst, nullptr, {0, 0, 0}, false};
+            if (!g_deko3dImageTrackHook || !g_deko3dImageTrackHook(track))
+                Deko3DApplyImageTrack(track);
         }
         noteDescriptorWrite(device);
+    }
+
+    // banjo-nx (2026-11-21, the core-3 command stage): plume_deko3d.h.
+    void Deko3DSetImageTrackHook(Deko3DImageTrackHook hook) { g_deko3dImageTrackHook = hook; }
+    void Deko3DApplyImageTrack(const Deko3DImageTrack &track) {
+        Deko3DDescriptorSet *set = track.set;
+        const uint32_t id = track.id;
+        if (!set)
+            return;
+        if (track.sized) {
+            if (set->imageSizes.size() <= id)  // (not with a set made with its images: sized then)
+                set->imageSizes.resize(id + 1);
+            set->imageSizes[id] = {track.size[0], track.size[1], track.size[2]};
+        }
+        if (track.texture) {
+            if (set->imageTextures.size() <= id)
+                set->imageTextures.resize(id + 1, nullptr);
+            set->imageTextures[id] = track.texture;
+        } else if (id < set->imageTextures.size()) {
+            set->imageTextures[id] = nullptr;
+        }
     }
 
     void Deko3DDescriptorSet::setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) {
@@ -954,6 +1113,7 @@ namespace plume {
     }
 
     Deko3DQueryPool::~Deko3DQueryPool() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
         if (block)
             device->retire({}, block);
     }
@@ -1081,7 +1241,14 @@ namespace plume {
             uint64_t heapFree = 0, processFree = 0;
             memoryFigures(heapFree, processFree);
             logf("device: creating (heap %" PRIu64 " MB free, process %" PRIu64 " MB unused)", heapFree >> 20, processFree >> 20);
+            {   // blur-nx (2026-11-13): nvservices' transfer memory (libnx __nx_nv_transfermem_size) and the system resource
+                uint64_t used = 0, total = 0;
+                systemResource(used, total);
+                logf("device: nvservices transfer memory %u KiB; system resource %" PRIu64 " of %" PRIu64 " KiB used",
+                     __nx_nv_transfermem_size >> 10, used >> 10, total >> 10);
+            }
         }
+        RexSwitchNvRetryLogHook = [](const char *line) { logf("%s", line); };  // blur-nx (2026-11-23)
         DkDeviceMaker dm;
         dkDeviceMakerDefaults(&dm);
         dm.cbDebug = debugCallback;
@@ -1169,6 +1336,12 @@ namespace plume {
     static uint64_t g_boostSince = 0;
 
     Deko3DDevice::~Deko3DDevice() {
+        {  // blur-nx (2026-11-18): the spare-chunk thread stopped first (it makes blocks and adds chunks)
+            std::unique_lock<std::mutex> lock(spareMutex);
+            spareStop = true;
+            spareWake.notify_all();
+            spareDone.wait_for(lock, std::chrono::seconds(2), [this] { return !spareRunning; });
+        }
         {
             std::lock_guard<std::mutex> lock(g_boostMutex);  // banjo-nx (2026-10-23): never left in boost mode
             if (g_boostActive)
@@ -1355,6 +1528,8 @@ namespace plume {
         return dkMemBlockGetCpuAddr(block);
     }
 
+    // blur-nx (2026-11-18, for 1 % lows, every port): a block that took 4 ms or more to make is logged with its time (64
+    // lines at most): the storage zeroed and flushed, the GPU mapping, the heap's figures, on the thread that asked.
     DkMemBlock Deko3DDevice::makeBlock(uint32_t size, uint32_t flags, const char *what) {
         DkMemBlock block = makeBlockRaw(size, flags, what);
         noteBlockMade(block, alignUp(size, DK_MEMBLOCK_ALIGNMENT), what);
@@ -1362,6 +1537,20 @@ namespace plume {
     }
 
     DkMemBlock Deko3DDevice::makeBlockRaw(uint32_t size, uint32_t flags, const char *what) {
+        const uint64_t t0 = armGetSystemTick();
+        DkMemBlock block = makeBlockUntimed(size, flags, what);
+        const double ms = double(armTicksToNs(armGetSystemTick() - t0)) / 1e6;
+        static std::atomic<uint32_t> slowLogged{0};
+        if (ms >= 4.0 && slowLogged.fetch_add(1, std::memory_order_relaxed) < 64) {
+            s32 priority = -1;
+            svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+            logf("memory block: %s, %u KiB took %.1f ms (a thread of priority 0x%X, core %d)%s", what, size >> 10, ms,
+                 uint32_t(priority), svcGetCurrentProcessorNumber(), block ? "" : ": NONE MADE");
+        }
+        return block;
+    }
+
+    DkMemBlock Deko3DDevice::makeBlockUntimed(uint32_t size, uint32_t flags, const char *what) {
         DkMemBlockMaker m;
         dkMemBlockMakerDefaults(&m, dk, alignUp(size, DK_MEMBLOCK_ALIGNMENT));
         m.flags = flags;
@@ -1374,7 +1563,7 @@ namespace plume {
         // on the thread making the block: the render thread for the upload ring's chunks).
         if ((size >= (8u << 20) || (before >> 26) != ((before + m.size) >> 26)) && logged.fetch_add(1) < 24) {
             uint64_t heapFree = 0, processFree = 0;
-            memoryFigures(heapFree, processFree);
+            memoryFiguresQuick(heapFree, processFree);  // port 161: no heap walk (the heap's room)
             logf("memory block: %s, %u KiB (deko3d blocks %" PRIu64 " MB in all; heap %" PRIu64 " MB free, process %" PRIu64 " MB unused)",
                  what, size >> 10, (before + m.size) >> 20, heapFree >> 20, processFree >> 20);
         }
@@ -1385,7 +1574,9 @@ namespace plume {
             memset(storage + m.size, GuardByte, GuardBytes);
             m.storage = storage;
         }
+        leaveBlockCrumb(m.size, m.flags, 2, what);  // blur-nx (2026-11-13)
         DkMemBlock block = dkMemBlockCreate(&m);
+        blockMade(block, what);
         if (storage) {
             std::lock_guard<std::mutex> lock(guardMutex);
             guarded.push_back({block, storage, m.size, what});
@@ -1435,7 +1626,10 @@ namespace plume {
                 memset(storage, 0, m.size);
                 armDCacheFlush(storage, m.size);
                 m.storage = storage;
+                g_regionBytesNow.store(regionSize, std::memory_order_relaxed);  // blur-nx (2026-11-13)
+                leaveBlockCrumb(m.size, m.flags, 1, what);
                 DkMemBlock block = dkMemBlockCreate(&m);
+                blockMade(block, what);
                 std::lock_guard<std::mutex> lock(g_regionMutex);
                 if (block)
                     g_regionBlocks.emplace(block, std::make_pair(at, span));
@@ -1445,6 +1639,25 @@ namespace plume {
                 return block;
             }
             // No room above newlib's break: newlib's heap, as before.
+            // sasrt-nx 1.0.1 (2026-11-24): but not below the CPU side's reserve (Deko3DSetRegionCpuReserve): the region
+            // was refused for it, and taking the same bytes from newlib here would spend it all the same. The block
+            // fails as one newlib cannot give does (below: the memory emergency), which the governor answers.
+            if (g_region.high) {
+                const uintptr_t brk = reinterpret_cast<uintptr_t>(sbrk(0));
+                const uintptr_t end = reinterpret_cast<uintptr_t>(fake_heap_end);
+                const uint64_t room = end > brk ? uint64_t(end - brk) : 0;
+                if (room < uint64_t(m.size) + g_regionCpuReserve.load(std::memory_order_relaxed)) {
+                    g_regionReserveRefused.fetch_add(1, std::memory_order_relaxed);
+                    total.fetch_sub(m.size);
+                    g_memoryEmergency.store(true, std::memory_order_relaxed);
+                    static std::atomic<uint32_t> reserveLogged{0};
+                    if (reserveLogged.fetch_add(1, std::memory_order_relaxed) < 16)
+                        logf("GPU region: a %s of %u KiB not made from the heap: %" PRIu64 " MB left there, under the CPU "
+                             "side's reserve of %" PRIu64 " MB (sasrt_region_cpu_reserve_mb)", what, size >> 10,
+                             room >> 20, g_regionCpuReserve.load(std::memory_order_relaxed) >> 20);
+                    return nullptr;
+                }
+            }
         }
         void *probe = memalign(DK_MEMBLOCK_ALIGNMENT, m.size);
         if (!probe) {
@@ -1493,7 +1706,10 @@ namespace plume {
             failedTick.store(0, std::memory_order_relaxed);
         }
         free(probe);
-        return dkMemBlockCreate(&m);
+        leaveBlockCrumb(m.size, m.flags, 0, what);  // blur-nx (2026-11-13)
+        DkMemBlock block = dkMemBlockCreate(&m);
+        blockMade(block, what);
+        return block;
 #endif
     }
 
@@ -1511,7 +1727,10 @@ namespace plume {
             }
         }
         noteBlockGone(block);  // fable2-nx (2026-11-19): the fault report's block table
+        const uint64_t bytes = dkMemBlockGetSize(block);  // blur-nx (2026-11-13): the live figures
         dkMemBlockDestroy(block);
+        g_blocksLive.fetch_sub(1, std::memory_order_relaxed);
+        g_blocksLiveBytes.fetch_sub(bytes, std::memory_order_relaxed);
         if (range.second) {
             std::lock_guard<std::mutex> lock(g_regionMutex);
             g_region.release(range.first, range.second, kRegionGiveBackAt, kRegionKeep, kRegionStep,
@@ -1610,6 +1829,98 @@ namespace plume {
         }
     }
 
+    // blur-nx (2026-11-18, for 1 % lows, every port: Deko3DSetImageSpareChunk). The image heap's spare chunk: asked for
+    // (heapMutex held) after an image took room in the shared chunks, when none of them is empty; made on a thread of
+    // its own, outside every lock, and added under heapMutex. One at a time (spareMaking), so at most one is made ahead.
+    static void *spareThreadEntry(void *arg) {
+        static_cast<Deko3DDevice *>(arg)->spareWorker();
+        return nullptr;
+    }
+
+    void Deko3DDevice::wantSpareLocked() {
+        if (!g_imageSpare.load(std::memory_order_relaxed))
+            return;
+        for (const Chunk &c : chunks)
+            if (c.block && !c.dedicated && c.freeList.size() == 1 && c.freeList[0].first == 0 && c.freeList[0].second == c.size)
+                return;  // an empty shared chunk: the spare is there
+        std::lock_guard<std::mutex> lock(spareMutex);
+        if (spareStop || spareWanted || spareMaking)
+            return;
+        spareWanted = true;
+        if (!spareStarted) {
+            spareStarted = true;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 256u << 10);
+            pthread_t thread;
+            spareRunning = pthread_create(&thread, &attr, spareThreadEntry, this) == 0;
+            pthread_attr_destroy(&attr);
+            if (spareRunning)
+                pthread_detach(thread);
+            else
+                logf("image heap: the spare-chunk thread did not start");
+        }
+        spareWake.notify_one();
+    }
+
+    void Deko3DDevice::spareWorker() {
+        // The uam thread's place: off the render thread's core, below the game's threads (the priority the process
+        // allows at or above the asked one, as compileWorker takes it).
+        if (g_deko3dOptions.placeCompileThread)  // sasrt-nx (2026-11-22): the compiles float (see the option)
+            g_deko3dOptions.placeCompileThread();
+        else if (g_deko3dOptions.compileCore >= 0)
+            svcSetThreadCoreMask(CUR_THREAD_HANDLE, g_deko3dOptions.compileCore, 1u << g_deko3dOptions.compileCore);
+        s32 asked = g_deko3dOptions.compilePriority, priority = -1;
+        if (asked > 0) {
+            u64 allowed = 0;
+            if (R_SUCCEEDED(svcGetInfo(&allowed, InfoType_PriorityMask, CUR_PROCESS_HANDLE, 0)) && allowed != 0) {
+                s32 p = std::min<s32>(asked, 63);
+                while (p > 0 && !(allowed & (1ull << p)))
+                    p--;
+                asked = p > 0 ? p : asked;
+            }
+            svcSetThreadPriority(CUR_THREAD_HANDLE, u32(asked));
+        }
+        svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+        logf("image heap: the spare-chunk thread started (core %d, priority 0x%X; Deko3DSetImageSpareChunk)",
+             g_deko3dOptions.compileCore, uint32_t(priority));
+        std::unique_lock<std::mutex> lock(spareMutex);
+        for (;;) {
+            spareWake.wait(lock, [this] { return spareStop || spareWanted; });
+            if (spareStop)
+                break;
+            spareWanted = false;
+            spareMaking = true;
+            lock.unlock();
+            DkMemBlock block = nullptr;
+            const uint64_t t0 = armGetSystemTick();
+            if (!heapRoomShort() && g_imageSpare.load(std::memory_order_relaxed)) {
+                t_inImageAlloc = true;  // no empty chunks given back to make a spare one
+                block = makeBlock(ImageChunkSize, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, "image heap chunk (ahead)");
+                t_inImageAlloc = false;
+            }
+            const double ms = double(armTicksToNs(armGetSystemTick() - t0)) / 1e6;
+            if (block) {
+                size_t n = 0;
+                {
+                    std::lock_guard<std::mutex> heap(heapMutex);
+                    Chunk c;
+                    c.block = block;
+                    c.size = ImageChunkSize;
+                    c.freeList.push_back({0, ImageChunkSize});
+                    chunks.push_back(std::move(c));
+                    n = chunks.size();
+                }
+                logf("image heap: chunk %zu of %u MiB made ahead in %.1f ms (Deko3DSetImageSpareChunk)", n,
+                     ImageChunkSize >> 20, ms);
+            }
+            lock.lock();
+            spareMaking = false;
+        }
+        spareRunning = false;
+        spareDone.notify_all();
+    }
+
     bool Deko3DDevice::imageAlloc(uint32_t size, uint32_t alignment, Deko3DImageAlloc &out, bool dedicated) {
         size = alignUp(size, 256);
         alignment = std::max<uint32_t>(alignment, 256);
@@ -1687,6 +1998,7 @@ namespace plume {
                     out.offset = at;
                     out.size = size;
                     out.chunk = int32_t(bc);
+                    wantSpareLocked();  // blur-nx (2026-11-18): the next chunk made ahead if none is empty now
                     return true;
                 }
             }
@@ -1708,12 +2020,14 @@ namespace plume {
                     out.offset = at;
                     out.size = size;
                     out.chunk = int32_t(ci);
+                    wantSpareLocked();  // blur-nx (2026-11-18): the next chunk made ahead if none is empty now
                     return true;
                 }
             }
             if (pass == 0) {
                 uint32_t chunkSize = std::max(ImageChunkSize, alignUp(size + alignment, DK_MEMBLOCK_ALIGNMENT));
                 Chunk c;
+                const uint64_t made_at = armGetSystemTick();  // blur-nx (2026-11-18): how long this thread waited
                 t_inImageAlloc = true;  // banjo-nx (2026-10-28): makeBlock leaves the image heap to this thread
                 c.block = makeBlock(chunkSize, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, "image heap chunk");
                 // banjo-nx (2026-10-28, the console's OOM): the empty chunks back, then the image's own size.
@@ -1731,7 +2045,8 @@ namespace plume {
                 c.size = chunkSize;
                 c.freeList.push_back({0, chunkSize});
                 chunks.push_back(std::move(c));
-                logf("image heap: chunk %zu of %u MiB", chunks.size(), chunkSize >> 20);
+                logf("image heap: chunk %zu of %u MiB, made at once in %.1f ms (the heap's lock held)", chunks.size(),
+                     chunkSize >> 20, double(armTicksToNs(armGetSystemTick() - made_at)) / 1e6);
             }
         }
         return false;
@@ -1901,6 +2216,8 @@ namespace plume {
         usage.ssboMask = uint32_t(strtoul(field("ssbo=").c_str(), nullptr, 16));
         usage.textures = field("tex=") == "1";
         usage.txqMask = uint32_t(strtoul(field("txq=").c_str(), nullptr, 16));  // banjo-nx (2026-10-19)
+        if (const std::string twin = field("twin="); !twin.empty())  // banjo-nx (2026-11-23): one register (twinsel)
+            usage.twinRegPlusOne = uint32_t(strtoul(twin.c_str(), nullptr, 10)) + 1;
         // texb=k:textureWord:samplerWord,... in binding order
         const std::string texb = field("texb=");
         size_t q = 0;
@@ -1947,7 +2264,65 @@ namespace plume {
         return out;
     }
 
+    // banjo-nx (2026-11-01): the GLSL bytes alive (kept or unpacked) and the shader objects, for the memory report.
+    static std::atomic<uint64_t> g_glslBytes{0}, g_shaderObjects{0};
+
+    static std::shared_ptr<const std::string> countedText(std::string &&text) {
+        const uint64_t bytes = text.size();
+        g_glslBytes.fetch_add(bytes, std::memory_order_relaxed);
+        return std::shared_ptr<const std::string>(new std::string(std::move(text)), [bytes](const std::string *t) {
+            g_glslBytes.fetch_sub(bytes, std::memory_order_relaxed);
+            delete t;
+        });
+    }
+
+    // banjo-nx (2026-11-01): the last texts unpacked, held a little longer (a shader's pipelines are often made one after
+    // another: one unpack for them, not one each).
+    static constexpr uint32_t kRecentGlsl = 32;
+    static std::mutex g_recentGlslMutex;
+    static std::shared_ptr<const std::string> g_recentGlsl[kRecentGlsl];
+    static uint32_t g_recentGlslNext = 0;
+
+    std::shared_ptr<const std::string> Deko3DGlslSource::text() {
+        std::shared_ptr<const std::string> t;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (kept)
+                return kept;
+            t = unpacked.lock();
+            if (!t && loader) {
+                std::string unpackedText = loader();  // under the source's lock: one unpack of a shader at a time
+                if (!unpackedText.empty()) {
+                    t = countedText(std::move(unpackedText));
+                    unpacked = t;
+                }
+            }
+        }
+        if (t) {
+            std::lock_guard<std::mutex> lock(g_recentGlslMutex);
+            g_recentGlsl[g_recentGlslNext++ % kRecentGlsl] = t;
+        }
+        return t;
+    }
+
+    void Deko3DShaderSetGlslLoader(RenderShader *shader, std::function<std::string()> loader) {
+        auto *s = static_cast<Deko3DShader *>(shader);
+        if (s == nullptr || !s->glsl || !loader)
+            return;
+        std::lock_guard<std::mutex> lock(s->glsl->mutex);
+        s->glsl->unpacked = s->glsl->kept;  // alive while something still holds it
+        s->glsl->kept.reset();
+        s->glsl->loader = std::move(loader);
+    }
+
+    void Deko3DShaderMemory(uint64_t &shaders, uint64_t &glslBytes) {
+        shaders = g_shaderObjects.load(std::memory_order_relaxed);
+        glslBytes = g_glslBytes.load(std::memory_order_relaxed);
+    }
+
     struct Deko3DShaderImpl : Deko3DShader {
+        Deko3DShaderImpl() { g_shaderObjects.fetch_add(1, std::memory_order_relaxed); }  // banjo-nx (2026-11-01)
+        ~Deko3DShaderImpl() { g_shaderObjects.fetch_sub(1, std::memory_order_relaxed); }
         std::vector<SpecDefault> specDefaults;
         // Variants already looked up (spec values -> variant), so a pipeline does not hash the text again.
         std::mutex mutex;
@@ -1969,17 +2344,24 @@ namespace plume {
         shader->device = this;
         shader->stage = DkStage(header.stage);
         const char *glsl = static_cast<const char *>(data) + sizeof(header);
-        shader->glsl = std::make_shared<const std::string>(glsl, header.glslSize);
+        shader->glsl = std::make_shared<Deko3DGlslSource>();  // banjo-nx (2026-11-01): kept until a loader is set
+        shader->glsl->kept = countedText(std::string(glsl, header.glslSize));
+        const std::string &text = *shader->glsl->kept;
         if (header.dkshSize)
             shader->defaultDksh.assign(reinterpret_cast<const uint8_t *>(glsl) + header.glslSize,
                                        reinterpret_cast<const uint8_t *>(glsl) + header.glslSize + header.dkshSize);
-        shader->usage = parseUsage(*shader->glsl);
+        shader->usage = parseUsage(text);
         // banjo-nx (2026-10-27): a vertex shader whose text never names gl_VertexID cannot read it, in any variant (a
         // variant's defines only remove code): its draws may give their base vertex to the draw (Renut's whole-buffer
         // draws), the vertex index it does not read being the only thing that differs.
-        shader->usage.readsVertexId = shader->stage != DkStage_Vertex || shader->glsl->find("gl_VertexID") != std::string::npos;
+        shader->usage.readsVertexId = shader->stage != DkStage_Vertex || text.find("gl_VertexID") != std::string::npos;
+        // banjo-nx (2026-11-23, banjo_renut_tile_twin_merge): twinsel's own read of it counts (dk_twin_lower).
+        shader->usage.readsFragCoord = shader->stage != DkStage_Fragment || text.find("gl_FragCoord") != std::string::npos;
         // vivapinata-nx (2026-11-03, tools/deko3d_glsl_opt.py vskill): a vertex shader with the kill's constant 914.
-        shader->usage.writesVertexKill = shader->stage == DkStage_Vertex && shader->glsl->find("SPIRV_CROSS_CONSTANT_ID_914") != std::string::npos;
+        shader->usage.writesVertexKill = shader->stage == DkStage_Vertex && text.find("SPIRV_CROSS_CONSTANT_ID_914") != std::string::npos;
+        // blur-nx (2026-11-12): see Deko3DShaderUsage::writesClipDistance.
+        shader->usage.writesClipDistance = (shader->stage != DkStage_Vertex && shader->stage != DkStage_Geometry) ||
+                                           text.find("gl_ClipDistance") != std::string::npos;
         // banjo-nx (2026-10-18): the varying locations it declares ("layout(location = N) in / out" lines).
         // katamari-nx (2026-11-01, rc10's black screen): an interpolation qualifier may come first ("layout(location = N)
         // centroid in", XenosRecomp's inputs the shader's header samples at the centroid); without it, those inputs were
@@ -1987,10 +2369,10 @@ namespace plume {
         {
             const char *key = "\nlayout(location = ";
             size_t p = 0;
-            while ((p = shader->glsl->find(key, p)) != std::string::npos) {
+            while ((p = text.find(key, p)) != std::string::npos) {
                 p += strlen(key);
                 char *end = nullptr;
-                const unsigned long loc = strtoul(shader->glsl->c_str() + p, &end, 10);
+                const unsigned long loc = strtoul(text.c_str() + p, &end, 10);
                 if (loc >= 32 || !end || strncmp(end, ") ", 2) != 0)
                     continue;
                 const char *q = end + 2;
@@ -2007,11 +2389,11 @@ namespace plume {
             }
         }
         {
-            const size_t z = shader->glsl->find("\n// banjo-vszero=0x");
+            const size_t z = text.find("\n// banjo-vszero=0x");
             if (z != std::string::npos)
-                shader->usage.zeroOutputMask = uint32_t(strtoul(shader->glsl->c_str() + z + 19, nullptr, 16));  // after "0x"
+                shader->usage.zeroOutputMask = uint32_t(strtoul(text.c_str() + z + 19, nullptr, 16));  // after "0x"
         }
-        shader->specDefaults = parseSpecDefaults(*shader->glsl);
+        shader->specDefaults = parseSpecDefaults(text);
         for (const SpecDefault &d : shader->specDefaults)
             shader->specIds.push_back(d.id);
         return shader;
@@ -2029,7 +2411,9 @@ namespace plume {
             std::lock_guard<std::mutex> lock(compileMutex);  // compile() reads it under the lock
             compileThreadHandle = threadGetCurHandle();
         }
-        if (g_deko3dOptions.compileCore >= 0)
+        if (g_deko3dOptions.placeCompileThread)  // sasrt-nx (2026-11-22): the compiles float (see the option)
+            g_deko3dOptions.placeCompileThread();
+        else if (g_deko3dOptions.compileCore >= 0)
             svcSetThreadCoreMask(CUR_THREAD_HANDLE, g_deko3dOptions.compileCore, 1u << g_deko3dOptions.compileCore);
         // banjo-nx (2026-10-23): the priority the process may give (the console's profile showed this thread at 0x3B in
         // every report: 0x3E is below an application's lowest, the game threads' 0x3B, and the kernel refused it while
@@ -2076,11 +2460,43 @@ namespace plume {
             CompileJob *job = nullptr;
             {
                 std::unique_lock<std::mutex> lock(compileMutex);
-                compileWake.wait(lock, [this] { return compileStop || !compileQueue.empty(); });
+                // banjo-nx (2026-11-20, the user: the compiler at most backgroundCompileShare % of its core, every
+                // compile counted): a compile waits out compileRestUntilNs unless a drawing thread waits for it; a
+                // cache read never waits (milliseconds). A new job wakes the wait, so a draw's compile or a read that
+                // arrives during a rest goes at once.
+                // 2026-11-20 (second build): the first such job anywhere in the queue, not only at its front: a compile
+                // the prebuild waits for is queued ahead of the background ones too, so a draw's compile could sit
+                // behind one during a rest (up to the 60 s cap). Such a job also goes ahead of a prebuild's compile
+                // when no rest is due (the prebuild is a background thread; the game waits for the draw).
+                std::vector<CompileJob *>::iterator pick;
+                for (;;) {
+                    compileWake.wait(lock, [this] { return compileStop || !compileQueue.empty(); });
+                    if (compileStop)
+                        break;
+                    // And while a drawing thread waits for a pipeline the prebuild builds (Deko3DHurryCompiles), the
+                    // prebuild's compiles too.
+                    const bool hurry = g_compileHurry.load(std::memory_order_relaxed) > 0;
+                    // 2026-11-20 (the city on the console): and an urgent compile (a fetch-specialised pipeline the
+                    // draws use the generic one for meanwhile): with the rest, Showdown Town's terrain pipelines came
+                    // 33-68 s late, the GPU at 51 ms a frame instead of 34 until then, and the prebuild's other
+                    // (cached) pipelines queued behind them.
+                    pick = std::find_if(compileQueue.begin(), compileQueue.end(), [hurry](const CompileJob *j) {
+                        return (j->async && j->cached) || (!j->async && (j->drawWaits || j->urgent || hurry));
+                    });
+                    if (pick != compileQueue.end())
+                        break;
+                    const uint64_t now = armTicksToNs(armGetSystemTick());
+                    if (compileRestUntilNs <= now) {
+                        pick = compileQueue.begin();
+                        break;
+                    }
+                    compileWake.wait_for(lock, std::chrono::nanoseconds(compileRestUntilNs - now));
+                    g_deko3dStats.backgroundRestNs += armTicksToNs(armGetSystemTick()) - now;
+                }
                 if (compileStop)
                     break;
-                job = compileQueue.front();
-                compileQueue.erase(compileQueue.begin());
+                job = *pick;
+                compileQueue.erase(pick);
             }
             // banjo-nx (2026-10-23, asyncCacheReads): a variant the cache file holds, read here (the drawing thread
             // went on with the generic variant). No rest after it: it is a read, not a compile.
@@ -2097,7 +2513,10 @@ namespace plume {
             }
             // banjo-nx (2026-10-21): a background job's text, made now from the shared one (one at a time).
             if (job->async) {
-                const std::string &glsl = *job->request.glsl;
+                // banjo-nx (2026-11-01): unpacked now (Deko3DGlslSource); none: an empty text, which fails to compile.
+                static const std::string noText;
+                const std::shared_ptr<const std::string> text = job->request.glsl ? job->request.glsl->text() : nullptr;
+                const std::string &glsl = text ? *text : noText;
                 const size_t nl = job->request.defines.empty() ? std::string::npos : glsl.find('\n');
                 if (nl == std::string::npos) {
                     job->ownSource = glsl;
@@ -2117,7 +2536,7 @@ namespace plume {
                 if (logged < 4) {
                     logged++;
                     uint64_t hf = 0, pf = 0;
-                    memoryFigures(hf, pf);
+                    memoryFiguresQuick(hf, pf);  // port 161: no heap walk
                     logf("uam: compile %u (stage %u, %zu bytes of GLSL; heap %" PRIu64 " MB free, process %" PRIu64 " MB unused)",
                          logged, uint32_t(job->stage), job->source->size(), hf >> 20, pf >> 20);
                 }
@@ -2168,6 +2587,19 @@ namespace plume {
                 g_deko3dStats.fastCompiles++;
             g_deko3dStats.shaderCompileNs += armTicksToNs(armGetSystemTick()) - t0;
             g_deko3dStats.shaderCompiles++;
+            // banjo-nx (2026-11-20, the user: at most backgroundCompileShare % of the core for every compile): this
+            // compile's time, whoever waited for it, adds a rest in proportion (at most 60 s of rest outstanding); the
+            // next compile no drawing thread waits for starts after it (see the loop's top).
+            {
+                const int share = g_deko3dOptions.backgroundCompileShare;
+                if (share > 0 && share < 100) {
+                    const uint64_t now = armTicksToNs(armGetSystemTick());
+                    const uint64_t rest = (now - t0) * uint64_t(100 - share) / uint64_t(share);
+                    std::lock_guard<std::mutex> lock(compileMutex);
+                    compileRestUntilNs = std::min<uint64_t>(std::max<uint64_t>(compileRestUntilNs, now) + rest,
+                                                            now + uint64_t(60000000000ull));
+                }
+            }
             if (job->async) {
                 job->ownSource.clear();
                 job->ownSource.shrink_to_fit();
@@ -2176,21 +2608,9 @@ namespace plume {
                 job->ownLog = std::move(r.log);
                 finishAsync(job);
                 delete job;
-                // banjo-nx (2026-10-23): at most backgroundCompileShare % of the core for background compiles (the
-                // thread cannot go below the game's threads, see compileWorker): a rest in proportion to the compile,
-                // at most 30 s (2026-10-28: was 8 s, which held the share at 20 % or more for 2 s compiles), ended by a
-                // compile a thread waits for (those go ahead of the background ones).
-                const int share = g_deko3dOptions.backgroundCompileShare;
-                if (share > 0 && share < 100) {
-                    const uint64_t t1 = armTicksToNs(armGetSystemTick());
-                    const uint64_t rest = std::min<uint64_t>((t1 - t0) * uint64_t(100 - share) / uint64_t(share),
-                                                             30000000000ull);
-                    std::unique_lock<std::mutex> lock(compileMutex);
-                    compileWake.wait_for(lock, std::chrono::nanoseconds(rest), [this] {
-                        return compileStop || (!compileQueue.empty() && !compileQueue.front()->async);
-                    });
-                    g_deko3dStats.backgroundRestNs += armTicksToNs(armGetSystemTick()) - t1;
-                }
+                // banjo-nx (2026-10-23; 2026-11-20): the rest is taken at the loop's top (compileRestUntilNs), for
+                // every compile; before, only background compiles rested, and a compile the prebuild waited for ended
+                // the rest: 86 compiles in 10 minutes took 26 % of core 3 on the console.
                 continue;
             }
             {
@@ -2210,6 +2630,9 @@ namespace plume {
 
     // banjo-nx (2026-10-21): set on threads that do not draw (Deko3DSetBackgroundThread): the pipeline prebuild.
     static thread_local bool t_backgroundThread = false;
+    // banjo-nx (2026-10-31, Deko3DSetDrawVariants): the background thread builds a pipeline a draw is waiting for (it
+    // draws with the generic variants meanwhile): its variants are queued as a draw's.
+    static thread_local bool t_drawVariants = false;
     // banjo-nx (2026-11-01, Deko3DSetUrgentVariants): the pipeline this thread builds draws much slower with the generic
     // variant (banjo_gpu_fetch_spec): its variants compiled now, on this thread (a compile it waits for: ahead of the
     // background ones), not queued in the background.
@@ -2257,6 +2680,7 @@ namespace plume {
         job.log = &log;
         // banjo-nx (2026-10-23): a blocking compile: a drawing thread (the game stops) or a background one (prebuild).
         job.drawWaits = !t_backgroundThread;
+        job.urgent = t_urgentVariants;  // banjo-nx (2026-11-20): no compile rest (see the uam loop)
         // banjo-nx (2026-10-18): the waiting thread's priority, lent to the uam thread while it waits (the render
         // thread must not wait behind the game's threads for a low-priority compile).
         s32 waiterPriority = 0;
@@ -2418,6 +2842,14 @@ namespace plume {
         return shader != nullptr && loc < 32 && (static_cast<const Deko3DShader *>(shader)->usage.inputMask >> loc) & 1u;
     }
 
+    bool Deko3DShaderReadsFragCoord(const RenderShader *shader) {
+        return shader == nullptr || static_cast<const Deko3DShader *>(shader)->usage.readsFragCoord;
+    }
+
+    uint32_t Deko3DShaderTwinRegPlusOne(const RenderShader *shader) {
+        return shader != nullptr ? static_cast<const Deko3DShader *>(shader)->usage.twinRegPlusOne : 0;
+    }
+
     bool Deko3DShaderReadsVertexId(const RenderShader *shader) {
         return shader == nullptr || static_cast<const Deko3DShader *>(shader)->usage.readsVertexId;
     }
@@ -2427,7 +2859,13 @@ namespace plume {
     bool g_deko3dProvisionalCount = true;
     void Deko3DSetProvisionalCount(bool on) { g_deko3dProvisionalCount = on; }
 
+    static std::atomic<uint64_t> g_graphicsPipelines{0};  // banjo-nx (2026-11-01)
+    uint64_t Deko3DPipelineCount() { return g_graphicsPipelines.load(std::memory_order_relaxed); }
+    Deko3DGraphicsPipeline::Deko3DGraphicsPipeline() { g_graphicsPipelines.fetch_add(1, std::memory_order_relaxed); }
+
     Deko3DGraphicsPipeline::~Deko3DGraphicsPipeline() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
+        g_graphicsPipelines.fetch_sub(1, std::memory_order_relaxed);
         if (provisional.load(std::memory_order_relaxed))
             g_deko3dProvisionalPipelines.fetch_sub(1, std::memory_order_relaxed);
     }
@@ -2565,7 +3003,17 @@ namespace plume {
     }
 
     void Deko3DSetBackgroundThread(bool background) { t_backgroundThread = background; }
+    void Deko3DSetDrawVariants(bool draw) { t_drawVariants = draw; }
     void Deko3DSetUrgentVariants(bool urgent) { t_urgentVariants = urgent; }
+    void Deko3DHurryCompiles(bool waiting) {
+        g_compileHurry.fetch_add(waiting ? 1 : -1, std::memory_order_relaxed);
+        if (waiting && g_imageDevice) {
+            // Under the lock: the uam thread looks at g_compileHurry and starts its wait with the lock held, so this
+            // wake is not lost between the two.
+            { std::lock_guard<std::mutex> lock(g_imageDevice->compileMutex); }
+            g_imageDevice->compileWake.notify_all();
+        }
+    }
 
     // At most this many background threads' requests wait at a time (each a few hundred bytes, but the uam thread does
     // about one a second on the console: a pipeline-list prebuild over a cache that lacks them would queue thousands).
@@ -2610,6 +3058,35 @@ namespace plume {
         }
         compileWake.notify_one();
         return true;
+    }
+
+    // banjo-nx (2026-11-20, logMisses): a variant the draw got the generic one for, once per key, as the compile log's
+    // "run-time variant" line: its kind, the stage, the variant text's size, the base text's size and FNV-1a 64 (the GLSL
+    // file tools/deko3d_variant_cache.py --runtime-log matches it to) and its constants ("ID VALUEu;").
+    static void logMissedVariant(uint64_t key, uint32_t stage, const std::string &glsl, const std::string &defines,
+                                 size_t sourceSize) {
+        static std::mutex mutex;
+        static std::unordered_set<uint64_t> seen;
+        static constexpr size_t kCap = 60000;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (seen.size() >= kCap || !seen.insert(key).second)
+                return;
+        }
+        static const char *kDefine = "#define SPIRV_CROSS_CONSTANT_ID_";
+        std::string list;
+        size_t at = 0;
+        while ((at = defines.find(kDefine, at)) != std::string::npos) {
+            at += strlen(kDefine);
+            const size_t end = defines.find('\n', at);
+            list.append(defines, at, (end == std::string::npos ? defines.size() : end) - at);
+            list += ';';
+            if (end == std::string::npos)
+                break;
+            at = end + 1;
+        }
+        logf("uam: missed (generic meanwhile) run-time variant (stage %u, %zu bytes, base %zu bytes %016" PRIx64 "): %s",
+             stage, sourceSize, glsl.size(), fnv1a64(glsl.data(), glsl.size()), list.c_str());
     }
 
     const DkShader *Deko3DDevice::loadVariant(const Deko3DShader *base, const RenderSpecConstant *specConstants, uint32_t specConstantsCount,
@@ -2665,7 +3142,15 @@ namespace plume {
             return generic();
         // The variant's text: the GLSL with the constants defined after its first line (#version).
         std::string source;
-        const std::string &glsl = *shader->glsl;
+        // banjo-nx (2026-11-01): unpacked if need be (Deko3DGlslSource), held until the key and any compile are made.
+        const std::shared_ptr<const std::string> glslText = shader->glsl->text();
+        if (!glslText) {
+            static std::atomic<uint32_t> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                logf("loadVariant: the GLSL of %s could not be unpacked: no variant", shader->name.c_str());
+            return nullptr;
+        }
+        const std::string &glsl = *glslText;
         const size_t nl = glsl.find('\n');
         if (defines.empty() || nl == std::string::npos) {
             source = glsl;
@@ -2708,7 +3193,7 @@ namespace plume {
                     pending->defines = defines;
                     pending->stage = shader->stage;
                     pending->name = shader->name;
-                    queueAsync(*pending, t_backgroundThread, true);
+                    queueAsync(*pending, t_backgroundThread && !t_drawVariants, true);
                     g_deko3dStats.variantFallbacks++;
                     return fallback;
                 }
@@ -2726,7 +3211,9 @@ namespace plume {
                 pending->defines = defines;
                 pending->stage = shader->stage;
                 pending->name = shader->name;
-                queueAsync(*pending, t_backgroundThread);  // no room: the draw that needs it queues it (refresh)
+                queueAsync(*pending, t_backgroundThread && !t_drawVariants);  // no room: the draw that needs it queues it (refresh)
+                if (g_deko3dOptions.logMisses)  // banjo-nx (2026-11-20)
+                    logMissedVariant(key, uint32_t(shader->stage), glsl, defines, source.size());
                 return generic();
             }
             if (!have && noCompile)
@@ -2887,6 +3374,20 @@ namespace plume {
             const Deko3DShader *vs = static_cast<const Deko3DShader *>(desc.vertexShader);
             if (desc.specConstants[i].index == 929 && desc.specConstants[i].value == 0 && vs &&
                 std::find(vs->specIds.begin(), vs->specIds.end(), 929u) != vs->specIds.end())
+                p->noUserClip = true;
+        }
+        // blur-nx (2026-11-12, Blur's black band on the console; the user: "it's probably some clipping issue / seems
+        // like deko3d only"): the clip slot off as well when the last stage before the rasterizer (the geometry shader,
+        // or else the vertex shader) writes no clip distance. Deko3DOptions::userClipEnable turns slot 0 on for every
+        // other draw (rr6-nx's fix for deko3d leaving every slot on), and Renut's host passes draw with present_vs, which
+        // writes none: on the console the hardware then clipped their full-screen triangle on whatever that output held,
+        // so a colour resolve (drawn on deko3d alone: DrawResolveCopy) could fill only a band of the target and the passes
+        // reading it showed the rest black (Blur's race intro). Ryujinx clips only with what a shader writes, which is why
+        // neither it nor the PC ever showed it. A shader that writes no clip distance asks for no clipping: exact.
+        {
+            const Deko3DShader *last = static_cast<const Deko3DShader *>(desc.geometryShader ? desc.geometryShader
+                                                                                             : desc.vertexShader);
+            if (last && !last->usage.writesClipDistance)
                 p->noUserClip = true;
         }
         // banjo-nx (2026-10-21, asyncVariants): the epoch before any of its variants is queued, so one done meanwhile
@@ -3292,3 +3793,126 @@ namespace plume {
         return d && d->queue && dkQueueIsInErrorState(d->queue);
     }
 };
+
+// blur-nx (2026-11-18, the map-load crashes: Video::KickLocked -> dkQueueSubmitCommands or dkQueueFlush ->
+// dk::detail::RaiseError(DkResult_Fail) -> diagAbortWithResult, Atmosphère's 2359-0001). deko3d 0.5.0 raises that error
+// when libnx's gpfifo kickoff fails and the channel holds no error notification: Queue::appendGpfifoEntries and
+// Queue::flush then ask Queue::checkError(), which returns false. So it is not a GPU fault: nvservices refused the
+// submission. libnx's nvGpuChannelKickoff retries nvservices' Busy every 100 ms and returns any other refusal. The
+// ioctl is wrapped here (-Wl,--wrap=nvioctlChannel_KickoffPb, plume's CMakeLists.txt). The largest submissions are
+// logged. A refusal is logged with its result, and the submission is sent again in two halves (and so on down), with
+// the gpfifo entries in their order, so the GPU runs the same commands. The first half carries the submission's
+// syncpoint increments (flag 8: nvservices raises the syncpoint's expected value by fence.value; the increment
+// commands are in deko3d's entries). The expected value then runs ahead of the GPU until the second half's
+// increments run, the state of any submission in flight. The second half is a plain one (libnx's flags without
+// increments).
+extern "C" Result __real_nvioctlChannel_KickoffPb(u32 fd, nvioctl_gpfifo_entry *entries, u32 num_entries, u32 flags,
+                                                  nvioctl_fence *fence_inout);
+extern "C" Result __wrap_nvioctlChannel_KickoffPb(u32 fd, nvioctl_gpfifo_entry *entries, u32 num_entries, u32 flags,
+                                                  nvioctl_fence *fence_inout);
+
+namespace plume {
+    static std::atomic<uint32_t> g_kickoffMost{0}, g_kickoffLogged{0}, g_kickoffRefusalLines{0};
+    static std::atomic<uint64_t> g_kickoffRefusals{0}, g_kickoffResent{0};
+    static constexpr uint32_t kKickoffIncrementFlag = 1u << 8;  // nvservices: the syncpoint raised by fence.value
+    static constexpr uint32_t kKickoffRefusalLines = 48;
+    static constexpr Result kKickoffBusy = MAKERESULT(Module_LibnxNvidia, LibnxNvidiaError_Busy);
+
+    static void kickoffRefused(Result r, const nvioctl_gpfifo_entry *entries, uint32_t count, uint32_t flags,
+                               const nvioctl_fence &fence, uint32_t depth) {
+        const uint64_t n = g_kickoffRefusals.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (g_kickoffRefusalLines.fetch_add(1, std::memory_order_relaxed) >= kKickoffRefusalLines)
+            return;
+        uint64_t words = 0;
+        uint32_t biggest = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const uint32_t w = (entries[i].desc32[1] >> 10) & 0x1FFFFFu;  // the entry's length in words
+            words += w;
+            biggest = std::max(biggest, w);
+        }
+        uint64_t heapFree = 0, processFree = 0, used = 0, total = 0;
+        memoryFigures(heapFree, processFree);
+        systemResource(used, total);
+        logf("nvservices REFUSED a GPU submission (refusal %" PRIu64 ", split depth %u): result 0x%X (module %u, "
+             "description %u); %u gpfifo entries (%" PRIu64 " command words, the largest entry %u), flags 0x%X, "
+             "syncpoint %u +%u; blocks %u live (%" PRIu64 " MB), GPU region %" PRIu64 " MB, heap %" PRIu64
+             " MB free, process %" PRIu64 " MB unused, system resource %" PRIu64 " of %" PRIu64 " KiB; %s",
+             n, depth, unsigned(r), unsigned(R_MODULE(r)), unsigned(R_DESCRIPTION(r)), count, words, biggest, flags,
+             fence.id, fence.value, g_blocksLive.load(std::memory_order_relaxed),
+             g_blocksLiveBytes.load(std::memory_order_relaxed) >> 20,
+             g_regionBytesNow.load(std::memory_order_relaxed) >> 20, heapFree >> 20, processFree >> 20, used >> 10,
+             total >> 10, count > 1 ? "sent again in halves" : "one entry: nothing to split (deko3d aborts)");
+    }
+
+    static Result kickoffHalves(u32 fd, nvioctl_gpfifo_entry *entries, u32 count, u32 flags, nvioctl_fence *fence,
+                                u32 depth);
+
+    // One part. nvservices' Busy is waited out here, as libnx does (libnx's own retry would send the whole submission
+    // again). A refusal is split again.
+    static Result kickoffPart(u32 fd, nvioctl_gpfifo_entry *entries, u32 count, u32 flags, nvioctl_fence *fence,
+                              u32 depth) {
+        for (;;) {
+            nvioctl_fence f = *fence;
+            const Result r = __real_nvioctlChannel_KickoffPb(fd, entries, count, flags, &f);
+            if (r == kKickoffBusy) {
+                svcSleepThread(100'000'000);
+                continue;
+            }
+            if (R_SUCCEEDED(r)) {
+                *fence = f;
+                return r;
+            }
+            kickoffRefused(r, entries, count, flags, *fence, depth);
+            return count > 1 ? kickoffHalves(fd, entries, count, flags, fence, depth + 1) : r;
+        }
+    }
+
+    static Result kickoffHalves(u32 fd, nvioctl_gpfifo_entry *entries, u32 count, u32 flags, nvioctl_fence *fence,
+                                u32 depth) {
+        const u32 first = count / 2;
+        nvioctl_fence a = *fence;  // the first half: the increments
+        Result r = kickoffPart(fd, entries, first, flags, &a, depth);
+        if (R_FAILED(r))
+            return r;
+        nvioctl_fence b{fence->id, 0};
+        r = kickoffPart(fd, entries + first, count - first, flags & ~kKickoffIncrementFlag, &b, depth);
+        if (R_FAILED(r))
+            return r;
+        *fence = a;
+        return r;
+    }
+
+}  // namespace plume
+
+extern "C" __attribute__((used)) Result __wrap_nvioctlChannel_KickoffPb(u32 fd, nvioctl_gpfifo_entry *entries,
+                                                                        u32 num_entries, u32 flags,
+                                                                        nvioctl_fence *fence_inout) {
+    using namespace plume;
+    if (num_entries > g_kickoffMost.load(std::memory_order_relaxed)) {
+        g_kickoffMost.store(num_entries, std::memory_order_relaxed);
+        if (num_entries >= 64 && (num_entries >= 2 * g_kickoffLogged.load(std::memory_order_relaxed) || num_entries >= 1024)) {
+            g_kickoffLogged.store(num_entries, std::memory_order_relaxed);
+            logf("nvservices: a GPU submission of %u gpfifo entries, the most so far (libnx sends at most 2048)",
+                 num_entries);
+        }
+    }
+    const nvioctl_fence in = *fence_inout;
+    const Result r = __real_nvioctlChannel_KickoffPb(fd, entries, num_entries, flags, fence_inout);
+    if (R_SUCCEEDED(r) || r == kKickoffBusy)
+        return r;  // (Busy: nothing was sent; libnx waits 100 ms and sends it again, as before)
+    kickoffRefused(r, entries, num_entries, flags, in, 0);
+    if (num_entries < 2)
+        return r;
+    nvioctl_fence f = in;
+    const Result s = kickoffHalves(fd, entries, num_entries, flags, &f, 1);
+    if (R_SUCCEEDED(s)) {
+        *fence_inout = f;
+        const uint64_t resent = g_kickoffResent.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (resent <= 16 || (resent & 63) == 0)
+            logf("nvservices: the refused submission went in as parts (%" PRIu64 " so far)", resent);
+    } else {
+        logf("nvservices: the refused submission could not be sent in parts either: result 0x%X (deko3d aborts)",
+             unsigned(s));
+    }
+    return s;
+}

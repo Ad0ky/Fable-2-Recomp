@@ -55,6 +55,7 @@ extern "C" const bool g_banjo_store_cards = false;
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>  // blur-nx (2026-11-16): banjo_hot_guard_keep
 #include <chrono>
 #include <cmath>    // port 72: the VMX fuzz's absolute error
 #include <cstdio>
@@ -88,6 +89,16 @@ REXCVAR_DECLARE(bool, banjo_cpu_verify);
 // atomic or outside call). Counted and logged only: a hand-written native in front of a callee can make the two forms
 // stop at different points, and another thread can change a counter between the two runs (sasrt-nx's console: 6 of
 // 5.07 million differed, one byte each), so a difference here does not switch the copy off.
+// blur-nx (2026-11-13, #69 of docs/cpu-near-exact-50-1113.md's second wave): the guard's register compare takes a NaN
+// that differs only in its sign bit (a float register, or a vector lane) as the same. The sign of a NaN an arithmetic
+// operation makes is the compiler's choice (a negation folded into a multiply-add or not), so the copy and the generated
+// code can differ there with the same source: the 4 differences of 2026-11-13's guard race (frsqrte of 0, then inf x 0).
+// Counted apart in the [hot] summary. Memory is still compared byte for byte.
+REXCVAR_DEFINE_BOOL(banjo_cpu_verify_nan_sign, true, "Banjo/Enhancements",
+                    "The guard: a register NaN differing only in its sign bit counts as the same (counted apart); "
+                    "false: every bit compared")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+std::atomic<uint64_t> g_guard_nan_sign_only{0};
 REXCVAR_DEFINE_BOOL(banjo_hot_guard_prefix, true, "Banjo/Enhancements",
                     "The guard: when the copy and the original both stop (an atomic or a call outside the copy), compare "
                     "the stores each made before it (counted in the [hot] summary; a difference is logged, not acted on)")
@@ -101,6 +112,14 @@ REXCVAR_DEFINE_INT32(sasrt_test_vmx_fuzz, 0, "Banjo/Enhancements",
                      "Test: compare the fast VMX estimate and multiply-add forms with the exact ones over N million "
                      "lanes on the console (\"[vmxfuzz]\" lines; 0 off)")
     .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// blur-nx (2026-11-16, the user: "make it so you can turn off certain functions from the guard switch off"): the
+// functions whose hook the guard never switches off. It still compares them and logs a repeated difference (the first
+// few per hook), but the hook stays on. A list of guest addresses or names, comma separated ("8230AD50,822DA210" or
+// "sub_8230AD50"); empty: the guard as before.
+REXCVAR_DEFINE_STRING(banjo_hot_guard_keep, "", "Banjo/Enhancements",
+                      "The guard: functions (comma-separated guest addresses or sub_ names) whose native copy it never "
+                      "switches off; a difference is logged and the copy stays on")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(banjo_hot_guard_calls, 64, "Banjo/Enhancements",
                      "Native copies of hot game functions: the first N guarded calls of each thread come one after "
@@ -125,6 +144,11 @@ REXCVAR_DEFINE_BOOL(banjo_hot_poison_dead, false, "Banjo/Enhancements",
                     "Check (hooked builds): after each unguarded run of a copy, overwrite the registers the guard does "
                     "not compare (dead after the return by LiveOut: tools/reg_liveness.py, leaf_dead_stores.py) with "
                     "garbage, so a wrong LiveOut shows. Diagnostic only; costs a test per call")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_hot_bulk_lines, false, "Banjo/Diagnostics",
+                    "Verify runs (2026-11-19): about once a minute the guard's report also has a line per reached bulk "
+                    "copy ('[hot] bulk reached <name> on|off: N compared, M not comparable'), to see which copies of a "
+                    "new list a run reached")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(banjo_hot_count, false, "Banjo/Enhancements",
                     "Measurement (PC): every native copy runs in its counting form and logs/hot_counts.txt gets how "
@@ -401,7 +425,22 @@ const PPCCRRegister* Cr(const PPCContext& c, int n) { return &c.cr0 + n; }  // c
 
 // First difference between two contexts (every register but the hook's skip set), or an empty string. a: the copy;
 // b: the original.
+// blur-nx (2026-11-13, #69, banjo_cpu_verify_nan_sign): x and y are the same NaN but for the sign bit.
+bool NanSignOnly64(uint64_t x, uint64_t y) {
+  return (x ^ y) == 0x8000000000000000ull && (x & 0x7FF0000000000000ull) == 0x7FF0000000000000ull &&
+         (x & 0x000FFFFFFFFFFFFFull) != 0;
+}
+bool NanSignOnly128(const PPCVRegister& x, const PPCVRegister& y) {
+  for (int k = 0; k < 4; ++k) {
+    const uint32_t a = x.u32[k], b = y.u32[k];
+    if (a != b && !((a ^ b) == 0x80000000u && (a & 0x7F800000u) == 0x7F800000u && (a & 0x007FFFFFu) != 0))
+      return false;
+  }
+  return true;
+}
+
 std::string CompareRegisters(const PPCContext& a, const PPCContext& b, const RegSkip& skip) {
+  static const bool nan_sign = REXCVAR_GET(banjo_cpu_verify_nan_sign);
   for (int i = 0; i < 32; ++i) {
     if ((skip.gpr >> i) & 1) continue;
     if (Gpr(a, i)->u64 != Gpr(b, i)->u64)
@@ -409,12 +448,21 @@ std::string CompareRegisters(const PPCContext& a, const PPCContext& b, const Reg
   }
   for (int i = 0; i < 32; ++i) {
     if ((skip.fpr >> i) & 1) continue;
-    if (Fpr(a, i)->u64 != Fpr(b, i)->u64)
+    if (Fpr(a, i)->u64 != Fpr(b, i)->u64) {
+      if (nan_sign && NanSignOnly64(Fpr(a, i)->u64, Fpr(b, i)->u64)) {
+        g_guard_nan_sign_only.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
       return fmt::format("f{} copy={:#018x} original={:#018x}", i, Fpr(a, i)->u64, Fpr(b, i)->u64);
+    }
   }
   for (int i = 0; i < 128; ++i) {
     if ((skip.vr[i >> 6] >> (i & 63)) & 1) continue;
     if (std::memcmp(Vr(a, i)->u8, Vr(b, i)->u8, 16) != 0) {
+      if (nan_sign && NanSignOnly128(*Vr(a, i), *Vr(b, i))) {
+        g_guard_nan_sign_only.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
       const auto* x = Vr(a, i)->u32;
       const auto* y = Vr(b, i)->u32;
       return fmt::format("v{} copy={:08x}{:08x}{:08x}{:08x} original={:08x}{:08x}{:08x}{:08x}", i, x[0], x[1], x[2],
@@ -922,6 +970,37 @@ Outcome Attempt(Hook& h, PPCContext& ctx, uint8_t* base, Scratch& t, std::string
 
 }  // namespace
 
+namespace {
+// blur-nx (2026-11-16): banjo_hot_guard_keep: is this hook's function on the list? (The list read once.)
+bool KeptByGuard(const Hook& h) {
+  static const std::vector<std::string> list = [] {
+    std::vector<std::string> out;
+    const std::string text = REXCVAR_GET(banjo_hot_guard_keep);
+    size_t at = 0;
+    while (at <= text.size()) {
+      size_t comma = text.find(',', at);
+      if (comma == std::string::npos) comma = text.size();
+      std::string item = text.substr(at, comma - at);
+      while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.erase(item.begin());
+      while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.pop_back();
+      if (item.rfind("sub_", 0) == 0) item = item.substr(4);
+      for (char& c : item) c = char(std::toupper(static_cast<unsigned char>(c)));
+      if (!item.empty()) out.push_back(item);
+      at = comma + 1;
+    }
+    if (!out.empty()) REXLOG_INFO("[hot] banjo_hot_guard_keep: {} function(s) the guard never switches off", out.size());
+    return out;
+  }();
+  if (list.empty() || !h.name) return false;
+  std::string name = h.name;
+  if (name.rfind("sub_", 0) == 0) name = name.substr(4);
+  for (char& c : name) c = char(std::toupper(static_cast<unsigned char>(c)));
+  for (const std::string& item : list)
+    if (item == name) return true;
+  return false;
+}
+}  // namespace
+
 void Check(Hook& h, PPCContext& ctx, uint8_t* base, uint32_t& counter) {
   // The next guarded call of this thread: at once while it is still in its first guard_calls (or in verify mode),
   // else after `period` calls. The counter word: banjo_hot_guest.h.
@@ -984,7 +1063,14 @@ void Check(Hook& h, PPCContext& ctx, uint8_t* base, uint32_t& counter) {
     // It repeated.
     h.compared.fetch_add(1, std::memory_order_relaxed);
     ::me::native::g_verify_native_checks.fetch_add(1, std::memory_order_relaxed);
-    h.differences.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t nth = h.differences.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (KeptByGuard(h)) {
+      // blur-nx (2026-11-16): on banjo_hot_guard_keep: logged (the first three of this hook), the copy stays on.
+      if (nth <= 3)
+        REXLOG_WARN("[hot] difference in {} ({}), kept on (banjo_hot_guard_keep): {}", h.name, h.key, diff);
+      if (outcome == Outcome::kPathsDiffer) h.orig(ctx, base);  // nothing has run for real yet
+      return;
+    }
     h.state.store(kOff, std::memory_order_relaxed);
     ::me::native::VerifyDifference();
     const PPCContext& in = t.in;
@@ -1131,6 +1217,9 @@ void Report() {
   // One line per hook that was reached, so each fits the log's line and a tool reads one function per line.
   uint64_t compared = 0, not_comparable = 0, differences = 0, not_repeated = 0, prefix_equal = 0, prefix_differ = 0;
   uint32_t reached = 0, on = 0, direct = 0, bulk_total = 0, bulk_reached = 0, bulk_on = 0;
+  // banjo_hot_bulk_lines: every 6th report (about once a minute), so a long run's log stays small.
+  static uint32_t report_number = 0;
+  const bool bulk_lines = REXCVAR_GET(banjo_hot_bulk_lines) && (report_number++ % 6) == 0;
   for (Hook* h = g_hooks; h; h = h->next) {
     const uint8_t state = h->state.load(std::memory_order_relaxed);
     bulk_total += h->bulk;
@@ -1152,6 +1241,12 @@ void Report() {
       if (d)
         REXLOG_INFO("[hot] {} (bulk) off after {} difference(s); {} calls compared before", h->name, d,
                     h->compared.load(std::memory_order_relaxed));
+      // banjo-nx (2026-11-19, the rebase; a handoff): banjo_hot_bulk_lines, a line per reached bulk copy, so a verify
+      // run shows which copies of a new list the guard reached (the guide: verified only with the counts showing it).
+      else if (bulk_lines)
+        REXLOG_INFO("[hot] bulk reached {} {}: {} compared, {} not comparable", h->name,
+                    state == kOn || state == kDirect ? "on" : "off", h->compared.load(std::memory_order_relaxed),
+                    h->not_comparable.load(std::memory_order_relaxed));
       continue;
     }
     const uint64_t c = h->compared.load(std::memory_order_relaxed);
@@ -1170,9 +1265,10 @@ void Report() {
   REXLOG_INFO("[hot] native copies: {} reached, {} on ({} direct, no guard); bulk copies (banjo_cpu_native_bulk {}): {} "
               "of {} reached, {} on; {} calls compared so far, {} not comparable ({} of them stopped in both forms "
               "with the same stores before the stop, {} not), {} differed once and not when repeated, differences: "
-              "{}{}",
+              "{} (registers that differed only in a NaN's sign, taken as the same: {}){}",
               reached, on, direct, REXCVAR_GET(banjo_cpu_native_bulk) ? "on" : "off", bulk_reached, bulk_total, bulk_on,
               compared, not_comparable, prefix_equal, prefix_differ, not_repeated, differences,
+              g_guard_nan_sign_only.load(std::memory_order_relaxed),  // blur-nx (2026-11-13, #69)
               // port 78, its idea 27: a build without the guard's forms compares nothing, whatever the keys say.
               BANJO_HOT_GUARD_FORMS ? "" : " (this build has no guard forms, SASRT_HOT_GUARD_FORMS OFF: nothing compared)");
 #endif  // BANJO_HOT_IN_PLACE

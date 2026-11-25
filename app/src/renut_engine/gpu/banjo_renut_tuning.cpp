@@ -1,4 +1,5 @@
 // banjo-nx (2026-10-17): see banjo_renut_tuning.h.
+#include "banjo_switch_default.h"  // banjo-nx (port 251): BANJO_SWITCH_DEFAULT
 #include "renut_engine/gpu/backend/render_thread.h"
 #include "renut_engine/gpu/backend/video.h"
 #include <rex/frame_latency.h>
@@ -8,6 +9,10 @@
 #include "renut_engine/gpu/d3d/d3d_native.h"  // banjo-nx (2026-10-26): g_touch_compare
 #include "renut_engine/gpu/backend/queued.h"
 #include "renut_engine/gpu/render/draw.h"
+#include "renut_engine/gpu/render/textures.h"  // blur-nx (2026-11-17, audit #4/#5): ResolveRemakeReport
+#include "renut_engine/gpu/stage_census.h"  // blur-nx (2026-11-17, audit #17-#22, #30)
+#include "renut_engine/gpu/host_batch.h"  // blur-nx (2026-11-18, the Renut host batch)
+#include "renut_engine/perf/frame_stats.h"  // blur-nx (2026-11-13): #37's census
 #include "renut_engine/gpu/render/graphics_options.h"  // banjo-nx (2026-10-28): dynamic resolution's ranges
 #include "renut_engine/gpu/guest/command_buffers.h"  // banjo-nx (2026-10-26): TagsReport
 #include "renut_engine/gpu/banjo_renut_record.h"
@@ -58,6 +63,7 @@ void Report();  // app/src/cpu/banjo_hot_guest.cpp: at most once every 10 s
 
 // banjo-nx's own renderer defines these (me_native_system.cpp, masseffect_native_draws.cpp); they mean the same job
 // here: the renderer's main thread and its background pipeline compiles.
+REXCVAR_DECLARE(std::string, log_level);  // sdk/src/core/logging.cpp (banjo-nx 2026-11-20, batch #4)
 REXCVAR_DECLARE(int32_t, banjo_ring_core);
 REXCVAR_DECLARE(int32_t, banjo_background_compile_core);
 // banjo-nx (2026-10-27, the user's request: NetherSX2_nx's 4-core mode). See sdk/src/core/threading_switch.h.
@@ -69,15 +75,33 @@ REXCVAR_DEFINE_BOOL(banjo_system_core_compiles, false, "Banjo/Threads",
                     "banjo_background_compile_core (off by default: core 3 was full with them and audio stuttered). "
                     "No effect with the usual three cores")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// sasrt-nx (2026-11-22, after base port 254 showed what a pinned compile does behind port 251's command stage on core 3:
+// in RR6 races one took 250-354 s): the shader compile threads (the uam thread and its spare-chunk thread, the pipeline
+// prebuild workers, the list writer, the cache saver) placed by this one key, the ring cleaner (not a compile) left to
+// banjo_system_core_compiles. The user: first "Let the shader compiles float around instead", then "Or restrict it to
+// core 2 actually": 2 by default (the game's core 2, as banjo_background_compile_core's default). -1: every core of the
+// process (with four cores, the system core too), no preferred core: the kernel places them (floating). -2: as before
+// (banjo_background_compile_core / banjo_system_core_compiles / banjo_system_core_uam).
+REXCVAR_DEFINE_INT32(sasrt_compile_threads_core, 2, "Banjo/Threads",
+                     "The shader compile threads' core (uam, the pipeline prebuild workers, the list writer, the cache "
+                     "saver): 0-3 pinned there (2: the user, 2026-11-22), -1 every core with no preferred one "
+                     "(floating), -2 as banjo_background_compile_core / banjo_system_core_compiles / "
+                     "banjo_system_core_uam place them")
+    .range(-2, 3)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // banjo-nx (2026-10-28, the user's request): the uam thread alone on the system core, with the background compiles held
 // to banjo_deko3d_background_compile_share (10 %) by their rests. The pipeline prebuild workers (bursts at area loads,
 // banjo_system_core_compiles) stay off it.
-REXCVAR_DEFINE_BOOL(banjo_system_core_uam, true, "Banjo/Threads",
+// Port 254 (2026-11-22, the user to rr6-nx: "Compile on core 2"): off by default. Port 251's command stage (0x2E) and
+// warm helper (0x2F) keep the system core busy in play, above this thread (0x3B): in RR6 races a compile there took
+// 250-354 s and the prebuild waiting on it held every specialised pipeline back (GPU +1.2 ms); on core 2, 169 ms.
+REXCVAR_DEFINE_BOOL(banjo_system_core_uam, false, "Banjo/Threads",
                     "When the process has the system core (four cores granted, banjo_system_core 1 or 2): the uam "
                     "shader compile thread runs there (at the lowest priority an application gets, so the audio "
                     "threads there go first; its background compiles rest to banjo_deko3d_background_compile_share of "
                     "the core) instead of on banjo_background_compile_core, the game's core 2. The pipeline prebuild "
-                    "workers stay where banjo_system_core_compiles puts them. No effect with the usual three cores")
+                    "workers stay where banjo_system_core_compiles puts them. Off by default (port 254: port 251's "
+                    "command stage and warm helper keep that core busy). No effect with the usual three cores")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DECLARE(int32_t, banjo_prewarm_threads);
 // banjo-nx's renderer's NVK keys (masseffect_native_draws.cpp), applied to Renut's renderer too (ControlNvkLocked).
@@ -109,6 +133,13 @@ REXCVAR_DECLARE(bool, banjo_renut_delta_prefetch);
 // matched. On deko3d (the console, Ryujinx) the river water was missing with it on and drawn with it off. Why its
 // discard is not the blend's no-op there is not found yet; the native renderer keeps banjo_gpu_blend_skip.
 // banjo-nx (2026-10-26, setter rewrite): d3d_native.h g_touch_compare.
+// banjo-nx (2026-11-20, render-thread batch): the 10 s report's per-draw counts (Latch().counts).
+REXCVAR_DEFINE_BOOL(banjo_renut_draw_counts, true, "Banjo/Renut",
+                    "The 10 s report's per-draw statistics counts (the GPU round's item counts, plume's binds and "
+                    "barriers, the shared and pushed constant counts, the depth counters): a load and a store each, "
+                    "several a draw. Off: those lines show zeros, the render thread saves their work. Always off with "
+                    "log_level \"off\" (the release); this key turns them off with the logs kept (a measured run)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(banjo_renut_touch_compare, true, "Banjo/Enhancements",
                     "Renut's renderer (2026-10-26): the native D3D setters store a device field and mark its chunk for "
                     "the recording only when the value changes (compare-on-set, as Unleashed's setters), so a recorded "
@@ -247,8 +278,7 @@ REXCVAR_DEFINE_INT32(banjo_renut_portrait_fur_shells_percent, 100, "Banjo/Enhanc
 // (banjo_renut_smaa) smooths the edges instead. A game sets 4 (its own) or 2 in its toml.
 REXCVAR_DEFINE_INT32(msaa_level, 1, "Katamari/Graphics",
                      "Samples per pixel of the game's MSAA targets: 1 (off, the base's default: SMAA smooths the edges "
-                     "instead), 2 or 4 (the game's own). Fewer: rougher edges, less GPU work")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+                     "instead), 2 or 4 (the game's own). Fewer: rougher edges, less GPU work");
 REXCVAR_DEFINE_INT32(banjo_renut_portrait_msaa_samples, 0, "Banjo/Enhancements",
                      "NOT exact, the user's call (2026-10-21): the samples of the colour and depth targets of 128 x 128 "
                      "or less that the game makes with MSAA (the dialogue portrait's 96 x 96 box, 4x). 0 as the game; 2: "
@@ -257,6 +287,16 @@ REXCVAR_DEFINE_INT32(banjo_renut_portrait_msaa_samples, 0, "Banjo/Enhancements",
                      "before the HUD, the portrait is part of it). Only lowers a count. disable_msaa covers only the "
                      "scene target")
     .range(0, 2);
+// Port 163 (from fnxf_xiii, its notes of 2026-10-21 to 11-17; fnxf_xiii's default, flags 77247): see Deko3DUamFlags.
+// Off by default: the shaders' code changes (a graphics-breaking key is off in the base; fnxf_xiii's own version once
+// overwrote a pixel shader's colour output, fixed here in all four moving passes), and another DKSH cache file
+// (deko3d_shaders.bin is the 1471 flags' only).
+REXCVAR_DEFINE_BOOL(banjo_deko3d_uam_pressure, false, "Banjo/Enhancements",
+                    "deko3d: uam's register pressure passes (values computed at their first use, also across blocks; a "
+                    "shader still above 56 registers compiled again with rematerialisation and the hoist). fnxf_xiii: "
+                    "about 9 registers fewer on pixel shaders above 56, the 34 above 64 all at 64 or fewer. Another "
+                    "shader cache. false: as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(banjo_deko3d_uam_wide_rows, true, "Banjo/Enhancements",
                     "deko3d renderer (2026-10-20, GPU): uam reads each bone row of tools/deko3d_glsl_opt.py's aw4 view "
                     "(a uvec4 of storage buffer 15) with one 128-bit load instead of four 32-bit ones (banjo flag 1024): "
@@ -301,12 +341,12 @@ REXCVAR_DEFINE_INT32(banjo_renut_render_height_handheld, 720, "Banjo/Enhancement
                      "Frames without that composite for half a second (menus, loading) are drawn at the display's "
                      "resolution whole. Shadow maps and the post-processing buffers keep the console's sizes. From the "
                      "next frame")
-    .range(480, 1080);
+    .range(360, 1080);  // port 196 (S4ep1-nx's): from 480; a game drawing 1920x1080 is half at 360 (960x540)
 REXCVAR_DEFINE_INT32(banjo_renut_render_height_docked, 720, "Banjo/Enhancements",
                      "NOT exact, the user's request (2026-10-21): banjo_renut_render_height_handheld for docked mode "
                      "(864 = 1536x864, 1.2x the game's; 900 = 1600x900; with banjo_renut_display_height_docked = 1080 "
-                     "the HUD at 1920x1080). Read at start")
-    .range(480, 1080);
+                     "the HUD at 1920x1080). From the next frame on deko3d (blur-nx 2026-11-18), else read at start")
+    .range(360, 1080);  // port 196 (S4ep1-nx's): from 480
 REXCVAR_DEFINE_INT32(banjo_renut_display_height_docked, 720, "Banjo/Enhancements",
                      "The display's resolution when docked on deko3d (2026-10-21; the swapchain change from sa2-nx "
                      "1.0.3.1): 720 = 1280x720, which the console scales to the TV; 1080 = the swapchain made at "
@@ -328,6 +368,14 @@ REXCVAR_DEFINE_INT32(banjo_renut_diag_smaa_compare_s, 0, "Banjo/Diagnostics",
                      "banjo_renut_smaa comparison pictures (2026-10-21): every N seconds the same frame's 3D image "
                      "before and after SMAA (the HUD not drawn yet) as capturas/smaa_NNN_off.tga and _on.tga next to "
                      "the NRO, at full size (0 = off; render/smaa.cpp)");
+// Port 164 (from fnxf_xiii, its note of 2026-11-05): backend/video.cpp detail::PieceDraws.
+REXCVAR_DEFINE_BOOL(banjo_deko3d_progressive_submit, true, "Banjo/Enhancements",
+                    "deko3d: a frame's command list ends at a kick once it holds a quarter of the previous frame's draws "
+                    "(40 at least, up to 6 pieces a frame), so the GPU works on the frame while the game and the render "
+                    "thread still make the rest (fnxf_xiii: a 195-draw frame never reached the fixed 200 and went to the "
+                    "GPU only at the present). banjo_deko3d_eager_kicks, when set, keeps its fixed 100. false: 200 draws, "
+                    "3 pieces, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(banjo_deko3d_eager_kicks, false, "Banjo/Enhancements",
                     "Input latency A/B (2026-10-20): the frame goes to the GPU in more, earlier parts: a command list ends at a game kick once it holds 100 draws (not 200, at most 6 a frame, not 3) and goes to the GPU at that kick (its upload memory cleaned first), not at the next one. At the frame cap the GPU then works while the render thread is still replaying the frame instead of mostly after the present: the frame is done sooner after its controller read (the [latency] line's \"input -> GPU done\"). The same commands in the same order (configs/banjo_deko3d_eager_kicks_ab.toml; in-run A/B target 18)");
 REXCVAR_DEFINE_BOOL(banjo_deko3d_skin_once, false, "Banjo/Enhancements",
@@ -428,7 +476,16 @@ REXCVAR_DEFINE_BOOL(banjo_deko3d_push_constants_verify, false, "Banjo/Diagnostic
                     "banjo_deko3d_push_constants: after every draw's updates, checks that the model of the uniform "
                     "buffers holds the guest's value of every register the shaders read (and their literals), and "
                     "logs a draw where it does not (a test: slower)");
-REXCVAR_DEFINE_BOOL(banjo_deko3d_kick_submit, true, "Banjo/Enhancements",
+// renut-ultimate (2026-11-16, port 145; tw2de_nx's tw2de_async_present of 2026-11-13, ON at the user's word: "port the
+// speed ups as on by default"). Read by name in sdk/src/ui/switch_perf.cpp at the first present.
+REXCVAR_DEFINE_BOOL(banjo_async_present, true, "Banjo/Enhancements",
+                    "Switch (tw2de_nx): the window's two binder calls of a present (queue the image, dequeue the next "
+                    "one: 2.7 ms a frame in tw2de_nx's heaviest stretch) are made by a helper thread, so the renderer's "
+                    "feed thread records the next frame instead of waiting for the compositor's answers. The same calls "
+                    "in the same order. false: on the presenting thread, as before");
+// banjo-nx (2026-11-21): off on the Switch (the user, after console c41: with it the render thread +1.7 % a draw, the GPU
+// +1.65 % a draw, -2.3 % fps in Showdown Town; what it buys is input latency).
+REXCVAR_DEFINE_BOOL(banjo_deko3d_kick_submit, BANJO_SWITCH_DEFAULT(false, true), "Banjo/Enhancements",
                     "deko3d renderer (2026-10-19, input latency): at the game's kicks (several a frame) the command "
                     "list recorded so far is ended and handed to the GPU at the next kick, instead of the whole frame "
                     "at the present: the GPU starts a frame's work while the render thread still records the rest, so "
@@ -649,11 +706,14 @@ REXCVAR_DEFINE_INT32(banjo_renut_ab_target, 0, "Banjo",
                      "banjo_gpu_depth_words_view; 14 banjo_renut_record_worker; 15 banjo_deko3d_light_branch, 16 "
                      "banjo_deko3d_gpr32 and 17 banjo_deko3d_skin_once (2026-10-20: the key on; the off half's "
                      "pipelines are built without its constant); 18 banjo_deko3d_eager_kicks; 19 "
-                     "banjo_renut_smaa (2026-10-21; was banjo_late_input_gpu until 36s). The part is "
+                     "banjo_renut_smaa (2026-10-21; was banjo_late_input_gpu until 36s); 256-511 a port's own targets (the base's are 1-255). The part is "
                      "switched off and on every banjo_renut_ab_s seconds; the \"[renut A/B]\" line every 10 s gives "
                      "both halves' frame rate, render thread and GPU time")
-    .range(0, 255);  // banjo-nx (2026-10-27): was 19, which refused every target from 20 on; 2026-10-28: 127 (64, 65);
+    .range(0, 511);  // banjo-nx (2026-10-27): was 19, which refused every target from 20 on; 2026-10-28: 127 (64, 65);
                      // sasrt-nx (2026-11-08): 255 (the third GPU round's targets, 120 and up)
+                     // renut-ultimate (2026-11-19, port 188; sasrt-nx's sync: its own 240 met the base's 240, Blur's
+                     // #36): 511. The base's targets are 1-255; 256-511 are a port's own, and the base never takes a
+                     // number there (an item it takes from a port gets a free number below 256)
 REXCVAR_DEFINE_INT32(banjo_renut_ab_s, 4, "Banjo", "Renut's renderer: the half-period of banjo_renut_ab_target, in seconds")
     .range(1, 60);
 REXCVAR_DEFINE_STRING(banjo_renut_ab_targets, "", "Banjo",
@@ -867,6 +927,8 @@ std::atomic<uint64_t> g_cards_clean{0}, g_cards_clean_bytes{0}, g_cards_dirty{0}
 std::atomic<uint64_t> g_kick_reuse[3]{}, g_kick_reuse_bytes[2]{};  // banjo-nx (2026-10-23, batch 6)
 std::atomic<uint64_t> g_tex_cards[4], g_tex_cards_bytes{0};  // proven, hashed, re-uploads saved, changed (verify)
 std::atomic<uint64_t> g_kind_depth_only{0}, g_kind_depth_plain{0}, g_kind_nothing{0}, g_kind_partial{0};
+// blur-nx (2026-11-13, #47's census): CountConstantUse.
+std::atomic<uint64_t> g_const_vs_indexed{0}, g_const_ps_indexed{0}, g_const_draws{0}, g_const_registers{0};
 std::atomic<uint64_t> g_depth_only_draws{0};  // banjo_gpu_depth_only (package 28)
 std::atomic<uint64_t> g_resolves_drawn{0};  // banjo_deko3d_draw_resolves (2026-10-18)
 std::atomic<uint64_t> g_smaa_runs{0};       // banjo_renut_smaa (2026-10-21)
@@ -915,6 +977,7 @@ void NotePipelineBuilt() {
 
 // The A/B word (banjo_renut_ab); the header reads it inline.
 std::atomic<int> g_ab_off{0};
+int g_ab_off_plain = 0;  // banjo-nx (2026-11-20, batch #3): see the header
 
 namespace {
 
@@ -983,7 +1046,7 @@ struct Stats {
   // banjo-nx (2026-10-20, banjo_renut_ab_targets): the list's halves by target, and the place in it.
   // banjo-nx (2026-10-27): 64 (targets 32-40 exist; AbTargets dropped them at 32). 2026-10-28: 128 (target 64, A/B of the
   // night_gpu packages' renut_ab.toml, was dropped silently at 64: the same trap again; 65 the host packets).
-  Half by_target[256][2];  // sasrt-nx (2026-11-08): 256 (targets up to 255)
+  Half by_target[512][2];  // sasrt-nx (2026-11-08): 256 (targets up to 255); port 188: 512 (256-511 a port's own)
   uint32_t cycle = 0;
   std::chrono::steady_clock::time_point half_start{};
   uint64_t cpu_mark = 0;  // banjo-nx (2026-10-28): TotalThreadTicks at the half's start
@@ -1097,9 +1160,32 @@ const char *AbName(int target) {
   // kAbBase + item, so 90's off half also switched sasrt_gpu_skip_inert_draws off).
   case 150: return "the shader round's GLSL passes in the pixel shaders, constant 975 (vivapinata_shader_round; off half: 975 = 0, the code as before them)";
   // vivapinata-nx (2026-11-12, port 115; its number).
+  case 173: return "command memory CPU-cached, cleaned at each list's end (banjo_deko3d_cached_commands; banjo-nx 2026-11-21)";
+  case 174: return "Replay: PrefetchShaderBehind at shader changes (prefetches only; banjo-nx 2026-11-21)";
+  case 175: return "Replay: ApplyResources prefetches the geometry objects' copies and cards, not only their answers (banjo-nx 2026-11-21)";
+  case 176: return "Replay: the next op's shader memo sets prefetched (PrefetchShaderLocked; banjo-nx 2026-11-21; off half: none)";
+  case 177: return "fast path: the shader change's prefetches (device lines, declaration, literal runs, entries; banjo-nx 2026-11-21)";
+  case 178: return "fast path: the texture slots' and the pipeline entry's prefetches (banjo-nx 2026-11-21; off half: none)";
+  case 179: return "kick submits (banjo_deko3d_kick_submit): lists ended at the game's kicks (banjo-nx 2026-11-21; off half: the frame at the present)";
+  case 181: return "Replay: the next draw's store cards prefetched from its record's header words (banjo-nx 2026-11-21; off half: none)";
+  case 182: return "the deko3d command stage (banjo_deko3d_command_stage): lists recorded into a stream played on the system core (banjo-nx 2026-11-21; off half: recorded directly)";
+  case 183: return "the command stage ends, submits and presents the frame (banjo_deko3d_stage_submit; banjo-nx 2026-11-21; off half: the render thread drains and submits)";
+  case 184: return "float constants into the stage's stream as the guest has them, swapped by the stage (banjo_deko3d_stage_swap; banjo-nx 2026-11-21)";
+  case 185: return "the cache-warming helper on the system core (banjo_renut_warm_helper; banjo-nx 2026-11-21; off half: given nothing)";
+  case 186: return "the command stage looks for work every poll_us, never woken by the render thread (banjo-nx 2026-11-21; off half: woken)";
+  case 189: return "the command stage and the warm helper float on cores 1-3 (banjo_deko3d_command_stage_float; banjo-nx 2026-11-22; off half: core 3 alone)";
+  case 188: return "the command stage prefetches its stream's lines ahead (banjo_deko3d_command_stage_stream_ahead; banjo-nx 2026-11-21)";
+  case 187: return "the command stage prefetches the objects of the commands ahead (banjo_deko3d_command_stage_peek; banjo-nx 2026-11-21)";
+  case 172: return "the fast path's spec answers (fetch spec, plain fetches, clip bit, sasrt words) kept while their inputs hold (banjo-nx 2026-11-21)";
   case 156: return "depth resolves nothing has read left out until something does (vivapinata_depth_resolve_skip_unread; NOT exact in principle; off half: drawn)";
   case 152: return "the pixel shaders' alpha test moved up ahead of the colour arithmetic, constant 977 = 1 (vivapinata_shader_earlykill; off half: the test last)";
   case 151: return "the pixel shaders without Renut's early alpha test, constant 976 = 0 (vivapinata_shader_noearly; off half: the test as before)";
+  // banjo-nx (2026-11-21, ports 246-247): its 300 and 301, numbered below 256 here (port 188).
+  case 170: return "FillTextures' skips: an unasked call's slot compare and copy, a slot answer's epoch buckets while the bind generation holds (port 246; off half: both as before)";
+  case 171: return "Replay's PrefetchShaderBehind skipped for a stage whose shader is the last op's (port 247; off half: both stages prefetched)";
+  // banjo-nx (2026-11-24, ports 275-276): its 320 and 322, numbered below 256 here (port 188).
+  case 204: return "a draw repeated for the next predicated tile drawn once over both tiles' rows (banjo_renut_tile_twin_merge, port 275; off half: each tile's own draw)";
+  case 205: return "a 60 cap never holds a frame past its time to rejoin the refresh grid (banjo_display_sync_no_late_snap, port 276; off half: held to the grid)";
   // blur-nx (2026-11-10/11, port 76; its keys, the same numbers; 210 and 214 not ported).
   case 211: return "an EXPAND resolve sampled as its FLOAT twin through the resolve's texture (blur_renut_expand_alias)";
   case 212: return "a partial resolve keeps a destination of another format and converts (blur_renut_resolve_keep_dest)";
@@ -1111,6 +1197,18 @@ const char *AbName(int target) {
   case 219: return "a colour resolve's exponent bias applied (blur_renut_resolve_exp_bias)";
   case 220: return "a target kept in part takes what other views wrote over its EDRAM (blur_renut_edram_inherit)";
   case 221: return "a multisampled resolve into a slice other than 0 goes through staging (blur_renut_ms_slice_resolve)";
+  // blur-nx (2026-11-18, the Renut host batch: gpu/host_batch.h, docs/renut-host-ideas-25-1118.md).
+  case 230: return "NewOp builds no resource objects or slot extents while replays inherit (blur_renut_record_skip_unused, #1 #2)";
+  case 231: return "an op's inherited words put back only in the chunks it applied (blur_renut_inherit_by_chunk, #3)";
+  case 232: return "the draw before's whole-buffer answer for the same streams (blur_renut_whole_repeat, #4)";
+  case 233: return "the ring cleaner above the game threads (blur_renut_ring_cleaner_priority, #11)";
+  case 234: return "BuildInheritRuns a 32-bit word at a time (blur_renut_inherit_runs_words, #13)";
+  case 235: return "the fast pipeline cache two-way (blur_renut_fast_pipeline_two_way, #16)";
+  case 236: return "(removed: #17, the two-way texture memo)";
+  case 237: return "a provisional pipeline answer looked up again with its kept key (blur_renut_provisional_key_kept, #18)";
+  case 238: return "runs and resolves wake the render thread as draws do (blur_renut_wake_batch_all, #28)";
+  case 239: return "eight viewports kept, not one (blur_renut_viewport_memo, #32)";
+  case 240: return "the mesh objects' generation raised only by a whole copy's drop (blur_renut_mesh_gen_whole_only, #36)";
   default: {
     // sasrt-nx (2026-11-08): the GPU round's items (sasrt_gpu_round.h: 90 and up).
     const char *name = sasrt::gpu_round::AbName(target);
@@ -1128,8 +1226,12 @@ bool g_precise_barriers_on = false;  // banjo_renut_precise_barriers as configur
 namespace {
 
 // banjo-nx (2026-10-20, banjo_renut_ab_targets): the list, read once (numbers 1-31).
+// banjo-nx (2026-11-20): filled under std::call_once, so this file can be built with -fno-threadsafe-statics (its
+// other function statics are plain values from keys); the list and the flag are constant-initialised.
 const std::vector<int> &AbTargets() {
-  static const std::vector<int> list = [] {
+  static std::vector<int> list;
+  static std::once_flag once;
+  std::call_once(once, [] {
     std::vector<int> v;
     const std::string s = REXCVAR_GET(banjo_renut_ab_targets);
     int n = 0;
@@ -1139,16 +1241,17 @@ const std::vector<int> &AbTargets() {
         n = n * 10 + (c - '0');
         digit = true;
       } else {
-        if (digit && n > 0 && n < 256)  // banjo-nx (2026-10-27): was 32, which dropped targets 32-40 silently; sasrt-nx: 256
+        if (digit && n > 0 && n < 512)  // banjo-nx (2026-10-27): was 32, which dropped targets 32-40 silently; sasrt-nx: 256;
+                                        // port 188: 512 (256-511 a port's own)
           v.push_back(n);
-        else if (digit && n >= 256)
-          REXLOG_WARN("[renut] banjo_renut_ab_targets: target {} is past the last one (255): left out", n);
+        else if (digit && n >= 512)
+          REXLOG_WARN("[renut] banjo_renut_ab_targets: target {} is past the last one (511): left out", n);
         n = 0;
         digit = false;
       }
     }
-    return v;
-  }();
+    list = std::move(v);
+  });
   return list;
 }
 // The target the A/B switches now (requires g_stats.mutex).
@@ -1162,6 +1265,10 @@ int AbTargetLocked() {
 // Render thread: the part as the half says.
 void AbApply(int target, bool on) {
   g_ab_off.store(on ? 0 : target, std::memory_order_relaxed);
+  g_ab_off_plain = on ? 0 : target;  // banjo-nx (2026-11-20, batch #3)
+  // banjo-nx (2026-11-20): the GPU round's On() answers follow the half (before ApplyPlume, which asks them)
+  if (sasrt::gpu_round::g_latched_ready.load(std::memory_order_acquire))
+    sasrt::gpu_round::RefreshEffective();
   sasrt::gpu_round::ApplyPlume();  // sasrt-nx (2026-11-08): the GPU round's plume items follow the half
   if (target == 26)  // banjo-nx (2026-10-26): read by every setter, so a plain flag (d3d_native.h)
     renut::gpu::native::g_touch_compare = on && REXCVAR_GET(banjo_renut_touch_compare);
@@ -1188,6 +1295,51 @@ std::atomic<uint64_t> g_draw_source[2];
 
 
 }  // namespace
+
+std::atomic<uint64_t> g_last_report_us{0};  // blur-nx (2026-11-17, audit #31): StatsGameFrame's report, its last time
+
+}  // namespace banjo::renut_gpu
+// blur-nx (2026-11-17, the Renut audit's #17-#22 and #30): gpu/stage_census.h.
+REXCVAR_DEFINE_BOOL(blur_renut_diag_stage_census, false, "Banjo/Diagnostics",
+                    "blur-nx (the Renut audit's census): the time the renderer spends in its stages (FastDrawLocked, "
+                    "DrawStateLocked, FillTextures, the constants, targets, pipeline, streams, uploads, resolves' "
+                    "setup, render-thread items, NewOp, BeginCommandBuffer's fence) in the 10 s report. Two clock reads "
+                    "and two atomics a stage when on")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+namespace renut::gpu::census {
+Acc g_acc[kStageCount];
+std::atomic<int> g_on{-1};
+bool OnSlow() {
+  const bool on = REXCVAR_GET(blur_renut_diag_stage_census);
+  g_on.store(on ? 1 : 0, std::memory_order_relaxed);
+  return on;
+}
+std::string Report(double seconds) {
+  if (!On() || seconds <= 0.0)
+    return {};
+  static constexpr const char *kNames[kStageCount] = {
+      "FastDrawLocked", "DrawStateLocked", "FillTextures", "constants", "BindTargets", "setPipeline", "BindStreams",
+      "WholeGeometryTry", "host draw", "CardsProve", "Upload", "RefreshBindingLocked", "ResolveTargetsLocked",
+      "render items", "NewOp", "BeginCommandBuffer fence"};
+#if defined(__SWITCH__)
+  const double tick_ms = 1000.0 / double(armGetSystemTickFreq());
+#else
+  const double tick_ms = 1000.0 * double(std::chrono::steady_clock::period::num) /
+                         double(std::chrono::steady_clock::period::den);
+#endif
+  std::string line = "stages (blur_renut_diag_stage_census), ms a second and calls a second:";
+  for (uint32_t i = 0; i < kStageCount; ++i) {
+    const uint64_t ticks = g_acc[i].ticks.exchange(0, std::memory_order_relaxed);
+    const uint64_t n = g_acc[i].n.exchange(0, std::memory_order_relaxed);
+    if (!n)
+      continue;
+    line += fmt::format(" {} {:.2f} ms/s ({:.0f}/s, {:.2f} us each);", kNames[i], double(ticks) * tick_ms / seconds,
+                        double(n) / seconds, double(ticks) * tick_ms * 1000.0 / double(n));
+  }
+  return line;
+}
+}  // namespace renut::gpu::census
+namespace banjo::renut_gpu {
 
 void StatsGameFrame() {
   const auto now = std::chrono::steady_clock::now();
@@ -1232,6 +1384,18 @@ void StatsGameFrame() {
   const double since = std::chrono::duration<double>(now - g_stats.last_report).count();
   if (since < 10.0)
     return;
+  // blur-nx (2026-11-17, the Renut audit's #31, a census): this report is built on the game thread at its Swap (the
+  // Game Master in Blur), under g_stats.mutex; how long it takes is logged at its end (the next report says the last).
+  struct ReportClock {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~ReportClock() {
+      g_last_report_us.store(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - start).count()),
+                             std::memory_order_relaxed);
+    }
+  } report_clock;
+  if (const uint64_t us = g_last_report_us.load(std::memory_order_relaxed))
+    REXLOG_INFO("[renut] the last 10 s report took {:.2f} ms on the game thread (blur-nx audit #31)", double(us) / 1000.0);
   BanjoTlbTestTick();
   // banjo-nx (2026-10-22): the native copies' report (app/src/cpu/banjo_hot_guest.cpp) comes with this one: without
   // a guard (direct dispatch) no hook calls it any more.
@@ -1298,6 +1462,14 @@ void StatsGameFrame() {
     REXLOG_INFO("[renut] {}", dk);
   if (const std::string ss = ::renut::gpu::StateSourceReport(); !ss.empty())  // banjo-nx (2026-10-26)
     REXLOG_INFO("[renut] {}", ss);
+  if (const std::string rl = ::renut::gpu::RecordLockReport(); !rl.empty())  // blur-nx (2026-11-17)
+    REXLOG_INFO("[renut] {}", rl);
+  if (const std::string rr = ::renut::gpu::ResolveRemakeReport(); !rr.empty())  // blur-nx (2026-11-17, audit #4/#5)
+    REXLOG_INFO("[renut] {}", rr);
+  if (const std::string st = ::renut::gpu::census::Report(since); !st.empty())  // blur-nx (2026-11-17, audit #17)
+    REXLOG_INFO("[renut] {}", st);
+  if (const std::string hb = ::renut::gpu::host_batch::Report(since); !hb.empty())  // blur-nx (2026-11-18)
+    REXLOG_INFO("[renut] {}", hb);
   if (const std::string rc = ::renut::gpu::ReplayRepeatCensusReport(); !rc.empty())  // banjo-nx (2026-10-26)
     REXLOG_INFO("[renut] {}", rc);
   if (const std::string pc = ::renut::gpu::PacketCensusReport(); !pc.empty())  // banjo-nx (2026-10-28)
@@ -1392,6 +1564,16 @@ void StatsGameFrame() {
   if (::renut::gpu::IsDeko3D())  // banjo-nx (2026-10-17): the deko3d back end
     REXLOG_INFO("[renut] {}", deko3d::Report());
 #endif
+  REXLOG_INFO("[renut] {}", renut::frame_stats::WaitReport());  // blur-nx (2026-11-13, #37's census)
+  REXLOG_INFO("[renut] {}", renut::frame_stats::PacingReport());  // blur-nx (2026-11-18, for 1 % lows)
+  {  // blur-nx (2026-11-13, #47's census; banjo_renut_lean_diagnostics' draws)
+    const uint64_t draws = g_const_draws.exchange(0, std::memory_order_relaxed);
+    const uint64_t regs = g_const_registers.exchange(0, std::memory_order_relaxed);
+    REXLOG_INFO("[renut] float constants (#47's census): {} draws, {} with a vertex shader and {} with a pixel shader "
+                "that index the register file (every register uploaded); the others read {:.1f} registers a draw",
+                draws, g_const_vs_indexed.exchange(0, std::memory_order_relaxed),
+                g_const_ps_indexed.exchange(0, std::memory_order_relaxed), draws ? double(regs) / double(draws) : 0.0);
+  }
   REXLOG_INFO("[renut] draw kinds: {} depth-only ({} of them without alpha test or alpha to coverage, with a pixel "
               "shader; {} drawn without it, banjo_gpu_depth_only), {} writing nothing, {} writing part of a target's "
               "channels",
@@ -1415,6 +1597,9 @@ void StatsGameFrame() {
               g_words_lazy[0].exchange(0, std::memory_order_relaxed),
               g_words_lazy[1].exchange(0, std::memory_order_relaxed),
               g_words_lazy[2].exchange(0, std::memory_order_relaxed));
+  // renut-ultimate (2026-11-13, sasrt-nx's resolve project R1): while sasrt_gpu_diag_depth_words is on.
+  if (const std::string words = ::renut::gpu::DepthWordsCensusReport(); !words.empty())
+    REXLOG_INFO("{}", words);
   // vivapinata-nx (2026-11-12, port 115): while vivapinata_depth_resolve_skip_unread is on.
   if (REXCVAR_GET(vivapinata_depth_resolve_skip_unread))
     REXLOG_INFO("[renut] depth resolves nothing had read (vivapinata_depth_resolve_skip_unread): {} left out; read "
@@ -1433,13 +1618,16 @@ void StatsGameFrame() {
     const uint64_t depth = g_ui_depth[0].exchange(0, std::memory_order_relaxed);
     const uint64_t kept = g_ui_depth[1].exchange(0, std::memory_order_relaxed);
     // banjo-nx (2026-10-28): with dynamic resolution on, its ranges (the fixed-height keys are not used then).
-    const std::string heights =
-        ::renut::gpu::DynamicResolutionOn()
-            ? fmt::format("dynamic: handheld {}-{}, docked {}-{}, {} steps between", ::renut::gpu::DynamicHeight(false, false),
-                          ::renut::gpu::DynamicHeight(false, true), ::renut::gpu::DynamicHeight(true, false),
-                          ::renut::gpu::DynamicHeight(true, true), ::renut::gpu::DynamicSteps())
-            : fmt::format("banjo_renut_render_height_handheld {}, _docked {}", RenderHeightHandheld(),
-                          RenderHeightDocked());
+    // rr6-nx (2026-11-22): each mode's own (banjo_renut_dynamic_resolution_handheld / _docked).
+    const auto mode_heights = [](bool docked) {
+      return ::renut::gpu::DynamicModeOn(docked)
+                 ? fmt::format("{} dynamic {}-{}", docked ? "docked" : "handheld",
+                               ::renut::gpu::DynamicHeight(docked, false), ::renut::gpu::DynamicHeight(docked, true))
+                 : fmt::format("{} fixed {}", docked ? "docked" : "handheld",
+                               docked ? RenderHeightDocked() : RenderHeightHandheld());
+    };
+    const std::string heights = mode_heights(false) + ", " + mode_heights(true) +
+                                fmt::format(", {} steps between", ::renut::gpu::DynamicSteps());
     if (scaled || RenderHeightHandheld() != 720 || RenderHeightDocked() != 720)
       REXLOG_INFO("[renut] internal resolution ({}, display docked {}, "
                   "{} upscale, not exact): {} composites scaled up for the HUD, {} drawn at the display's resolution, "
@@ -1648,6 +1836,10 @@ bool SkinOnceOn() { return REXCVAR_GET(banjo_deko3d_skin_once); }
 bool EagerKicksOn() {
   return REXCVAR_GET(banjo_deko3d_eager_kicks) && g_ab_off.load(std::memory_order_relaxed) != 18;
 }
+bool ProgressiveSubmitOn() {  // port 164
+  static const bool on = REXCVAR_GET(banjo_deko3d_progressive_submit);
+  return on;
+}
 bool SmaaOn() {
   return REXCVAR_GET(banjo_renut_smaa) && g_ab_off.load(std::memory_order_relaxed) != 19;
 }
@@ -1706,6 +1898,10 @@ unsigned Deko3DUamFlags() {
     flags &= ~32u;
   if (!REXCVAR_GET(banjo_deko3d_uam_uniform_branches))
     flags &= ~256u;
+  // Port 163 (from fnxf_xiii): the register pressure passes (2048 the sink, 8192 its neutral moves, 65536 the global
+  // sink; a shader still above 56 registers compiled again with the costlier ones: DekoCompiler::TryRescue).
+  if (REXCVAR_GET(banjo_deko3d_uam_pressure))
+    flags |= 2048u | 8192u | 65536u;
   return flags;
 }
 // banjo-nx (2026-10-27): the background threads' core: the system core when the process has it
@@ -1717,7 +1913,38 @@ static int32_t BackgroundCore() {
   }
   return REXCVAR_GET(banjo_background_compile_core);
 }
+#if REX_PLATFORM_SWITCH
+// sasrt-nx (2026-11-22, sasrt_compile_threads_core -1): the calling thread on every core of the process (the system
+// core kept in the mask: RexSwitchSetCurrentThreadCoresWithSystem), no preferred core.
+static bool FloatCurrentThread() {
+  return RexSwitchSetCurrentThreadCoresWithSystem(-1, RexSwitchProcessCoreMask());
+}
+static void FloatCompileThread() {
+  const bool ok = FloatCurrentThread();
+  REXLOG_INFO("[renut] uam thread floats: every core of the process (mask 0x{:X}){} (sasrt_compile_threads_core -1)",
+              RexSwitchProcessCoreMask(), ok ? "" : " (NOT accepted)");
+}
+// The compile threads' place by sasrt_compile_threads_core (>= 0 pinned, -1 floating); false for -2 (the old keys).
+static bool PlaceCompileThreadByKey() {
+  const int32_t core = REXCVAR_GET(sasrt_compile_threads_core);
+  if (core == -1)
+    return FloatCurrentThread();
+  if (core >= 0)
+    return RexSwitchPinCurrentThreadToCore(int(core));
+  return false;
+}
+#endif
+void (*Deko3DCompileThreadPlacer())() {
+#if REX_PLATFORM_SWITCH
+  if (REXCVAR_GET(sasrt_compile_threads_core) == -1)  // floating; a pinned core goes through compileCore
+    return &FloatCompileThread;
+#endif
+  return nullptr;
+}
 int Deko3DCompileCore() {
+  // sasrt-nx (2026-11-22): sasrt_compile_threads_core (-1: placed by Deko3DCompileThreadPlacer; -2: the keys below)
+  if (REXCVAR_GET(sasrt_compile_threads_core) != -2)
+    return REXCVAR_GET(sasrt_compile_threads_core);
   // banjo-nx (2026-10-28): the uam thread on the system core when there is one (banjo_system_core_uam).
   if (REXCVAR_GET(banjo_system_core_uam)) {
     const int system_core = RexSwitchSystemCore();
@@ -1735,9 +1962,7 @@ int Deko3DBackgroundCompileShare() {
 }
 
 
-void CountDepthFloatSampled() {
-  Bump(g_depth_float_sampled, 1);
-}
+// (CountDepthFloatSampled: inline in the header since 2026-11-20)
 
 void CountDrawSource(int source, uint64_t draws) {
   g_draw_source[source].store(g_draw_source[source].load(std::memory_order_relaxed) + draws, std::memory_order_relaxed);
@@ -1905,9 +2130,7 @@ void CountSkippedResolve(bool depth) {
   Bump(g_resolves_skipped[depth ? 1 : 0], 1);
 }
 
-void CountDepthWords(bool viewed) {
-  Bump(viewed ? g_words_viewed : g_words_copied, 1);
-}
+// (CountDepthWords: inline in the header since 2026-11-20)
 
 
 
@@ -1977,6 +2200,15 @@ void CountExactMemoHit(uint64_t bytes) {
   Bump(g_exact_memo_bytes, bytes);
 }
 
+void CountConstantUse(bool vs_indexed, bool ps_indexed, uint32_t registers) {  // blur-nx (2026-11-13, #47)
+  Bump(g_const_draws, 1);
+  if (vs_indexed)
+    Bump(g_const_vs_indexed, 1);
+  if (ps_indexed)
+    Bump(g_const_ps_indexed, 1);
+  Bump(g_const_registers, registers);
+}
+
 void CountDrawKind(bool depth_only, bool depth_only_plain, bool writes_nothing, bool partial_mask) {
   if (depth_only)
     Bump(g_kind_depth_only, 1);
@@ -2033,19 +2265,65 @@ REXCVAR_DEFINE_INT32(sasrt_memory_low_mb, 256, "SASRT/Graphics", "sasrt_memory_g
 REXCVAR_DEFINE_INT32(sasrt_memory_critical_mb, 128, "SASRT/Graphics", "sasrt_memory_governor: the critical mark (MB free)")
     .range(8, 2048)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// sasrt-nx 1.0.1 (2026-11-24, SASRT's docked bad_alloc): the figure above adds the GPU region's free space to the heap's
+// room (what a GPU block can use), and in docked mode it read 782 MB while newlib, the CPU side, had 215: the region's
+// 567 MB were free in 48 ranges inside it, which newlib cannot use (its heap ends at the region's bottom). The region
+// then grew into the rest and the game's own allocation failed with 0.6 MB left; the governor saw its critical mark 3 s
+// before. So the CPU side's room is a figure of its own: the heap's room and the region's free bottom
+// (Deko3DRegionGiveBack can return it), against marks of its own; either side under its mark makes memory low /
+// critical.
+REXCVAR_DEFINE_BOOL(sasrt_memory_cpu_governor, true, "SASRT/Graphics",
+                    "sasrt_memory_governor also watches the CPU side's room on its own (the heap's room and the GPU "
+                    "region's free bottom, not the region's free space inside it): under sasrt_memory_cpu_low_mb memory "
+                    "is low, under sasrt_memory_cpu_critical_mb critical, and the region's free bottom goes back")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(sasrt_memory_cpu_low_mb, 160, "SASRT/Graphics",
+                     "sasrt_memory_cpu_governor: the CPU side's low mark (MB of heap room and region free bottom)")
+    .range(16, 2048)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(sasrt_memory_cpu_critical_mb, 96, "SASRT/Graphics",
+                     "sasrt_memory_cpu_governor: the CPU side's critical mark (MB of heap room and region free bottom)")
+    .range(8, 2048)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// sasrt-nx 1.0.1 (2026-11-24): the room the GPU region leaves newlib (plume's Deko3DSetRegionCpuReserve; 32 MB before):
+// the region's growth and a GPU block's fallback to newlib stop there and fail as the memory emergency (textures
+// released, the resolution a step down) where the CPU side's failure was the game's crash. 0: the old 32 MB.
+REXCVAR_DEFINE_INT32(sasrt_region_cpu_reserve_mb, 160, "SASRT/Graphics",
+                     "The MB of heap the GPU region always leaves the CPU side (its growth and GPU blocks' fallback to the "
+                     "heap stop there: a GPU block fails, which the memory emergency answers, instead of the game's own "
+                     "allocation); 0: 32 MB as before")
+    .range(0, 1024)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 std::atomic<uint32_t> g_heap_free_mb{UINT32_MAX};
+std::atomic<uint32_t> g_cpu_free_mb{UINT32_MAX};  // sasrt-nx 1.0.1
 std::atomic<uint32_t> g_memory_emergency_looks{0};
 bool MemoryLow() {
   static const bool on = REXCVAR_GET(sasrt_memory_governor);
   static const uint32_t mark = uint32_t(REXCVAR_GET(sasrt_memory_low_mb));
+  static const uint32_t cpu_mark = REXCVAR_GET(sasrt_memory_cpu_governor) ? uint32_t(REXCVAR_GET(sasrt_memory_cpu_low_mb)) : 0;
   return on && (g_heap_free_mb.load(std::memory_order_relaxed) < mark ||
+                g_cpu_free_mb.load(std::memory_order_relaxed) < cpu_mark ||
                 g_memory_emergency_looks.load(std::memory_order_relaxed) != 0);
 }
 bool MemoryCritical() {
   static const bool on = REXCVAR_GET(sasrt_memory_governor);
   static const uint32_t mark = uint32_t(REXCVAR_GET(sasrt_memory_critical_mb));
+  static const uint32_t cpu_mark =
+      REXCVAR_GET(sasrt_memory_cpu_governor) ? uint32_t(REXCVAR_GET(sasrt_memory_cpu_critical_mb)) : 0;
   return on && (g_heap_free_mb.load(std::memory_order_relaxed) < mark ||
+                g_cpu_free_mb.load(std::memory_order_relaxed) < cpu_mark ||
                 g_memory_emergency_looks.load(std::memory_order_relaxed) != 0);
+}
+bool CpuGovernorOn() {  // sasrt-nx 1.0.1
+  static const bool on = REXCVAR_GET(sasrt_memory_governor) && REXCVAR_GET(sasrt_memory_cpu_governor);
+  return on;
+}
+uint32_t CpuLowMarkMb() {  // sasrt-nx 1.0.1
+  static const uint32_t mark = uint32_t(REXCVAR_GET(sasrt_memory_cpu_low_mb));
+  return mark;
+}
+uint64_t RegionCpuReserveBytes() {  // sasrt-nx 1.0.1: 0 keeps plume's 32 MB
+  return uint64_t(REXCVAR_GET(sasrt_region_cpu_reserve_mb)) << 20;
 }
 uint32_t MemoryLowMarkMb() {
   static const uint32_t mark = uint32_t(REXCVAR_GET(sasrt_memory_low_mb));
@@ -2312,9 +2590,22 @@ void OnRenderThreadStart() {
 #endif
 }
 
+int BackgroundThreadPriority() { return kBackgroundPriority; }  // blur-nx (2026-11-18, #11)
 void OnBackgroundThreadStart(const char *what) {
 #if REX_PLATFORM_SWITCH
   const bool priority_ok = RexSwitchSetCurrentThreadPriorityOk(kBackgroundPriority);
+  // sasrt-nx (2026-11-22): the compile threads by sasrt_compile_threads_core; the ring cleaner (not a compile) stays
+  // where banjo_system_core_compiles places it
+  if (REXCVAR_GET(sasrt_compile_threads_core) != -2 && std::string_view(what) != "ring cleaner") {
+    const int32_t key_core = REXCVAR_GET(sasrt_compile_threads_core);
+    const bool place_ok = PlaceCompileThreadByKey();
+    REXLOG_INFO("[renut] {} at priority 0x{:X}{}, {}{} (sasrt_compile_threads_core)", what, kBackgroundPriority,
+                priority_ok ? "" : " (NOT accepted)",
+                key_core < 0 ? fmt::format("floating on every core of the process (mask 0x{:X})", RexSwitchProcessCoreMask())
+                             : fmt::format("pinned to core {}", key_core),
+                place_ok ? "" : " (NOT accepted)");
+    return;
+  }
   const int32_t core = BackgroundCore();  // banjo-nx (2026-10-27): the system core when there is one
   const bool core_ok = core < 0 || RexSwitchPinCurrentThreadToCore(int(core));
   REXLOG_INFO("[renut] {} at priority 0x{:X}{}, {} (banjo_background_compile_core / banjo_system_core_compiles)",
@@ -2329,6 +2620,22 @@ void OnBackgroundThreadStart(const char *what) {
 
 void OnPrebuildWorkerStart() {
   OnBackgroundThreadStart("pipeline prebuild worker");
+}
+
+// Port 171 (from fnxf_xiii, its note of 2026-11-05): render/textures.cpp's untile helpers, at the render thread's
+// priority on cores 0 and 2 (fnxf_xiii tried the main thread's 0x3B on core 0: no gain, and a helper that lost core 0
+// to main held the run's end).
+void OnCopyHelperStart(uint32_t index) {
+#if REX_PLATFORM_SWITCH
+  const int core = index == 0 ? 0 : 2;
+  const int priority = int(kRenderThreadPriority);
+  const bool priority_ok = RexSwitchSetCurrentThreadPriorityOk(priority);
+  const bool core_ok = RexSwitchPinCurrentThreadToCore(core);
+  REXLOG_INFO("[renut] untile helper {} at priority 0x{:X}{}, core {}{}", index, priority,
+              priority_ok ? "" : " (NOT accepted)", core, core_ok ? "" : " (NOT accepted)");
+#else
+  (void)index;
+#endif
 }
 
 uint32_t PrebuildReleaseSeconds() {
@@ -2455,7 +2762,9 @@ void OnDeviceCreated(plume::RenderDevice *device) {
 #if REX_PLATFORM_SWITCH
     (void)RexSwitchSetCurrentThreadPriorityOk(kBackgroundPriority);
     const int32_t core = REXCVAR_GET(banjo_background_compile_core);
-    if (core >= 0)
+    if (REXCVAR_GET(sasrt_compile_threads_core) != -2)  // sasrt-nx (2026-11-22)
+      (void)PlaceCompileThreadByKey();
+    else if (core >= 0)
       (void)RexSwitchPinCurrentThreadToCore(int(core));
 #endif
     std::unique_lock lock(g_saver.mutex);
@@ -2550,6 +2859,8 @@ void LatchTuning() {
   g_latched.small_captures = REXCVAR_GET(banjo_renut_small_captures);
   g_latched.delta_masks = REXCVAR_GET(banjo_renut_delta_masks);
   g_latched.delta_prefetch = REXCVAR_GET(banjo_renut_delta_prefetch);
+  g_latched.counts = REXCVAR_GET(log_level) != "off" && REXCVAR_GET(banjo_renut_draw_counts);  // banjo-nx (2026-11-20, batch #4)
+  g_latched.ready = true;  // banjo-nx (2026-11-20, batch #3): Latch() reads this one
   g_latched_ready.store(true, std::memory_order_release);
 }
 
@@ -2575,3 +2886,198 @@ void BanjoTlbTestTick() {
   RexGmLatencyTest([](const char* line) { REXLOG_INFO("{}", line); });
 #endif
 }
+
+// blur-nx (2026-11-18, the Renut host batch: gpu/host_batch.h; docs/renut-host-ideas-25-1118.md). Each switch is exact
+// (the same pixels) and an in-run A/B target (host_batch::kAbBase + its item); the census is a diagnostic.
+REXCVAR_DEFINE_BOOL(blur_renut_record_skip_unused, true, "Banjo/Enhancements",
+                    "blur-nx (#1, #2; A/B 230): while banjo_renut_replay_inherits is on, NewOp builds no resource "
+                    "objects (banjo_renut_resource_objects) and no slot extents (banjo_renut_record_extents): a replay "
+                    "with inherited words uses neither (Blur: every replay)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_inherit_by_chunk, true, "Banjo/Enhancements",
+                    "blur-nx (#3; A/B 231): a replayed op's inherited words are put back from the running device only "
+                    "in the chunks the op applied (ApplyState writes no other), not every inherited run at every op")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_whole_repeat, true, "Banjo/Enhancements",
+                    "blur-nx (#4; A/B 232): a draw whose streams, index buffer, shader and layout are the draw before's, "
+                    "in the same kick and frame and with no export pending, takes that draw's whole-buffer copies "
+                    "without WholeGeometryTry's probes and lookups (their proofs and uses were made by that draw)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(blur_renut_ring_cleaner_priority, 0x2D, "Banjo/Enhancements",
+                     "blur-nx (#11; A/B 233): the upload ring cleaner's priority on the background core (0x2D: above "
+                     "the game threads' 0x3B, below the render thread and audio), so that it cleans the ranges before "
+                     "the submit needs them instead of the render thread taking them over. 0: the background priority")
+    .range(0, 0x3F)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_inherit_runs_words, true, "Banjo/Enhancements",
+                    "blur-nx (#13; A/B 234): BuildInheritRuns works on the set-word bitmap a 32-bit word at a time")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_fast_pipeline_two_way, true, "Banjo/Enhancements",
+                    "blur-nx (#16; A/B 235): the fast path's pipeline cache looks in two neighbouring entries (the "
+                    "older one replaced on a miss), not one: its conflicts each made the key and looked it up again")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_provisional_key_kept, true, "Banjo/Enhancements",
+                    "blur-nx (#18; A/B 237): a pipeline cache entry with this draw's inputs from an earlier prebuild "
+                    "epoch is looked up again with the key it holds (made from the same inputs), not a new MakeKey")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_wake_batch_all, false, "Banjo/Enhancements",
+                    "blur-nx (#28; A/B 238): command buffer runs and resolves wake a sleeping render thread as draws do "
+                    "(once banjo_renut_wake_batch items wait; it looks every 2 ms anyway), not at once. The same "
+                    "commands; the Game Master makes fewer wake calls, the render thread may start an item up to 2 ms "
+                    "later")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_viewport_memo, true, "Banjo/Enhancements",
+                    "blur-nx (#32; A/B 239): ComputeViewport keeps its last eight answers by their inputs, not one")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_mesh_gen_whole_only, true, "Banjo/Enhancements",
+                    "blur-nx (#36, found on the way; A/B 240): a cached copy's drop raises the mesh objects' generation "
+                    "(voiding every one of them) only when the copy is a whole buffer's, which alone mesh objects, "
+                    "geometry objects and the whole-repeat answer hold; range copies' drops left them all to miss")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_host_batch_verify, false, "Banjo/Debug",
+                    "blur-nx (2026-11-18, the Renut host batch): #3's restored image checked to hold every inherited "
+                    "run of the running device after each op, #13's runs made both ways and compared, #32's kept "
+                    "viewports computed again and compared; differences counted and logged (the first 16)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_diag_batch_census, false, "Banjo/Diagnostics",
+                    "blur-nx (2026-11-18, the Renut host batch's census): one 10 s line of counts for the batch's "
+                    "questions (inherited bytes, repeated geometry and texture sets, resolves, uploads, fence waits, "
+                    "conversions by kind, draws without field changes, op growth, stack headers, wakes, the record "
+                    "lock, immediate draws, setter calls). A load and a store a count when on")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace renut::gpu::host_batch {
+Switches g_switches;
+std::atomic<bool> g_ready{false};
+std::atomic<uint64_t> g_count[kCountCount];
+void LatchSwitches() {
+  Switches s;
+  s.on[kSkipUnused] = REXCVAR_GET(blur_renut_record_skip_unused);
+  s.on[kInheritByChunk] = REXCVAR_GET(blur_renut_inherit_by_chunk);
+  s.on[kWholeRepeat] = REXCVAR_GET(blur_renut_whole_repeat);
+  s.on[kCleanerPriority] = REXCVAR_GET(blur_renut_ring_cleaner_priority) > 0;
+  s.on[kInheritWords] = REXCVAR_GET(blur_renut_inherit_runs_words);
+  s.on[kPipelineTwoWay] = REXCVAR_GET(blur_renut_fast_pipeline_two_way);
+  s.on[kProvisionalKey] = REXCVAR_GET(blur_renut_provisional_key_kept);
+  s.on[kWakeBatchAll] = REXCVAR_GET(blur_renut_wake_batch_all);
+  s.on[kViewportMemo] = REXCVAR_GET(blur_renut_viewport_memo);
+  s.on[kMeshGenWhole] = REXCVAR_GET(blur_renut_mesh_gen_whole_only);
+  g_switches = s;
+  g_ready.store(true, std::memory_order_release);
+}
+void SetThisThreadPriority(int priority) {
+#if REX_PLATFORM_SWITCH
+  (void)RexSwitchSetCurrentThreadPriorityOk(priority);
+#else
+  (void)priority;
+#endif
+}
+int BackgroundPriority() { return banjo::renut_gpu::BackgroundThreadPriority(); }
+int CleanerPriority() {
+  static const int p = REXCVAR_GET(blur_renut_ring_cleaner_priority);
+  return p;
+}
+#if !defined(RENUT_DIAG_CENSUS_OFF)
+bool CensusOn() {
+  static const bool on = REXCVAR_GET(blur_renut_diag_batch_census);
+  return on;
+}
+#endif
+bool VerifyOn() {
+  static const bool on = REXCVAR_GET(blur_renut_host_batch_verify);
+  return on;
+}
+void VerifyDiffer(const char *what) {
+  static std::atomic<uint32_t> logged{0};
+  static std::atomic<uint64_t> total{0};
+  const uint64_t n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (logged.fetch_add(1, std::memory_order_relaxed) < 16 || (n & 1023) == 0)
+    REXLOG_WARN("[renut] blur_renut_host_batch_verify: {} ({} differences so far)", what, n);
+}
+uint64_t Ticks() {
+#if defined(__SWITCH__)
+  return armGetSystemTick();
+#else
+  return uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
+namespace {
+struct UploadNote {
+  uint32_t va = 0, width = 0, height = 0, format = 0;
+  uint64_t count = 0, bytes = 0;
+};
+std::mutex g_upload_mutex;
+UploadNote g_uploads[32];
+double TickMs() {
+#if defined(__SWITCH__)
+  return 1000.0 / double(armGetSystemTickFreq());
+#else
+  return 1000.0 * double(std::chrono::steady_clock::period::num) / double(std::chrono::steady_clock::period::den);
+#endif
+}
+}  // namespace
+void NoteUpload(uint32_t guest_va, uint32_t width, uint32_t height, uint32_t format, uint64_t bytes) {
+  if (!CensusOn())
+    return;
+  std::lock_guard lock(g_upload_mutex);
+  UploadNote *free_slot = nullptr, *least = &g_uploads[0];
+  for (UploadNote &n : g_uploads) {
+    if (n.count && n.va == guest_va && n.width == width && n.height == height && n.format == format) {
+      ++n.count;
+      n.bytes += bytes;
+      return;
+    }
+    if (!n.count && !free_slot)
+      free_slot = &n;
+    if (n.count < least->count)
+      least = &n;
+  }
+  UploadNote &n = free_slot ? *free_slot : *least;  // (full: the least uploaded one goes)
+  n = {guest_va, width, height, format, 1, bytes};
+}
+std::string Report(double seconds) {
+  if (!CensusOn() || seconds <= 0.0)
+    return {};
+  uint64_t c[kCountCount];
+  for (uint32_t i = 0; i < kCountCount; ++i)
+    c[i] = g_count[i].exchange(0, std::memory_order_relaxed);
+  const double ms = TickMs();
+  const auto per_s = [seconds](uint64_t v) { return double(v) / seconds; };
+  const auto pct = [](uint64_t part, uint64_t whole) { return whole ? 100.0 * double(part) / double(whole) : 0.0; };
+  std::string line = fmt::format(
+      "host batch census (blur_renut_diag_batch_census), a second: #3 inherited words {:.0f} ops, {:.1f} KB as "
+      "before, {:.1f} KB by chunk; #4 whole geometry {:.0f} tries, {:.1f} % the draw before's; #5 texture fills "
+      "{:.0f}, {:.1f} % as the call before, {:.1f} % as one of the 16 before; #6 resolves {:.0f}, {:.2f} ms finding "
+      "the destination, {:.2f} ms their work; #7 texture uploads {:.0f} ({:.1f} MB); #8 fence waits {:.0f} ({:.2f} "
+      "ms), {:.0f} of them kicked their own work; #12 conversions: whole {:.1f} KB, range {:.1f} KB, up {:.1f} KB; "
+      "#19 fast draws {:.0f}, {:.1f} % without a field changed; #20 ops {:.0f}, {:.0f} grew their vector; #21 {:.0f} "
+      "captured stack headers; #28 wakes {:.0f} by draws, {:.0f} by others ({:.2f} ms), record lock waits {:.0f} "
+      "({:.2f} ms); #29 immediate draws {:.0f} ({:.2f} ms queueing); #35 setter calls {:.0f}",
+      per_s(c[kRestoreOps]), per_s(c[kRestoreBytesAll]) / 1024.0, per_s(c[kRestoreBytesChunk]) / 1024.0,
+      per_s(c[kWholeTries]), pct(c[kWholeRepeats], c[kWholeTries]), per_s(c[kTextureSetCalls]),
+      pct(c[kTextureSetSame], c[kTextureSetCalls]), pct(c[kTextureSetSeen], c[kTextureSetCalls]),
+      per_s(c[kResolveCalls]), double(c[kResolveTicksDest]) * ms / seconds, double(c[kResolveTicksWork]) * ms / seconds,
+      per_s(c[kUploadCalls]), per_s(c[kUploadBytes]) / 1048576.0, per_s(c[kFenceWaits]),
+      double(c[kFenceWaitTicks]) * ms / seconds, per_s(c[kFenceWaitsKicked]), per_s(c[kConvertWholeBytes]) / 1024.0,
+      per_s(c[kConvertRangeBytes]) / 1024.0, per_s(c[kConvertUpBytes]) / 1024.0, per_s(c[kFastDraws]),
+      pct(c[kFastDrawsNoFields], c[kFastDraws]), per_s(c[kOps]), per_s(c[kOpGrowths]), per_s(c[kOpsStackHeaders]),
+      per_s(c[kWakesDraw]), per_s(c[kWakesOther]), double(c[kWakeTicks]) * ms / seconds, per_s(c[kRecordLockWaits]),
+      double(c[kRecordLockTicks]) * ms / seconds, per_s(c[kImmediateDraws]), double(c[kImmediateTicks]) * ms / seconds,
+      per_s(c[kSetterCalls]));
+  {
+    std::lock_guard lock(g_upload_mutex);
+    UploadNote sorted[32];
+    std::copy(std::begin(g_uploads), std::end(g_uploads), sorted);
+    std::sort(std::begin(sorted), std::end(sorted),
+              [](const UploadNote &a, const UploadNote &b) { return a.count > b.count; });
+    std::string top;
+    for (int i = 0; i < 8 && sorted[i].count; ++i)
+      top += fmt::format(" {:08X} {}x{} format {} x{} ({:.1f} KB each);", sorted[i].va, sorted[i].width,
+                         sorted[i].height, sorted[i].format, sorted[i].count,
+                         double(sorted[i].bytes) / double(sorted[i].count) / 1024.0);
+    if (!top.empty())
+      line += "; #7 the most uploaded since the start:" + top;
+  }
+  return line;
+}
+}  // namespace renut::gpu::host_batch

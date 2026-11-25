@@ -13,18 +13,24 @@ rem   folder's cache when it holds the other value. Unset, a new folder has them
 rem   (the option's Switch default), and GUARD_FORMS=ON sets them OFF (a guard needs its hooks). Each form has its own
 rem   PGO profile: pgo\ (hooked) and pgo-inplace\ (in place), docs/building.md.
 rem Uses the VS-bundled CMake/Ninja (Windows paths) and devkitA64 GCC via the toolchain file.
+rem fable2-nx (2026-11-24, as gears-nx): VS 2022 Community, devkitPro on D: and this PC's Python where the usual ones are
+rem missing. deko3d only: REXGLUE_SWITCH_NVK stays OFF, so NVK_SDK's Mesa path is not used.
 set "VSROOT=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools"
-set "PATH=C:\Python314;%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
+if not exist "%VSROOT%" set "VSROOT=C:\Program Files\Microsoft Visual Studio\2022\Community"
+set "PYDIR=C:\Python314"
+if not exist "%PYDIR%\python.exe" set "PYDIR=D:\Program Files\Python\Python310"
+set "PATH=%PYDIR%;%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
 set "DEVKITPRO=C:/devkitPro"
+if not exist "C:\devkitPro\devkitA64" set "DEVKITPRO=D:/devkitPro"
 set "ROOT=%~dp0.."
 if "%NVK_SDK%"=="" set "NVK_SDK=C:/devkitPro/mesa-switch-main-nfsmw-source/mesa-switch-main/mesa-unified-install/opt/devkitpro/portlibs/switch"
 if "%BUILD_DIR%"=="" set "BUILD_DIR=%ROOT%\app\out\switch"
-if "%JOBS%"=="" set "JOBS=10"
+if "%JOBS%"=="" set "JOBS=5"
 if not exist "%BUILD_DIR%\CMakeCache.txt" (
   cmake -S "%ROOT%\app" -B "%BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release ^
     "-DCMAKE_TOOLCHAIN_FILE=%ROOT%\tools\switch\cmake\switch-devkitA64.cmake" ^
     "-DREXSDK_DIR=%ROOT%\sdk" "-DREXGLUE_SWITCH_NVK_SDK=%NVK_SDK%" ^
-    -DPYTHON_EXECUTABLE=C:/Python314/python.exe -DPython3_EXECUTABLE=C:/Python314/python.exe %CMAKE_EXTRA% || exit /b 1
+    "-DPYTHON_EXECUTABLE=%PYDIR%\python.exe" "-DPython3_EXECUTABLE=%PYDIR%\python.exe" "-DDEVKITPRO=%DEVKITPRO%" %CMAKE_EXTRA% || exit /b 1
 )
 rem renut-ultimate (2026-11-11, port 78; sasrt-nx's idea 27, its -GuardForms): GUARD_FORMS re-configures the folder only
 rem when its cache holds the other value (the hot sources then compile again in the other form).

@@ -210,10 +210,17 @@ unsigned RexSwitchAppCoreMask(void);
 /* Pins the calling thread to the system core alone and, if priority >= 0, sets its priority. False (nothing
  * changed) without a system core. */
 bool RexSwitchMoveCurrentThreadToSystemCore(int priority);
+// banjo-nx (2026-11-22): the calling thread's cores set to 'mask' (bits of cores) with 'preferred' its ideal one, the
+// system core kept in it (svcSetThreadCoreMask's wrap takes the system core out of a mask of several cores); the
+// process's cores only. False when nothing of the mask is the process's or the call fails.
+bool RexSwitchSetCurrentThreadCoresWithSystem(int preferred, unsigned mask);
 /* banjo-nx (2026-10-27): running under the forwarder banjo_forwarder_program_id names, writes the four-core NPDM to
  * sdmc:/atmosphere/contents/<id>/exefs/main.npdm when it is missing or different (Atmosphere's ExeFS file replacement;
- * it takes effect at the forwarder's next launch). 0 nothing to do, 1 already in place, 2 written, -1 failed. */
+ * it takes effect at the forwarder's next launch). 0 nothing to do, 1 already in place, 2 written, -1 failed.
+ * blur-nx (2026-11-18): with four_core_mode false it removes that NPDM instead (3 removed, 0 none of ours there). */
 int RexSwitchEnsureForwarderNpdm(void);
+/* blur-nx (2026-11-18): the same for the game menu's four-core option (on: written, off: removed), at once. */
+int RexSwitchApplyFourCoreMode(int on);
 /* banjo-nx (2026-10-27): banjo_system_core_xma (the XMA Decoder on the system core) and the mixer's priority there. */
 bool RexSwitchSystemCoreXma(void);
 int RexSwitchSystemCoreMixerPriority(void);

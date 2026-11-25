@@ -24,6 +24,9 @@ $args = @("--log_file=$log", "--audio_mute=true", "--window_start_minimized=$min
         @($Extra -split ' ' | Where-Object { $_ })
 # The emulated GPU is the SDK's plugin (rexgpu-xenos.dll), loaded only when named.
 if ($Renderer -eq "emulated") { $args += "--gpu_plugin=xenos" }
+# banjo-nx (2026-11-19): Start-Process joins -ArgumentList's elements with spaces and quotes none of them, so a path
+# with a space ("D:\Banjo kazooie port\...") split into two arguments and the run wrote no log.
+$args = @($args | ForEach-Object { if ($_ -match ' ' -and $_ -notmatch '^".*"$') { '"' + $_ + '"' } else { $_ } })
 $style = if ($Visible) { "Normal" } else { "Minimized" }
 $p = Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $dir -PassThru -WindowStyle $style `
      -RedirectStandardError (Join-Path $logs "stderr.txt") -RedirectStandardOutput (Join-Path $logs "stdout.txt")

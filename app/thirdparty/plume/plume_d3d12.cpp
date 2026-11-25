@@ -481,7 +481,9 @@ namespace plume {
         case RenderHeapType::READBACK:
             return D3D12_HEAP_TYPE_READBACK;
         case RenderHeapType::GPU_UPLOAD:
-            return D3D12_HEAP_TYPE_GPU_UPLOAD;
+            // fable2-nx (2026-11-24, as gears-nx): D3D12_HEAP_TYPE_GPU_UPLOAD (5) is in Windows SDK 10.0.26100's
+            // d3d12.h; an older SDK (10.0.22621) builds with the value itself.
+            return static_cast<D3D12_HEAP_TYPE>(5);
         default:
             assert(false && "Unknown heap type.");
             return D3D12_HEAP_TYPE_DEFAULT;

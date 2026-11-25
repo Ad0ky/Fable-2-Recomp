@@ -1253,8 +1253,41 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 
     uint32_t vectorWriteMask = instr.vectorWriteMask;
-    if (instr.exportData)
+    // Port 175 (from rehatched-nx, its commit 58ad78b0): an export to a register with no name (not oC0-3 or oDepth)
+    // is a plain register write: its masks are not cut, and no '.x = ...' without a name is written.
+    if (instr.exportData && !exportRegister.empty())
         vectorWriteMask &= ~instr.scalarWriteMask;
+
+#ifdef RENUT_RECOMP
+    // fable2-nx (2026-11-25, the black seams at Bowerstone's kerbs; BANJO_RENUT_NAN_KILL=0 in the build's environment
+    // turns it off): a whole-register move of an all-NaN literal in a vertex shader is Fable 2's vertex kill. Its
+    // terrain layers write NaN into the position where a layer is absent and compute the position only where it is
+    // present (under !p0). A NaN position drops every primitive with that vertex, so each layer lost the row of cells
+    // at its border and no layer covered it (black seams along the kerbs, none on the console). Here the move marks
+    // the vertex killed instead (oPts.z: the GPU, D3D12's cull distance and deko3d_glsl_opt.py's vskill pass drop a
+    // primitive only when all its vertices are killed) and clears p0, so the shader goes on to compute the real
+    // position and attributes of the vertex, which the primitives it still belongs to need.
+    if (!isPixelShader && !instr.exportData && vectorWriteMask == 0b1111 && !nanLiteralRegisters.empty() &&
+        (instr.vectorOpcode == AluVectorOpcode::Max || instr.vectorOpcode == AluVectorOpcode::Min))
+    {
+        static const bool nanKill = [] {
+            const char *off = std::getenv("BANJO_RENUT_NAN_KILL");
+            return !(off && off[0] == '0');
+        }();
+        const std::string a = op(VECTOR_0);
+        if (nanKill && a == op(VECTOR_1) &&
+            std::any_of(nanLiteralRegisters.begin(), nanLiteralRegisters.end(),
+                [&a](uint32_t reg) { return a == fmt::format("c{}.xyzw", reg) || a == fmt::format("c{}", reg); }))
+        {
+            hasVertexKill = true;
+            indent();
+            out += "oPts.z = 1.0;\n";
+            indent();
+            out += "p0 = false;\n";
+            vectorWriteMask = 0;
+        }
+    }
+#endif
 
 #ifdef REBLUE_RECOMP
     // A Sgt/Sge whose sources are ShadowTexture taps re-emits per lane as a
@@ -1741,7 +1774,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 
     uint32_t scalarWriteMask = instr.scalarWriteMask;
-    if (instr.exportData)
+    if (instr.exportData && !exportRegister.empty())  // port 175
         scalarWriteMask &= ~instr.vectorWriteMask;
 
     if (scalarWriteMask != 0)
@@ -1777,7 +1810,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 #endif
 
-    if (instr.exportData)
+    if (instr.exportData && !exportRegister.empty())  // port 175
     {
         uint32_t zeroMask = instr.scalarDestRelative ? (0b1111 & ~(instr.vectorWriteMask | instr.scalarWriteMask)) : 0;
         uint32_t oneMask = instr.vectorWriteMask & instr.scalarWriteMask;
@@ -2447,6 +2480,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     const uint32_t words[4] = { value[0].get(), value[1].get(), value[2].get(), value[3].get() };
                     if (reg < 256)
                         allLiterals.push_back({ reg, words[0], words[1], words[2], words[3] });
+                    // fable2-nx (2026-11-25): see nanLiteralRegisters.
+                    if (!isPixelShader && std::all_of(std::begin(words), std::end(words), [](uint32_t w) {
+                            return (w & 0x7F800000u) == 0x7F800000u && (w & 0x007FFFFFu) != 0;
+                        }))
+                        nanLiteralRegisters.insert(reg);
                     std::string comps[4];
                     bool fromBuffer = false;
                     for (uint32_t k = 0; k < 4; ++k)

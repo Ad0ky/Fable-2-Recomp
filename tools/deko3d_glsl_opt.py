@@ -2748,73 +2748,6 @@ def with_viva_round(text):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# pass: plainfetch — a fetch's sign, gamma and exponent code dropped where the draw's fetch words have none
-# (sasrt-nx, 2026-11-08, the GPU round after its move to the ultimate base: sasrt_gpu_plain_fetches, constant 926;
-# renut-ultimate port 44, measured by rr6-nx the same day: with the ultimate renderer its pixel shaders were about 120
-# instructions heavier per fetch and the race drew 3.2 ms a frame more on the GPU. The mask: render/draw.cpp
-# PlainFetchMask)
-
-PLAINFETCH_DECL = ('#ifndef SPIRV_CROSS_CONSTANT_ID_926\n#define SPIRV_CROSS_CONSTANT_ID_926 0u\n#endif\n'
-                   'const uint g_sasrtPlainFetch = SPIRV_CROSS_CONSTANT_ID_926;\n')
-_PF_COND = r'(?:!\(\((_\d+) \| (_\d+)\) != 0u\)|(_\d+))'
-_PF_BLOCK = re.compile(r'bool (_\d+);\s*if \(' + _PF_COND + r'\)\s*\{\s*\1 = (_\d+) != 0;\s*\}\s*else\s*\{\s*\1 = true;\s*\}')
-_PF_NOT = r'bool {v} = !\(\((_\d+) \| (_\d+)\) != 0u\);'
-_PF_SIGNS = r'uint {v} = \(g_UboShared\.v\[(\d+)u\]\.([xyzw]) >> 16u\) & 15u;'
-_PF_GAMMA = r'uint {v} = \(g_UboShared\.v\[(\d+)u\]\.([xyzw]) >> 13u\) & 7u;'
-_PF_EXP = r'int {v} = int\(g_UboShared\.v\[(\d+)u\]\.([xyzw]) << 6u\) >> 26;'
-
-
-def _pf_byte(m):
-    return int(m.group(1)) * 16 + 'xyzw'.index(m.group(2)) * 4
-
-
-def pass_plainfetch(text):
-    """Renut's texture fetches apply Xenos' per-fetch-constant signs and gamma (SharedConstants.sampler_indices bits
-    13-19: v[24 + r / 4]) and the exponent adjust (texture_indices bits 20-25: v[r / 4] for a 2D fetch) to the texel in
-    a block that runs only when the fetch constant has any; for every other fetch the block is skipped and the texel is
-    used as it is. The block is a uniform branch, but its temporaries count in the shader's registers (the race's
-    G-buffer shader 33 GPRs with them, 28 without; the final pass 42 and 31). Constant 926, bit r: the draw's words for
-    fetch constant r have none of the three (render/draw.cpp PlainFetchMask), so the block's condition is false at
-    compile time and uam drops it. Its default 0 leaves every block as it was. Same pixels: the condition was false for
-    that draw anyway."""
-    if 'SPIRV_CROSS_CONSTANT_ID_926' in text or '>> 16u) & 15u;' not in text:
-        return text
-    is_vertex = re.search(r'\bgl_Position\b', text) is not None  # vivapinata-nx (2026-11-12): vertex shaders too
-    edits = []
-    for m in _PF_BLOCK.finditer(text):
-        b, x, y, p, e = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
-        if p:
-            mn = re.search(_PF_NOT.format(v=re.escape(p)), text)
-            if not mn:
-                continue
-            x, y = mn.group(1), mn.group(2)
-        ms = re.search(_PF_SIGNS.format(v=re.escape(x)), text)
-        mg = re.search(_PF_GAMMA.format(v=re.escape(y)), text)
-        me = re.search(_PF_EXP.format(v=re.escape(e)), text)
-        if not (ms and mg and me):
-            continue
-        sb, gb, eb = _pf_byte(ms), _pf_byte(mg), _pf_byte(me)
-        r = (sb - 384) // 4
-        # the words of one fetch constant r: sampler_indices[r] (bytes 384-511) for both, texture_indices[d][r] (d the
-        # fetch's dimension, bytes 0-383) for the exponent
-        if sb != gb or not 384 <= sb < 512 or eb >= 384 or eb % 128 != 4 * r:
-            continue
-        # vivapinata-nx (2026-11-12, A/B 150): a samplerk read (its line after SK_MARK) skips its block only with 975
-        gate = f'((g_sasrtPlainFetch >> {r}u) & 1u) == 0u'
-        # 2026-11-12: and every fetch of a vertex shader (926 says the vertex shader's fetches too only since the shader
-        # round, render/draw.cpp SasrtPlainFetchMask's vs_entry)
-        if text[:ms.start()].rstrip().endswith(SK_MARK) or is_vertex:
-            gate = f'(!g_vivaRound || {gate})'
-        edits.append((m.end(), f'\n    {b} = {b} && {gate};'))
-    if not edits:
-        return text
-    for at, code in reversed(edits):
-        text = text[:at] + code + text[at:]
-    text = insert_globals(text, PLAINFETCH_DECL)
-    return with_viva_round(text) if '(!g_vivaRound || ' in text else text
-
-
-# ---------------------------------------------------------------------------------------------------------------------
 # pass: vskill — a vertex kill as the GPU does it: only a primitive whose vertices are all killed goes (constant 914)
 # vivapinata-nx (2026-11-03, 6eecb25a), ported into renut-ultimate.
 
@@ -3351,6 +3284,86 @@ def pass_pcfgather(text):
     return insert_before_main(text, PCFGATHER_DECL)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# pass: twinsel — a tile's constants by the pixel's row, for one draw over both predicated tiles (2026-11-23)
+
+_TWIN_LIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'twinsel_shaders.txt')
+
+
+def _twin_list():
+    out = {}
+    try:
+        for ln in open(_TWIN_LIST_PATH, encoding='utf-8'):
+            parts = ln.split('#')[0].split()
+            if len(parts) >= 2:
+                out[parts[0].upper()] = [int(p) for p in parts[1:2]]
+    except OSError:
+        pass
+    return out
+
+
+_TWIN = _twin_list()
+
+
+def pass_twinsel(text, name=None):
+    """N&B draws its sea (sub_82386BF8) once per predicated tile: the same tessellated draw twice in a row, each cut to
+    its tile's rows, the pixel shader's constants differing in one register (c222: which tile's screen remap), so the
+    vertex and tessellation work runs twice (banjo_renut_diag_tile_twins, 2026-11-23). render/draw.cpp
+    (banjo_renut_tile_twin_merge) draws such a pair once over both tiles' rows; the listed pixel shaders
+    (tools/twinsel_shaders.txt: the hash and the register that differs) then read the listed register from the
+    shared block's tail for the pixels of the lower tile: v[94].z (SharedConstants::pad_1512[0]) holds the first host row
+    of the lower tile's scissor, v[95] that tile's value of the register (the bits its own draw would have uploaded) and
+    v[96] its pixel shader bools (v[33], SharedConstants::booleans[4-7]: the sea's twins differ in PixelShaderB[0] too,
+    banjo_renut_diag_tile_twins' second run), every read of v[33] taken through the same choice. A pixel's centre is at its row + 0.5 (gl_FragCoord, the upper-left origin the shaders' VPOS
+    uses), so the row is the lower tile's exactly when gl_FragCoord.y >= that first row: the pixels its own scissor kept.
+    Every other draw leaves v[94].z at 0: the register as before. A shader with a relative read of the float constants
+    (one that could reach a listed register) is left as it was."""
+    regs = _TWIN.get(name.upper()) if name else None
+    if not regs or 'dk_twin_lower' in text:
+        return text
+    # gl_FragCoord read already: the shader may read the pixel position (VPOS, which has the tile's corner,
+    # SharedConstants::pixel_origin, taken off: one tile's alone), so it is not one for both tiles.
+    if re.search(r'g_UboPixel\.v\[(?!\d+u\])', text) or 'gl_FragCoord' in text:
+        return text
+    header = re.search(r'^// banjo-dk ([^\n]*)$', text, re.M)
+    if not header or ' twin=' in header.group(0):
+        return text
+    span = main_span(text)
+    if not span:
+        return text
+    start, end = span
+    for r in regs:
+        token = f'g_UboPixel.v[{r}u]'
+        if token in text[:start] or token in text[end:]:
+            return text
+    body = text[start:end]
+    decl = ('\n    float dk_twin_split = uintBitsToFloat(g_UboShared.v[94u].z);\n'
+            '    bool dk_twin_lower = (dk_twin_split != 0.0) && (gl_FragCoord.y >= dk_twin_split);')
+    for k, r in enumerate(regs):
+        token = f'g_UboPixel.v[{r}u]'
+        if token not in body:
+            continue
+        body = body.replace(token, f'dk_twin_c{k}')
+        decl += f'\n    vec4 dk_twin_c{k} = dk_twin_lower ? uintBitsToFloat(g_UboShared.v[{95 + k}u]) : {token};'
+    if 'dk_twin_c' not in body:
+        return text
+    if 'g_UboShared.v[33u]' in body:
+        body = body.replace('g_UboShared.v[33u]', 'dk_twin_b')
+        decl += '\n    uvec4 dk_twin_b = dk_twin_lower ? g_UboShared.v[96u] : g_UboShared.v[33u];'
+    used = [r for k, r in enumerate(regs) if f'dk_twin_c{k}' in body]
+    # main_span's start is right after the body's opening brace: the declarations first.
+    text = text[:start] + decl + body + text[end:]
+    # The banjo-dk line says which registers the lower tile's values replace (plume_deko3d parseUsage: twin=R[,R]),
+    # the shared block (UBO binding 2) in its UBO mask: a draw is merged only for a pixel shader that says so.
+    line = header.group(0)
+    ubo = re.search(r'ubo=(0x[0-9a-fA-F]+)', line)
+    new_line = line
+    if ubo:
+        new_line = new_line.replace(ubo.group(0), 'ubo=0x%x' % (int(ubo.group(1), 16) | 0x4), 1)
+    new_line += ' twin=' + ','.join(str(r) for r in used)
+    return text.replace(line, new_line, 1)
+
+
 PASSES = [
     ('scalecodes', pass_scalecodes),
     ('scale1', pass_scale1),
@@ -3401,6 +3414,7 @@ PASSES = [
     ('expwin', pass_expwin),  # sasrt-nx (2026-11-08): the fourth GPU round, constant 944
     ('expparts', pass_expparts),  # sasrt-nx (2026-11-09): an EXPERIMENT, constant 945 (0: as before)
     ('pcfgather', pass_pcfgather),  # fable2-nx (2026-11-17): constant 981, after onex / onexsize
+    ('twinsel', pass_twinsel),  # banjo-nx (2026-11-23): the listed pixel shaders (tools/twinsel_shaders.txt), no constant
     ('clamp7e3', pass_clamp7e3),  # dishonored-nx (2026-10-31; port 106): constant 990, the last pixel pass
     ('invariant', pass_invariant),  # dishonored-nx (2026-10-30; port 100): vertex shaders, no constant
 ]
@@ -3416,6 +3430,7 @@ STAGE_OF = {'earlykill': 'frag', 'noearly': 'frag', 'facesign': 'frag', 'clipspe
 STAGE_OF['invariant'] = 'vert'  # dishonored-nx (port 100)
 STAGE_OF['pcfgather'] = 'frag'  # fable2-nx
 STAGE_OF['clamp7e3'] = 'frag'  # dishonored-nx (port 106)
+STAGE_OF['twinsel'] = 'frag'  # banjo-nx (2026-11-23)
 
 
 def optimise(text, passes=DEFAULT, stage=None, name=None):
@@ -3427,7 +3442,7 @@ def optimise(text, passes=DEFAULT, stage=None, name=None):
     for pname, fn in PASSES:
         if pname in names and STAGE_OF.get(pname, stage) == stage:
             text = fn(text, name) if fn in (pass_gpr32, pass_lightbranch, pass_nullps, pass_skinonce, pass_nofxaa,
-                                            pass_noearly) else fn(text)
+                                            pass_noearly, pass_twinsel) else fn(text)
     return text
 
 

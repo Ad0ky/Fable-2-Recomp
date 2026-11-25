@@ -30,6 +30,11 @@ namespace renut::gpu::render_thread {
 // render thread, so work held back on the game's side (a tile's command buffer run waiting for its twin) is queued
 // before anything after it. Set once at start-up; null for none.
 void SetBeforePushHook(void (*hook)());
+// banjo-nx (2026-11-23, banjo_renut_tile_twin_merge): a second such hook, called before the first.
+void SetBeforePushHook2(void (*hook)());
+// banjo-nx (2026-11-23): one of the two hooks now (1: SetBeforePushHook's, 2: SetBeforePushHook2's), when set: work held
+// by the other holder queued before this one holds its own, so at most one thing is held at a time.
+void RunBeforePushHook(int which);
 
 // Runs 'work' on the render thread after everything queued before it, with
 // State().mutex held.
@@ -65,7 +70,9 @@ bool WaitForFenceProgress(std::chrono::milliseconds timeout);
 // A guest frame: 'work' (the Swap) is queued; then the game thread waits while
 // more than kMaxFramesAhead frames are queued but not yet done. Returns the
 // number of frames the render thread has finished.
-constexpr uint64_t kMaxFramesAhead = 1;
+// blur-nx (2026-11-13, #37 of Blur's docs/cpu-near-exact-50-1113.md): 2, so rr6_frames_ahead = 2 can be tried (its
+// default stays 1; two frames ahead lets the game rewrite data the render thread has yet to read: not exact).
+constexpr uint64_t kMaxFramesAhead = 2;
 uint64_t QueueFrame(std::function<void()> work);
 // banjo-nx (2026-10-19, banjo_late_input): the late input delay (rex::latency's frame read delay), and its line for the
 // 10 s report.

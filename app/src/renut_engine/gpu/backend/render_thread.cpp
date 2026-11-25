@@ -2,6 +2,9 @@
  * @file    gpu/backend/render_thread.cpp
  */
 #include "renut_engine/gpu/backend/render_thread.h"
+#include "renut_engine/gpu/stage_census.h"  // blur-nx (2026-11-17, the Renut audit's census)
+#include "renut_engine/gpu/host_batch.h"  // blur-nx (2026-11-18, the Renut host batch)
+#include "renut_engine/gpu/sasrt_gpu_round.h"  // sasrt-nx (2026-11-20): the second render-thread round
 
 #include <algorithm>
 #include <atomic>
@@ -29,7 +32,8 @@
 // rewrite data before the render thread reads it. Ryujinx rarely shows it; a slow GPU shows it constantly.
 REXCVAR_DEFINE_INT32(rr6_frames_ahead, 1, "Banjo/Enhancements",
                      "How many frames the game may run ahead of Renut's render thread. 0: the game waits at its Swap "
-                     "until the render thread has done the frame. 1: one frame ahead")
+                     "until the render thread has done the frame. 1: one frame ahead. 2 (blur-nx #37, near-exact): two "
+                     "frames ahead (the game may rewrite data the render thread has yet to read)")
     .range(0, 1)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(rr6_diag_render_delay_ms, 0, "Banjo/Enhancements",
@@ -42,9 +46,24 @@ REXCVAR_DEFINE_BOOL(banjo_renut_done_notify_waiters, true, "Banjo/Enhancements",
                     "it: a signal is a kernel call on the Switch even with nobody waiting, and it made one after every "
                     "batch of work. Off: after every batch, as before")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_render_address_wait, true, "Banjo/Renut",
+                    "blur-nx (the Renut audit's #11, exact; the Switch): with the lock-free ring, the render thread sleeps "
+                    "on an address (svcWaitForAddress) and a push wakes it with svcSignalToAddress, without g_mutex on "
+                    "either side (Blur's Game Master: 0.88 % in notify_one waking it). false: g_work_cv, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_done_lockfree, true, "Banjo/Renut",
+                    "blur-nx (the Renut audit's #12, exact): the lock-free ring's batch end counts its items and reads "
+                    "the done waiters as atomics, taking g_mutex only to wake one (with banjo_renut_done_notify_waiters). "
+                    "false: g_mutex at every batch end, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(banjo_renut_prefetch_next, true, "Banjo/Enhancements",
                     "Renut's render thread asks for the next draw's capture (written on the game thread's core) to be "
                     "brought into its cache while it does the draw before it")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// banjo-nx (2026-11-20, render-thread batch, experiment #58): see RunRing.
+REXCVAR_DEFINE_INT32(banjo_renut_ring_spin_us, 0, "Banjo/Renut",
+                     "Experiment: microseconds Renut's render thread looks for new work before it sleeps on an empty "
+                     "ring (0: sleeps at once)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(banjo_renut_wake_batch, 16, "Banjo/Enhancements",
                      "Renut's render thread, when it has caught up and sleeps, is woken by the game's draws only once "
@@ -73,6 +92,16 @@ REXCVAR_DEFINE_BOOL(dishonored_renut_lockfree_queue, true, "Banjo/Enhancements",
 #endif
 #include <windows.h>
 #endif
+
+#if defined(__SWITCH__)
+// blur-nx (2026-11-17, the Renut audit's #11): the SDK's address-wait helpers (threading_switch.cpp).
+extern "C" bool RexSwitchWaitIfEqual(volatile uint32_t* word, uint32_t value, int64_t ns);
+extern "C" void RexSwitchWakeAddress(volatile uint32_t* word, int32_t count);
+#endif
+
+namespace renut::gpu {
+void SettleExportsForFence();  // port 170: render/draw.cpp (banjo_fence_waits_exports)
+}
 
 namespace renut::gpu::render_thread {
 
@@ -103,6 +132,12 @@ inline void PrefetchItem(const Item &item) {
     __builtin_prefetch(b + 64);
     __builtin_prefetch(b + 128);
     __builtin_prefetch(b + 192);
+    // sasrt-nx (2026-11-20, sasrt_rt2_ring_prefetch; the second render-thread round's #30): a narrowed delta averages
+    // ~360 bytes in Sonic Transformed's 4-player race (6-7 lines): two lines more.
+    if (sasrt::gpu_round::On(sasrt::gpu_round::kRt2RingPrefetch)) {
+      __builtin_prefetch(b + 256);
+      __builtin_prefetch(b + 320);
+    }
   }
 }
 
@@ -117,10 +152,39 @@ std::condition_variable g_done_cv;  // work done: frames, fences, drains; or sto
 // banjo-nx (2026-10-20, from sa2-nx, banjo_renut_done_notify_waiters): threads in g_done_cv's waits (under g_mutex). A done signal goes
 // only when there is one: a waiter checks its condition under g_mutex before it counts itself and sleeps, and the
 // state it waits for changes under g_mutex too, so no signal it needs is skipped.
-int g_done_waiters = 0;
+// blur-nx (2026-11-17, the Renut audit's #12): atomics (sequentially consistent), so the ring's batch end can count
+// its items and read the waiters without g_mutex (blur_renut_done_lockfree, RunRing); every other access is still
+// under g_mutex as before.
+std::atomic<int> g_done_waiters{0};
 bool DoneNotifyAll() {
   static const bool on = REXCVAR_GET(banjo_renut_done_notify_waiters);
   return !on;
+}
+// blur-nx (2026-11-17, the Renut audit's #11, blur_renut_render_address_wait; the Switch): the ring's sleep on an
+// address instead of g_work_cv. The render thread reads g_wake_word, looks at the ring once more and sleeps while the
+// word is unchanged (svcWaitForAddress); a push that publishes, then reads g_waiting true, adds to the word and wakes
+// the address (svcSignalToAddress): no g_mutex on either side, and the woken thread does not take a mutex first (a
+// condition variable's wake on Horizon hands it the mutex). Either the push's add comes before the render thread's read
+// of the word (then its look at the ring, after that read, sees the item) or after it (then the wait sees the word
+// changed, or is woken). g_stop_flag: g_stopping for the sleeper, which holds no g_mutex.
+std::atomic<uint32_t> g_wake_word{0};
+std::atomic<bool> g_stop_flag{false};
+// blur-nx (2026-11-17, audit #11): blur_renut_render_address_wait (the Switch only).
+bool AddressWakeOn() {
+#if defined(__SWITCH__)
+  static const bool on = REXCVAR_GET(blur_renut_render_address_wait);
+  return on;
+#else
+  return false;
+#endif
+}
+// A push's wake of the sleeping render thread (g_waiting read true): the address, or g_work_cv (taking g_mutex first,
+// so the notify cannot come between the render thread's last look and its wait; Locked: the caller holds g_mutex).
+void WakeRenderAddress() {
+#if defined(__SWITCH__)
+  g_wake_word.fetch_add(1, std::memory_order_seq_cst);
+  RexSwitchWakeAddress(reinterpret_cast<volatile uint32_t *>(&g_wake_word), 1);
+#endif
 }
 // banjo-nx (2026-10-20, from sa2-nx, banjo_renut_wake_batch): the draws queued before a sleeping render thread is woken (1: each).
 size_t WakeBatch() {
@@ -181,7 +245,7 @@ std::thread::id g_thread_id;
 bool g_running = false;   // the thread takes work
 bool g_stopping = false;  // Stop: finish what is queued, then end
 uint64_t g_items_queued = 0;
-uint64_t g_items_done = 0;
+std::atomic<uint64_t> g_items_done{0};  // blur-nx (2026-11-17, audit #12): see g_done_waiters
 uint64_t g_frames_queued = 0;
 uint64_t g_frames_done = 0;
 uint64_t g_fences_done = 0;  // fence completions written, plus callbacks reached
@@ -210,6 +274,7 @@ Clock::duration g_waited{};
 thread_local bool t_render_thread = false;
 
 void Execute(Item &item) {
+  ::renut::gpu::census::Scope census_scope(::renut::gpu::census::kRunItem);  // blur-nx (2026-11-17)
   if (item.locked) {
     std::lock_guard lock(State().mutex);
     item.work();
@@ -225,15 +290,44 @@ void Execute(Item &item) {
 // consistent: no store-load reordering) is seen by that last look, and one that read it true takes g_mutex before it
 // notifies, so it cannot notify between the look and the wait.
 constexpr size_t kRingRun = 256;
+// banjo-nx (2026-11-20, render-thread batch, experiment #58): with the ring empty, the render thread looks again for up
+// to this many microseconds (a YIELD between looks) before it sleeps: a push in that time is taken without the kernel's
+// sleep and wake (svcWaitForAddress / svcSignalToAddress, tens of microseconds each way). 0: sleep at once, as before.
+// It spends the render thread's core while it looks; measure it (tools/ab_halves.py) before keeping it.
 void RunRing() {
   static const bool batch_clock = REXCVAR_GET(banjo_renut_batch_clock);
   static const bool prefetch = REXCVAR_GET(banjo_renut_prefetch_next);
+  static const int spin_us = REXCVAR_GET(banjo_renut_ring_spin_us);
   uint64_t pos = g_dequeue.load(std::memory_order_relaxed);
   for (;;) {
+    if (spin_us > 0 && !RingReady(pos)) {
+      const Clock::time_point until = Clock::now() + std::chrono::microseconds(spin_us);
+      while (!RingReady(pos) && Clock::now() < until) {
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+      }
+    }
     if (!RingReady(pos)) {
       g_waiting.store(true, std::memory_order_seq_cst);
       bool stopping = false;
-      if (!RingReadySc(pos)) {
+      if (AddressWakeOn()) {
+        // blur-nx (2026-11-17, audit #11): the word read before the last look (see g_wake_word). With a wake batch,
+        // draws queued without a wake are taken within 2 ms, as with g_work_cv; otherwise a 100 ms net.
+        const int64_t slice_ns = WakeBatch() > 1 ? 2'000'000 : 100'000'000;
+        for (;;) {
+          const uint32_t word = g_wake_word.load(std::memory_order_seq_cst);
+          if (RingReadySc(pos) || g_stop_flag.load(std::memory_order_acquire))
+            break;
+#if defined(__SWITCH__)
+          RexSwitchWaitIfEqual(reinterpret_cast<volatile uint32_t *>(&g_wake_word), word, slice_ns);
+#else
+          (void)word;
+          (void)slice_ns;
+#endif
+        }
+        stopping = g_stop_flag.load(std::memory_order_acquire);
+      } else if (!RingReadySc(pos)) {
         std::unique_lock lock(g_mutex);
         g_render_waiting = true;
         if (WakeBatch() > 1) {
@@ -279,7 +373,18 @@ void RunRing() {
     if (batch_clock)
       g_busy += Clock::now() - start;
     bool wake;
-    {
+    // blur-nx (2026-11-17, the Renut audit's #12, blur_renut_done_lockfree): the count added and the waiters read
+    // without g_mutex (both sequentially consistent). A waiter counts itself under g_mutex before it tests its
+    // condition: either this load sees it (and the wake takes g_mutex once, so the waiter is asleep in g_done_cv or
+    // has not yet tested), or its test comes after this add and sees the new count.
+    static const bool lockfree = REXCVAR_GET(blur_renut_done_lockfree);
+    if (lockfree && !DoneNotifyAll()) {
+      g_items_done.fetch_add(n, std::memory_order_seq_cst);
+      wake = g_done_waiters.load(std::memory_order_seq_cst) > 0;
+      if (wake) {
+        std::lock_guard lock(g_mutex);
+      }
+    } else {
       std::lock_guard lock(g_mutex);
       g_items_done += n;
       wake = g_done_waiters > 0 || DoneNotifyAll();
@@ -404,6 +509,11 @@ void Start() {
 // wake are handed over. Requires g_mutex.
 void WakeForWaitLocked() {
   if (LockfreeOn()) {  // dishonored-nx (port 105, dishonored_renut_lockfree_queue)
+    if (AddressWakeOn()) {  // blur-nx (2026-11-17, audit #11): the sleeper holds no g_mutex; g_waiting says it sleeps
+      if (g_waiting.load(std::memory_order_seq_cst) && g_ring && RingReady(g_dequeue.load(std::memory_order_relaxed)))
+        WakeRenderAddress();
+      return;
+    }
     if (g_render_waiting && g_ring && RingReady(g_dequeue.load(std::memory_order_relaxed)))
       g_work_cv.notify_one();
     return;
@@ -414,9 +524,15 @@ void WakeForWaitLocked() {
 
 // vivapinata-nx (2026-11-11, vivapinata_tiles_once): SetBeforePushHook's function.
 std::atomic<void (*)()> g_before_push{nullptr};
+// banjo-nx (2026-11-23, banjo_renut_tile_twin_merge): a second one (queued.cpp's held tile twin), called first.
+std::atomic<void (*)()> g_before_push2{nullptr};
 
 [[gnu::always_inline]] inline void BeforePush() {
-  if (void (*hook)() = g_before_push.load(std::memory_order_relaxed); hook && !t_render_thread) [[unlikely]]
+  if (t_render_thread)
+    return;
+  if (void (*hook)() = g_before_push2.load(std::memory_order_relaxed)) [[unlikely]]
+    hook();
+  if (void (*hook)() = g_before_push.load(std::memory_order_relaxed)) [[unlikely]]
     hook();
 }
 
@@ -444,10 +560,14 @@ bool PushRing(Item &&item, bool draw) {
         return false;
       }
       if (g_waiting.load(std::memory_order_seq_cst)) {  // (a signal is a kernel call on the Switch: only to a sleeper)
-        {
-          std::lock_guard lock(g_mutex);
+        if (AddressWakeOn()) {
+          WakeRenderAddress();  // blur-nx (2026-11-17, audit #11)
+        } else {
+          {
+            std::lock_guard lock(g_mutex);
+          }
+          g_work_cv.notify_one();
         }
-        g_work_cv.notify_one();
       }
       std::this_thread::yield();
       pos = g_enqueue.load(std::memory_order_relaxed);
@@ -461,14 +581,29 @@ bool PushRing(Item &&item, bool draw) {
   slot->item = std::move(item);
   // Published, then g_waiting read: a sequentially consistent store and load (stlr, ldar: no dmb), RunRing's order.
   slot->seq.store(pos + 1, std::memory_order_seq_cst);
+  // blur-nx (2026-11-18, the Renut host batch's #28, blur_renut_wake_batch_all / A/B 238): with a wake batch (the render
+  // thread then looks every 2 ms by itself), any item may wait for the batch as draws do: command buffer runs and
+  // resolves woke it at once, each a kernel call on the pushing thread (the Game Master's), with the render thread idle
+  // half the time.
+  const bool as_draw = draw || (g_wake_batch > 1 && ::renut::gpu::host_batch::On(::renut::gpu::host_batch::kWakeBatchAll));
   const bool wake = (g_waiting.load(std::memory_order_seq_cst) &&
-                     (!draw || pos + 1 - g_dequeue.load(std::memory_order_relaxed) >= g_wake_batch)) ||
+                     (!as_draw || pos + 1 - g_dequeue.load(std::memory_order_relaxed) >= g_wake_batch)) ||
                     !g_notify_idle;
   if (wake) {
-    {
-      std::lock_guard lock(g_mutex);
+    const bool hb_census = ::renut::gpu::host_batch::CensusOn();  // blur-nx (2026-11-18, the census's #28)
+    const uint64_t t0 = hb_census ? ::renut::gpu::host_batch::Ticks() : 0;
+    if (AddressWakeOn()) {
+      WakeRenderAddress();  // blur-nx (2026-11-17, audit #11)
+    } else {
+      {
+        std::lock_guard lock(g_mutex);
+      }
+      g_work_cv.notify_one();
     }
-    g_work_cv.notify_one();
+    if (hb_census) {
+      ::renut::gpu::host_batch::Add(draw ? ::renut::gpu::host_batch::kWakesDraw : ::renut::gpu::host_batch::kWakesOther);
+      ::renut::gpu::host_batch::Add(::renut::gpu::host_batch::kWakeTicks, ::renut::gpu::host_batch::Ticks() - t0);
+    }
   }
   return true;
 }
@@ -512,6 +647,15 @@ void SetBeforePushHook(void (*hook)()) {
   g_before_push.store(hook, std::memory_order_relaxed);
 }
 
+void SetBeforePushHook2(void (*hook)()) {
+  g_before_push2.store(hook, std::memory_order_relaxed);
+}
+
+void RunBeforePushHook(int which) {
+  if (void (*hook)() = (which == 2 ? g_before_push2 : g_before_push).load(std::memory_order_relaxed))
+    hook();
+}
+
 void Queue(std::function<void()> work) {
   Push(std::move(work), true);
 }
@@ -526,6 +670,7 @@ void QueuePrefetched(const void *prefetch0, const void *prefetch1, std::function
 
 void QueueFenceCompletion(u32 completion_va, u32 fence, uint64_t after_callback) {
   QueueUnlocked([completion_va, fence, after_callback] {
+    ::renut::gpu::SettleExportsForFence();  // port 170 (banjo_fence_waits_exports; nothing when off)
     bool wake;
     {
       std::lock_guard lock(g_mutex);
@@ -692,7 +837,7 @@ uint64_t QueueFrame(std::function<void()> work) {
   const uint64_t done = g_frames_done;
   lock.unlock();
   const auto waited = std::chrono::steady_clock::now() - waiting;
-  frame_stats::OnGameThreadWait(std::chrono::duration<double, std::milli>(waited).count());
+  frame_stats::OnGameThreadWait(std::chrono::duration<double, std::milli>(waited).count(), 1);  // blur-nx: #37
   // banjo-nx (2026-10-19, banjo_late_input): this frame's slack (the game thread only: one Swap at a time).
   {
     // The game's frame interval (the game thread only), averaged over about 16 frames.
@@ -745,8 +890,11 @@ void Stop() {
     if (!g_running || g_stopping)
       return;
     g_stopping = true;
+    g_stop_flag.store(true, std::memory_order_release);  // blur-nx (2026-11-17, audit #11)
   }
   g_accepting.store(false, std::memory_order_release);  // dishonored-nx (port 105): later pushes run inline
+  if (AddressWakeOn())
+    WakeRenderAddress();  // blur-nx (2026-11-17, audit #11)
   g_work_cv.notify_all();
   g_done_cv.notify_all();
 }

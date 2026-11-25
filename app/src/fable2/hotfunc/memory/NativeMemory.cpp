@@ -21,7 +21,8 @@
 
 #include <cstring>
 
-#include <rex/system/xmemory.h>  // fable2-nx (2026-11-14): MarkStoreCards
+#include <rex/system/xmemory.h>  // fable2-nx (2026-11-14): MarkStoreCards; (2026-11-24) MarkStoreCardsAt with the guest base
+// (the generated code's base): g_store_cards is the runtime's data, which the PC app (the runtime a DLL) cannot link to.
 
 extern "C" void __imp__MemCpy_SdkRuntime_82CA2C60(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__MemCpy_Aligned_82CA30E8(PPCContext& ctx, uint8_t* base);

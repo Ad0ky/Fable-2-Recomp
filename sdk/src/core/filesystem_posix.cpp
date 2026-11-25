@@ -14,13 +14,14 @@
 #include <string.h>
 
 #include <algorithm>
+#include <cerrno>  // port 203
 #include <cstring>
 #include <iostream>
 #include <memory>
-#include <string>
-#include <atomic>
-#include <unordered_map>
-#include <mutex>
+#include <mutex>          // port 203
+#include <string>         // port 203
+#include <unordered_map>  // port 203
+#include <vector>  // port 203
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -32,10 +33,36 @@
 #endif
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform/env.h>
 #include <rex/string.h>
+
+#if defined(__SWITCH__)
+#include "guest_memory_switch.h"  // port 146: RexGmBase / RexGmSize, the guest window
+#endif
+
+// renut-ultimate (2026-11-16, port 146; tw2de_nx's of 2026-10-26/27, the speed-up ON by default at the user's word): the Switch's
+// reads and writes through a host buffer (PosixFileHandle below). ON at the user's word ("port the speed ups as on by default").
+REXCVAR_DEFINE_INT32(filesystem_bounce_piece_mb, 4, "Filesystem",
+                     "tw2de_nx: the Switch's file reads and writes go through a host buffer in pieces of this many MB "
+                     "(1-16; 4 by default, 1 as before). Each piece is a request to the file system service (about 2.3 ms of fixed "
+                     "cost on the console, tw2de_nx): 1 MB pieces cut a large read's speed by about a seventh, 4 MB "
+                     "(masseffect_io_chunk_mb's size, which the reads are split into anyway) by none. Each reading thread "
+                     "keeps a buffer of this size")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// renut-ultimate (2026-11-20, port 203; sims3-nx's): the Switch's one Horizon file per path (OpenExisting below).
+REXCVAR_DEFINE_BOOL(filesystem_shared_handles, true, "Filesystem",
+                    "Switch: every guest handle on a file outside the game's own (saves, profiles) shares one Horizon "
+                    "descriptor, reopened read-write for the first writer: Horizon refuses a write open while another "
+                    "open exists (The Sims 3's saves failed). false = a descriptor per handle, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(filesystem_bounce_guest_only, true, "Filesystem",
+                    "tw2de_nx: only a buffer in the guest's memory goes through the host buffer (the file system refuses "
+                    "guest memory as a transfer buffer); a host buffer (the read cache's, the renderer's) is read and "
+                    "written directly, one copy less. false = every buffer through it, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 #include <dirent.h>
 #include <ftw.h>
@@ -241,46 +268,104 @@ bool CreateEmptyFile(const std::filesystem::path& path) {
 
 #if defined(__SWITCH__)
 /*
- * fable2-nx (2026-11-24, Fable II's saves "corrupted"): Horizon's file system refuses to open a file that is already
- * open when one of the two opens writes (the open fails; here it reached the game as NO_SUCH_FILE). Fable II saves by
- * opening mainsave.bin to create it (read access, FILE_OVERWRITE_IF) and, with that handle still open, again to write
- * it (FILE_OPEN): the second open failed every time, nothing was written and every load said "corrupted". Windows and
- * the Xbox 360 allow it (share modes). So the handles of one file share one host descriptor: an open that fails while
- * another handle of the same file is open takes that descriptor, reopened read-write when the rights differ. Reads
- * and writes keep their own offsets (pread / pwrite), each under the descriptor's lock.
+ * renut-ultimate (2026-11-20, port 203): sims3-nx's one Horizon file per path, however many guest handles it has.
+ * On the Xbox 360 a game can hold a file open several times. Horizon refuses a write open while any other open of the
+ * file exists, and any open while a write open exists: The Sims 3 creates its save, keeps two read handles on it and
+ * then opens it for writing, which failed (NO_SUCH_FILE), and the game reported that saving failed. So every handle
+ * on such a path shares one descriptor, reopened read-write when the first writer comes, with a lock per file over
+ * each transfer (newlib's pread and pwrite move the shared position). stat also opens the file on Horizon and fails
+ * while a writer holds it, so GetInfo asks the shared descriptor first. The game's own files (read-only opens under
+ * the game data root, SetReadOnlyGameRoot below) keep a descriptor per handle and no lock: sharing them stopped
+ * sims3-nx's start-up. filesystem_shared_handles (on): false, a descriptor per handle as before.
  */
-struct SharedHostFd {
-  std::mutex m;
+struct SharedHostFile {
+  std::string key;
   int fd = -1;
-  int mode = O_RDONLY;
+  bool writable = false;
+  uint32_t references = 0;
+  std::mutex mutex;  // taken after g_shared_files_mutex, never before it
 };
-std::mutex g_shared_fds_mutex;
-std::unordered_map<std::string, std::weak_ptr<SharedHostFd>> g_shared_fds;
-std::shared_ptr<SharedHostFd> MakeSharedHostFd(int fd, int mode) {
-  std::shared_ptr<SharedHostFd> s(new SharedHostFd, [](SharedHostFd* p) {
-    if (p->fd >= 0) close(p->fd);
-    delete p;
-  });
-  s->fd = fd;
-  s->mode = mode;
-  return s;
+
+static std::mutex g_shared_files_mutex;
+static std::unordered_map<std::string, std::unique_ptr<SharedHostFile>> g_shared_files;
+// The read-only roots (the game data's, the title update's): set at start (SetReadOnlyGameRoot), read after.
+static std::vector<std::string> g_read_only_roots;
+
+void SetReadOnlyGameRoot(const std::filesystem::path& root) {
+  std::string text = root.string();
+  if (!text.empty() && text.back() != '/')
+    text += '/';
+  g_read_only_roots.push_back(text);
 }
+
+static bool UnderReadOnlyRoot(const std::string& key) {
+  for (const std::string& root : g_read_only_roots)
+    if (key.rfind(root, 0) == 0)
+      return true;
+  return false;
+}
+
+static bool MakeSharedFileWritable(SharedHostFile& shared) {
+  std::lock_guard<std::mutex> lock(shared.mutex);
+  if (shared.writable) return true;
+  close(shared.fd);
+  shared.fd = open(shared.key.c_str(), O_RDWR);
+  if (shared.fd == -1) {
+    REXFS_ERROR("Could not reopen '{}' for writing: errno {}", shared.key, errno);
+    shared.fd = open(shared.key.c_str(), O_RDONLY);
+    return false;
+  }
+  shared.writable = true;
+  return true;
+}
+
+static bool StatSharedFile(const std::filesystem::path& path, struct stat* st) {
+  std::lock_guard<std::mutex> registry(g_shared_files_mutex);
+  const auto it = g_shared_files.find(path.string());
+  if (it == g_shared_files.end()) return false;
+  std::lock_guard<std::mutex> lock(it->second->mutex);
+  std::memset(st, 0, sizeof(*st));
+  if (fstat(it->second->fd, st) != 0) return false;
+  st->st_mode = (st->st_mode & ~S_IFMT) | S_IFREG;
+  return true;
+}
+
+bool TruncateOpenFile(const std::filesystem::path& path) {
+  std::lock_guard<std::mutex> registry(g_shared_files_mutex);
+  const auto it = g_shared_files.find(path.string());
+  if (it == g_shared_files.end()) return false;
+  SharedHostFile& shared = *it->second;
+  if (!MakeSharedFileWritable(shared)) return false;
+  std::lock_guard<std::mutex> lock(shared.mutex);
+  return ftruncate(shared.fd, 0) == 0;
+}
+#else
+void SetReadOnlyGameRoot(const std::filesystem::path&) {}
 #endif
 
 class PosixFileHandle : public FileHandle {
  public:
-#if defined(__SWITCH__)
-  PosixFileHandle(std::filesystem::path path, std::shared_ptr<SharedHostFd> shared)
-      : FileHandle(std::move(path)), shared_(std::move(shared)) {}
-  ~PosixFileHandle() override = default;  // the descriptor closes with its last handle
-#else
   PosixFileHandle(std::filesystem::path path, int handle)
       : FileHandle(std::move(path)), handle_(handle) {}
+#if defined(__SWITCH__)
+  // Port 203: a handle on a shared Horizon file (its descriptor, and its lock over each transfer).
+  PosixFileHandle(std::filesystem::path path, SharedHostFile* shared)
+      : FileHandle(std::move(path)), shared_(shared), handle_(-1) {}  // the members' order
+#endif
   ~PosixFileHandle() override {
+#if defined(__SWITCH__)
+    if (shared_) {
+      std::lock_guard<std::mutex> registry(g_shared_files_mutex);
+      if (--shared_->references == 0) {
+        close(shared_->fd);
+        g_shared_files.erase(shared_->key);
+      }
+      return;
+    }
+#endif
     close(handle_);
     handle_ = -1;
   }
-#endif
 #if defined(__SWITCH__)
   /*
    * banjo-nx (2026-10-29, for the DLC; from peggle1-nx, 2026-10-21): on Horizon the file system never sees the caller's buffer. The buffers here are usually
@@ -292,22 +377,43 @@ class PosixFileHandle : public FileHandle {
    * (about 5 ms for those 23 MB on the A57), the same results as one pread / pwrite (a short piece ends the transfer
    * with what was moved, an error before the first byte is an error).
    */
-  static constexpr size_t kPiece = size_t(1) << 20;
+  // Port 146: filesystem_bounce_piece_mb (1 MB by default, as before), filesystem_bounce_guest_only (off).
+  static size_t PieceBytes() {
+    static const size_t piece = size_t(std::clamp(REXCVAR_GET(filesystem_bounce_piece_mb), 1, 16)) << 20;
+    return piece;
+  }
   static uint8_t* Bounce() {
     static thread_local std::unique_ptr<uint8_t[]> bounce;
-    if (!bounce) bounce = std::make_unique<uint8_t[]>(kPiece);
+    if (!bounce) bounce = std::make_unique<uint8_t[]>(PieceBytes());
     return bounce.get();
+  }
+  // Whether [p, p + n) is a host buffer the file system may take directly (filesystem_bounce_guest_only).
+  static bool DirectOk(const void* p, size_t n) {
+    static const bool guest_only = REXCVAR_GET(filesystem_bounce_guest_only);
+    if (!guest_only || !n)
+      return false;
+    const uint8_t* base = RexGmBase();
+    const uint8_t* q = static_cast<const uint8_t*>(p);
+    return base && !(q + n > base && q < base + RexGmSize());
   }
   bool Read(size_t file_offset, void* buffer, size_t buffer_length,
             size_t* out_bytes_read) override {
+    if (DirectOk(buffer, buffer_length)) {  // port 146
+      const ssize_t got = PRead(buffer, buffer_length, off_t(file_offset));
+      if (got < 0) {
+        *out_bytes_read = 0;
+        return false;
+      }
+      *out_bytes_read = size_t(got);
+      return true;
+    }
+    const size_t kPiece = PieceBytes();
     uint8_t* const bounce = Bounce();
-    std::lock_guard lock(shared_->m);
-    const int handle_ = shared_->fd;
     auto* out = static_cast<uint8_t*>(buffer);
     size_t total = 0;
     while (total < buffer_length) {
       const size_t piece = std::min(kPiece, buffer_length - total);
-      const ssize_t got = pread(handle_, bounce, piece, off_t(file_offset + total));
+      const ssize_t got = PRead(bounce, piece, off_t(file_offset + total));
       if (got < 0) {
         if (!total) {
           *out_bytes_read = 0;
@@ -324,15 +430,23 @@ class PosixFileHandle : public FileHandle {
   }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
+    if (DirectOk(buffer, buffer_length)) {  // port 146
+      const ssize_t put = PWrite(buffer, buffer_length, off_t(file_offset));
+      if (put < 0) {
+        *out_bytes_written = 0;
+        return false;
+      }
+      *out_bytes_written = size_t(put);
+      return true;
+    }
+    const size_t kPiece = PieceBytes();
     uint8_t* const bounce = Bounce();
-    std::lock_guard lock(shared_->m);
-    const int handle_ = shared_->fd;
     const auto* in = static_cast<const uint8_t*>(buffer);
     size_t total = 0;
     while (total < buffer_length) {
       const size_t piece = std::min(kPiece, buffer_length - total);
       std::memcpy(bounce, in + total, piece);
-      const ssize_t put = pwrite(handle_, bounce, piece, off_t(file_offset + total));
+      const ssize_t put = PWrite(bounce, piece, off_t(file_offset + total));
       if (put < 0) {
         if (!total) {
           *out_bytes_written = 0;
@@ -370,23 +484,40 @@ class PosixFileHandle : public FileHandle {
 #endif
 #if defined(__SWITCH__)
   bool SetLength(size_t length) override {
-    std::lock_guard lock(shared_->m);
-    return ftruncate(shared_->fd, length) >= 0;
+    if (shared_) {
+      std::lock_guard<std::mutex> lock(shared_->mutex);
+      return ftruncate(shared_->fd, length) >= 0;
+    }
+    return ftruncate(handle_, length) >= 0 ? true : false;
   }
   void Flush() override {
-    std::lock_guard lock(shared_->m);
-    fsync(shared_->fd);
+    if (shared_) {
+      std::lock_guard<std::mutex> lock(shared_->mutex);
+      fsync(shared_->fd);
+      return;
+    }
+    fsync(handle_);
   }
-
- private:
-  std::shared_ptr<SharedHostFd> shared_;
 #else
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
   void Flush() override { fsync(handle_); }
+#endif
 
  private:
-  int handle_ = -1;
+#if defined(__SWITCH__)
+  ssize_t PRead(void* to, size_t n, off_t at) {
+    if (!shared_) return pread(handle_, to, n, at);
+    std::lock_guard<std::mutex> lock(shared_->mutex);
+    return pread(shared_->fd, to, n, at);
+  }
+  ssize_t PWrite(const void* from, size_t n, off_t at) {
+    if (!shared_) return pwrite(handle_, from, n, at);
+    std::lock_guard<std::mutex> lock(shared_->mutex);
+    return pwrite(shared_->fd, from, n, at);
+  }
+  SharedHostFile* shared_ = nullptr;
 #endif
+  int handle_ = -1;
 };
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
@@ -405,6 +536,33 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path
   const bool want_read = (desired_access & kReadRights) != 0;
   const bool want_write = (desired_access & kWriteRights) != 0;
 
+#if defined(__SWITCH__)
+  static const bool shared_handles = REXCVAR_GET(filesystem_shared_handles);  // port 203
+  const std::string key = path.string();
+  const bool game_file = !want_write && UnderReadOnlyRoot(key);
+  if (shared_handles && !game_file) {
+    std::lock_guard<std::mutex> registry(g_shared_files_mutex);
+    auto found = g_shared_files.find(key);
+    if (found != g_shared_files.end()) {
+      if (want_write && !MakeSharedFileWritable(*found->second)) return nullptr;
+    } else {
+      // A writer always reads as well: a later reader on the same path shares this descriptor.
+      const int fd = open(key.c_str(), want_write ? O_RDWR : O_RDONLY);
+      if (fd == -1) {
+        if (errno != ENOENT) REXFS_ERROR("Could not open '{}' (write {}): errno {}", key, want_write, errno);
+        return nullptr;
+      }
+      auto shared = std::make_unique<SharedHostFile>();
+      shared->key = key;
+      shared->fd = fd;
+      shared->writable = want_write;
+      found = g_shared_files.emplace(key, std::move(shared)).first;
+    }
+    ++found->second->references;
+    return std::make_unique<PosixFileHandle>(path, found->second.get());
+  }
+#endif
+
   int open_access = O_RDONLY;
   if (want_read && want_write) {
     open_access = O_RDWR;
@@ -415,65 +573,21 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path
   // No O_APPEND for kFileAppendData: writes go through pwrite with an explicit
   // offset, which O_APPEND would override.
   int handle = open(path.c_str(), open_access);
-#if defined(__SWITCH__)
-  const std::string key = path.string();
-  if (handle != -1) {
-    auto shared = MakeSharedHostFd(handle, open_access);
-    {
-      std::lock_guard lock(g_shared_fds_mutex);
-      if (g_shared_fds.size() > 512) {  // the closed files' entries
-        for (auto it = g_shared_fds.begin(); it != g_shared_fds.end();)
-          it = it->second.expired() ? g_shared_fds.erase(it) : std::next(it);
-      }
-      g_shared_fds[key] = shared;
-    }
-    return std::make_unique<PosixFileHandle>(path, std::move(shared));
-  }
-  // fable2-nx (2026-11-24): refused while another handle of this file is open (SharedHostFd above): that handle's
-  // descriptor, read-write if this open asks for a right it lacks.
-  std::shared_ptr<SharedHostFd> shared;
-  {
-    std::lock_guard lock(g_shared_fds_mutex);
-    const auto it = g_shared_fds.find(key);
-    if (it != g_shared_fds.end())
-      shared = it->second.lock();
-  }
-  if (!shared)
-    return nullptr;
-  {
-    std::lock_guard lock(shared->m);
-    const bool has_read = shared->mode != O_WRONLY, has_write = shared->mode != O_RDONLY;
-    if ((want_read && !has_read) || (want_write && !has_write)) {
-      const int old_mode = shared->mode;
-      close(shared->fd);
-      const int fd = open(path.c_str(), O_RDWR);
-      if (fd == -1) {
-        shared->fd = open(path.c_str(), old_mode);
-        REXFS_WARN("[io] '{}': open refused while another handle holds it, and no read-write descriptor either",
-                   path.string());
-        return nullptr;
-      }
-      shared->fd = fd;
-      shared->mode = O_RDWR;
-    }
-  }
-  static std::atomic<uint32_t> logged{0};
-  if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
-    REXFS_INFO("[io] '{}' opened again while open (Horizon refuses a second open with a writer): the open handle's "
-               "descriptor is shared, read-write", path.string());
-  return std::make_unique<PosixFileHandle>(path, std::move(shared));
-#else
   if (handle == -1) {
     // TODO(benvanik): pick correct response.
     return nullptr;
   }
   return std::make_unique<PosixFileHandle>(path, handle);
-#endif
 }
 
 bool GetInfo(const std::filesystem::path& path, FileInfo* out_info) {
   struct stat st;
-  if (stat(path.c_str(), &st) == 0) {
+#if defined(__SWITCH__)
+  const bool have_info = StatSharedFile(path, &st) || stat(path.c_str(), &st) == 0;  // port 203
+#else
+  const bool have_info = stat(path.c_str(), &st) == 0;
+#endif
+  if (have_info) {
     if (S_ISDIR(st.st_mode)) {
       out_info->type = FileInfo::Type::kDirectory;
       out_info->total_size = 0;

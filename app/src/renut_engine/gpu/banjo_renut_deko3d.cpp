@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
@@ -25,6 +26,38 @@
 
 // sasrt-nx (2026-11-08, the GPU round after the move to the ultimate base): defined on every platform so the tomls read
 // the same; only the deko3d back end counts.
+// Port 165 (from fnxf_xiii, its notes of 2026-10-25 and 10-29): plume_deko3d.h Deko3DOptions::swapInterval.
+REXCVAR_DEFINE_INT32(banjo_deko3d_swap_interval, 1, "Banjo/Enhancements",
+                     "deko3d: the display refreshes each image is held for with vsync on, 1-4 (fnxf_xiii's frame "
+                     "interval: 2 shows a 30 fps game evenly at 60 Hz, paced by the display itself). 1: as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Port 161 (from fnxf_xiii, its note of 2026-11-05): see DiagLogWriter.
+REXCVAR_DEFINE_BOOL(banjo_deko3d_log_writer, true, "Banjo/Enhancements",
+                    "deko3d.log's progress lines (memory blocks, compile threads, swapchain) written and flushed by a "
+                    "thread of their own instead of the thread that said them (failures still at once). false: every "
+                    "line written and flushed where it is said, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Port 161 (from fnxf_xiii, its note of 2026-10-30): plume_deko3d.h beforeBufferCopy. Off by default since port 250
+// (2026-11-21, blur-nx's console bisect: with it on, Blur's races drew rainbow colour fringes, its release NRO too;
+// docs/off-by-default.md section 1).
+// banjo-nx (2026-11-20, the rebase's console runs: 20,000 stages on the generic variant): plume's logMisses.
+// renut-nx (2026-11-22, the user: the slow boot): the DKSH cache's start took 101-105 s on the console with 195,826
+// variants (one small read a record on the SD card). NAME.idx beside it lists the records (LoadCache).
+REXCVAR_DEFINE_BOOL(banjo_deko3d_cache_index, true, "Banjo/Enhancements",
+                    "The DKSH cache's index file (deko3d_shaders.bin.idx): the start reads the records' keys, offsets "
+                    "and sizes from it in one read and walks only the records added since (false: the whole cache is "
+                    "walked at every start, in 4 MB pieces)");
+REXCVAR_DEFINE_BOOL(banjo_deko3d_log_misses, false, "Banjo/Diagnostics",
+                    "deko3d renderer: every shader variant a draw got the generic one for (neither loaded nor in "
+                    "deko3d_shaders.bin) is logged once to deko3d.log as a \"run-time variant\" line, for "
+                    "tools/deko3d_variant_cache.py --runtime-log: the variants a cache made from the pipeline lists lacks")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_deko3d_copy_run_barriers, false, "Banjo/Enhancements",
+                    "deko3d: no barrier between back-to-back buffer copies once a full one has run (the copy engine "
+                    "was taken to run them one at a time; each full barrier is 2 GPU submission entries). Off by "
+                    "default: with it on, Blur's console races drew rainbow colour fringes (port 250). "
+                    "false: a barrier before every copy, as before port 161")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(sasrt_deko3d_diag_trace, false, "SASRT/Diagnostics",
                     "deko3d renderer, a measurement (the second GPU round of 2026-11-08): every 600th frame's command "
                     "stream logged as tokens ([deko3d trace] lines: barriers with their causes, draws, dispatches, target "
@@ -311,6 +344,131 @@ struct DkshCache {
 };
 DkshCache g_cache;
 
+// renut-nx (2026-11-22, the user: the slow boot): the cache's start was 101-105 s on the console at every start since
+// at least c40 (195,826 variants). The walk sought to each record and read its 16-byte head: a seek drops stdio's
+// buffer, so each record was a small read at a new place on the SD card. Now (1) NAME.idx beside the cache lists its
+// records' keys, offsets and sizes (16 bytes each, ~3 MB), read in one go; it holds the cache's length when written
+// and the first and last records' heads, checked against the cache; records appended after it (a run's compiles) are
+// walked from its end, and a cache it does not match is walked whole. (2) The walk reads the cache in 4 MB pieces and
+// finds the heads inside them. The index is written again (NAME.idx.new, then renamed) when the walk found records.
+// Credit: the cache format and the walk are banjo-nx's (2026-10-18, its record cut of 2026-10-20).
+struct CacheIndexHead {
+  char magic[4];     // "BDKI"
+  uint32_t version;  // 1
+  char tag[16];      // kCacheTag
+  uint64_t length;   // the cache's end of whole records when the index was written
+  uint64_t count;    // records listed
+  uint64_t first_key, last_key;
+  uint64_t first_at, last_at;  // the first and the last listed record's DKSH offsets
+  uint32_t first_size, last_size;
+};
+struct CacheIndexRecord {
+  uint64_t key;
+  uint64_t at_size;  // the DKSH's offset (low 40 bits) and its size (high 24 bits)
+};
+static_assert(sizeof(CacheIndexRecord) == 16, "16-byte index records");
+constexpr uint64_t kIndexAtMask = 0xFFFFFFFFFFull;
+
+// One record head (key, size, the DKSH magic) at `at`: false when there is not one.
+bool ReadCacheHead(FILE *f, long at, long length, uint64_t &key, uint32_t &size) {
+  uint32_t magic = 0;
+  return at >= 0 && at + 16 <= length && std::fseek(f, at, SEEK_SET) == 0 && std::fread(&key, 8, 1, f) == 1 &&
+         std::fread(&size, 4, 1, f) == 1 && std::fread(&magic, 4, 1, f) == 1 && size >= 64 && size <= (16u << 20) &&
+         at + 12 + long(size) <= length && magic == kDkshMagic;
+}
+
+// The index, when it matches the cache: c.index filled, the end of its records returned; else -1 (nothing kept).
+long ReadCacheIndex(DkshCache &c, long length) {
+  FILE *f = std::fopen((c.path + ".idx").c_str(), "rb");
+  if (!f)
+    return -1;
+  CacheIndexHead h{};
+  bool ok = std::fread(&h, sizeof(h), 1, f) == 1 && std::memcmp(h.magic, "BDKI", 4) == 0 && h.version == 1 &&
+            std::memcmp(h.tag, kCacheTag, sizeof(kCacheTag)) == 0 && long(h.length) <= length && h.count > 0 &&
+            h.count < (16u << 20);
+  std::vector<CacheIndexRecord> records;
+  if (ok) {
+    records.resize(size_t(h.count));
+    ok = std::fread(records.data(), sizeof(CacheIndexRecord), records.size(), f) == records.size();
+  }
+  std::fclose(f);
+  uint64_t key = 0;
+  uint32_t size = 0;
+  if (!ok || !ReadCacheHead(c.file, long(h.first_at) - 12, length, key, size) || key != h.first_key ||
+      size != h.first_size || !ReadCacheHead(c.file, long(h.last_at) - 12, length, key, size) || key != h.last_key ||
+      size != h.last_size || long(h.last_at) + long(size) != long(h.length))
+    return -1;
+  c.index.reserve(records.size() + 4096);
+  for (const CacheIndexRecord &r : records)
+    c.index[r.key] = {long(r.at_size & kIndexAtMask), uint32_t(r.at_size >> 40)};
+  return long(h.length);
+}
+
+// The cache's records from `at` on, read in 4 MB pieces: the end of the last whole record.
+long WalkCacheRecords(DkshCache &c, long at, long length) {
+  constexpr size_t kPiece = 4u << 20;
+  std::vector<uint8_t> buf(kPiece);
+  long buf_at = -1;  // the file offset of buf[0]
+  size_t buf_len = 0;
+  while (at + 16 <= length) {
+    if (buf_at < 0 || at < buf_at || at + 16 > buf_at + long(buf_len)) {
+      if (std::fseek(c.file, at, SEEK_SET) != 0)
+        break;
+      buf_at = at;
+      buf_len = std::fread(buf.data(), 1, std::min<size_t>(kPiece, size_t(length - at)), c.file);
+      if (buf_len < 16)
+        break;
+    }
+    const uint8_t *p = buf.data() + (at - buf_at);
+    uint64_t key;
+    uint32_t size, magic;
+    std::memcpy(&key, p, 8);
+    std::memcpy(&size, p + 8, 4);
+    std::memcpy(&magic, p + 12, 4);
+    if (size < 64 || size > (16u << 20) || at + 12 + long(size) > length || magic != kDkshMagic)
+      break;
+    c.index[key] = {at + 12, size};
+    at += 12 + long(size);
+  }
+  return at;
+}
+
+void WriteCacheIndex(const DkshCache &c) {
+  if (c.index.empty())
+    return;
+  std::vector<CacheIndexRecord> records;
+  records.reserve(c.index.size());
+  for (const auto &[key, v] : c.index)
+    records.push_back({key, uint64_t(v.first) | (uint64_t(v.second) << 40)});
+  std::sort(records.begin(), records.end(), [](const CacheIndexRecord &a, const CacheIndexRecord &b) {
+    return (a.at_size & kIndexAtMask) < (b.at_size & kIndexAtMask);
+  });
+  CacheIndexHead h{};
+  std::memcpy(h.magic, "BDKI", 4);
+  h.version = 1;
+  std::memcpy(h.tag, kCacheTag, sizeof(kCacheTag));
+  h.length = uint64_t(c.end);
+  h.count = records.size();
+  h.first_key = records.front().key;
+  h.first_at = records.front().at_size & kIndexAtMask;
+  h.first_size = uint32_t(records.front().at_size >> 40);
+  h.last_key = records.back().key;
+  h.last_at = records.back().at_size & kIndexAtMask;
+  h.last_size = uint32_t(records.back().at_size >> 40);
+  const std::string path = c.path + ".idx", tmp = path + ".new";
+  FILE *f = std::fopen(tmp.c_str(), "wb");
+  if (!f)
+    return;
+  const bool ok = std::fwrite(&h, sizeof(h), 1, f) == 1 &&
+                  std::fwrite(records.data(), sizeof(CacheIndexRecord), records.size(), f) == records.size();
+  if (std::fclose(f) == 0 && ok) {
+    std::remove(path.c_str());
+    if (std::rename(tmp.c_str(), path.c_str()) == 0)
+      return;
+  }
+  std::remove(tmp.c_str());
+}
+
 void LoadCache() {
   DkshCache &c = g_cache;
   // banjo-nx (2026-10-18): the code uam makes with other flags (banjo_deko3d_uam_prmt, banjo_deko3d_uam_gvn off) has a
@@ -336,19 +494,15 @@ void LoadCache() {
       // the process did not finish). The file is cut there and new records follow the good ones. Before, appends
       // went after such a record, where the next start's walk never found them: Ryujinx runs 20-22 compiled the same
       // ~30 shaders on every start.
-      long at = sizeof(head);
-      for (;;) {
-        uint64_t key;
-        uint32_t size, magic;
-        if (at + 16 > length || std::fseek(c.file, at, SEEK_SET) != 0 || std::fread(&key, sizeof(key), 1, c.file) != 1 ||
-            std::fread(&size, sizeof(size), 1, c.file) != 1 || std::fread(&magic, sizeof(magic), 1, c.file) != 1)
-          break;
-        if (size < 64 || size > (16u << 20) || at + 12 + long(size) > length || magic != kDkshMagic)
-          break;
-        c.index[key] = {at + 12, size};
-        at += 12 + long(size);
-      }
+      // renut-nx (2026-11-22): the index's records, then the walk from where they end (WalkCacheRecords: 4 MB pieces).
+      const auto t0 = std::chrono::steady_clock::now();
+      const bool use_index = REXCVAR_GET(banjo_deko3d_cache_index);
+      const long indexed = use_index ? ReadCacheIndex(c, length) : -1;
+      const size_t from_index = c.index.size();
+      long at = indexed > 0 ? indexed : long(sizeof(head));
+      at = WalkCacheRecords(c, at, length);
       c.end = at;
+      const bool walked = at != (indexed > 0 ? indexed : long(sizeof(head)));
       if (at != length) {
         REXLOG_WARN("[deko3d] DKSH cache {}: {} bytes after the last whole record ({} of them) dropped", c.path,
                     length - at, c.index.size());
@@ -356,6 +510,12 @@ void LoadCache() {
         if (ftruncate(fileno(c.file), at) != 0)
           REXLOG_WARN("[deko3d] DKSH cache {}: could not be cut; new records overwrite the rest", c.path);
       }
+      if (use_index && (walked || indexed < 0))
+        WriteCacheIndex(c);
+      REXLOG_INFO("[deko3d] DKSH cache {}: read in {} ms ({} records from its index{}, {} walked{})", c.path,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(),
+                  from_index, use_index ? (indexed < 0 ? ": none or not this cache's" : "") : ": off",
+                  c.index.size() - from_index, use_index && (walked || indexed < 0) ? "; the index written" : "");
     }
   }
   if (fresh) {
@@ -404,62 +564,165 @@ bool InstalledShaderTable(std::vector<ShaderCacheEntry> &entries, std::vector<Sh
 
 #if defined(PLUME_DEKO3D)
 
-std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *device, uint64_t hash) {
-  // The installer's package first (made from the player's files), then the NRO's own.
+// banjo-nx (2026-11-01): a shader's GLSL from the package that has it, the installer's first (empty: in neither, or it did
+// not unpack). in_memory: that package is in memory (unpacking it again later reads no card).
+static std::string UnpackGlsl(uint64_t hash, uint32_t &stage, bool &in_memory) {
   InstalledPackage &f = OpenInstalled();
   Package &p = Open();
   const PackageEntry *installed = Find(f, hash);
   const PackageEntry *e = installed ? installed : Find(p, hash);
-  if (!e || !device) {
+  in_memory = false;
+  if (!e) {
     static int logged = 0;
     if ((f.ok || p.ok) && logged++ < 16)
       REXLOG_ERROR("[deko3d] shader {:016X} is in no GLSL package", hash);
-    return nullptr;
+    return {};
   }
-  std::vector<uint8_t> blob(sizeof(plume::Deko3DShaderBlob) + e->size);
-  plume::Deko3DShaderBlob header;
-  header.stage = e->stage;
-  header.glslSize = e->size;
-  header.dkshSize = 0;
-  std::memcpy(blob.data(), &header, sizeof(header));
+  stage = e->stage;
+  std::string text(e->size, '\0');
   if (installed && f.ddict) {
     // banjo-nx (2026-10-23): from memory (a package with a dictionary).
     std::lock_guard<std::mutex> lock(f.mutex);
-    const size_t n = ZSTD_decompress_usingDDict(f.dctx, blob.data() + sizeof(header), e->size, f.data.data() + e->offset,
+    const size_t n = ZSTD_decompress_usingDDict(f.dctx, text.data(), e->size, f.data.data() + e->offset,
                                                 e->compressedSize, f.ddict);
     if (ZSTD_isError(n) || n != e->size) {
       REXLOG_ERROR("[deko3d] shader {:016X}: the installed GLSL did not unpack ({})", hash,
                    ZSTD_isError(n) ? ZSTD_getErrorName(n) : "short");
-      return nullptr;
+      return {};
     }
+    in_memory = true;
   } else if (installed) {
     std::lock_guard<std::mutex> lock(f.mutex);
     std::vector<uint8_t> frame(e->compressedSize);
     const bool read = std::fseek(f.file, long(f.data_offset + e->offset), SEEK_SET) == 0 &&
                       std::fread(frame.data(), 1, frame.size(), f.file) == frame.size();
-    const size_t n = read ? ZSTD_decompressDCtx(f.dctx, blob.data() + sizeof(header), e->size, frame.data(), frame.size())
-                          : 0;
+    const size_t n = read ? ZSTD_decompressDCtx(f.dctx, text.data(), e->size, frame.data(), frame.size()) : 0;
     if (!read || ZSTD_isError(n) || n != e->size) {
       REXLOG_ERROR("[deko3d] shader {:016X}: the installed GLSL did not read ({})", hash,
                    !read ? "card" : ZSTD_isError(n) ? ZSTD_getErrorName(n) : "short");
-      return nullptr;
+      return {};
     }
   } else {
     std::lock_guard<std::mutex> lock(p.mutex);
-    const size_t n = p.dict ? ZSTD_decompress_usingDDict(p.dctx, blob.data() + sizeof(header), e->size,
-                                                         p.data + e->offset, e->compressedSize, p.dict)
-                            : ZSTD_decompressDCtx(p.dctx, blob.data() + sizeof(header), e->size, p.data + e->offset,
-                                                  e->compressedSize);
+    const size_t n = p.dict ? ZSTD_decompress_usingDDict(p.dctx, text.data(), e->size, p.data + e->offset,
+                                                         e->compressedSize, p.dict)
+                            : ZSTD_decompressDCtx(p.dctx, text.data(), e->size, p.data + e->offset, e->compressedSize);
     if (ZSTD_isError(n) || n != e->size) {
       REXLOG_ERROR("[deko3d] shader {:016X}: the GLSL did not unpack ({})", hash,
                    ZSTD_isError(n) ? ZSTD_getErrorName(n) : "short");
-      return nullptr;
+      return {};
+    }
+    in_memory = true;
+  }
+  return text;
+}
+
+std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *device, uint64_t hash) {
+  // The installer's package first (made from the player's files), then the NRO's own.
+  if (!device)
+    return nullptr;
+  uint32_t stage = 0;
+  bool in_memory = false;
+  const std::string glsl = UnpackGlsl(hash, stage, in_memory);
+  if (glsl.empty())
+    return nullptr;
+  std::vector<uint8_t> blob(sizeof(plume::Deko3DShaderBlob) + glsl.size());
+  plume::Deko3DShaderBlob header;
+  header.stage = stage;
+  header.glslSize = uint32_t(glsl.size());
+  header.dkshSize = 0;
+  std::memcpy(blob.data(), &header, sizeof(header));
+  std::memcpy(blob.data() + sizeof(header), glsl.data(), glsl.size());
+  auto shader = device->createShader(blob.data(), blob.size(), "main", plume::RenderShaderFormat::DEKO3D);
+  if (shader) {
+    shader->setName(fmt::format("{}_{:016X}", stage == 4 ? "ps" : "vs", hash));
+    // banjo-nx (2026-11-01, the console's out-of-memory crash): the text is not kept with the shader; plume unpacks it
+    // again when a new variant needs it (plume::Deko3DGlslSource). A package read from the card keeps it, as before.
+    if (in_memory) {
+      plume::Deko3DShaderSetGlslLoader(shader.get(), [hash] {
+        uint32_t st = 0;
+        bool mem = false;
+        return UnpackGlsl(hash, st, mem);
+      });
     }
   }
-  auto shader = device->createShader(blob.data(), blob.size(), "main", plume::RenderShaderFormat::DEKO3D);
-  if (shader)
-    shader->setName(fmt::format("{}_{:016X}", e->stage == 4 ? "ps" : "vs", hash));
   return shader;
+}
+
+// Port 161 (from fnxf_xiii, its note of 2026-11-05; banjo_deko3d_log_writer): deko3d.log's writer. The back end's
+// progress lines (its memory blocks, the compile threads, the swapchain, the first presents) are queued and written and
+// flushed by a thread of their own: each line was a write and a flush of the card on the thread that said it, the
+// render thread's for the "memory block" lines of an area's new buffers (fnxf_xiii: 16 ms of such writes in one
+// frame). Any other line (a failure, a guard, a fence that does not signal) is written and flushed at once on its own
+// thread, after the queued ones, so a crash right after it still has it in the file.
+class DiagLogWriter {
+ public:
+  static DiagLogWriter &Instance() {
+    static DiagLogWriter w;
+    return w;
+  }
+  void Open(FILE *file) { file_ = file; }
+  void Queue(const char *line) {
+    bool start = false;
+    {
+      std::lock_guard lock(queue_mutex_);
+      queue_.emplace_back(line);
+      start = !started_;
+      started_ = true;
+    }
+    if (start)
+      banjo::renut_gpu::StartLongLivedThread([] { Instance().Loop(); }, 32 * 1024);
+    cv_.notify_one();
+  }
+  void WriteNow(const char *line) {
+    std::vector<std::string> lines;
+    {
+      std::lock_guard lock(queue_mutex_);
+      lines.swap(queue_);
+    }
+    std::lock_guard lock(file_mutex_);
+    if (!file_)
+      return;
+    for (const std::string &l : lines)
+      std::fprintf(file_, "%s\n", l.c_str());
+    std::fprintf(file_, "%s\n", line);
+    std::fflush(file_);
+  }
+
+ private:
+  void Loop() {
+    for (;;) {
+      std::vector<std::string> lines;
+      {
+        std::unique_lock lock(queue_mutex_);
+        cv_.wait(lock, [this] { return !queue_.empty(); });
+        lines.swap(queue_);
+      }
+      std::lock_guard lock(file_mutex_);
+      if (!file_)
+        continue;
+      for (const std::string &l : lines)
+        std::fprintf(file_, "%s\n", l.c_str());
+      std::fflush(file_);
+    }
+  }
+  std::mutex queue_mutex_, file_mutex_;
+  std::condition_variable cv_;
+  std::vector<std::string> queue_;
+  bool started_ = false;
+  FILE *file_ = nullptr;
+};
+
+bool Deko3DProgressLine(const char *message) {
+  static constexpr const char *kProgress[] = {
+      "device: creating", "image heap:", "buffer arena:", "device ready:", "memory block:", "blocks:", "uam thread:",
+      "uam: compile", "uam: run-time variant", "uam background thread:", "uam queue:", "shader code: block",
+      "trace ", "self-test", "swapchain:", "present ", "nvservices: a GPU submission",
+  };
+  for (const char *prefix : kProgress)
+    if (std::strncmp(message, prefix, std::strlen(prefix)) == 0)
+      return true;
+  return false;
 }
 
 void InstallShaderCache() {
@@ -470,8 +733,17 @@ void InstallShaderCache() {
                           ? nullptr
                           : std::fopen(NextToExecutable("deko3d.log").string().c_str(), "w");
   static std::mutex diag_mutex;
+  static const bool writer = REXCVAR_GET(banjo_deko3d_log_writer);  // port 161
+  DiagLogWriter::Instance().Open(diag);
   plume::SetDeko3DLogCallback([](const char *message) {
     REXLOG_INFO("[deko3d] {}", message);
+    if (writer) {  // port 161: see DiagLogWriter
+      if (Deko3DProgressLine(message))
+        DiagLogWriter::Instance().Queue(message);
+      else
+        DiagLogWriter::Instance().WriteNow(message);
+      return;
+    }
     std::lock_guard<std::mutex> lock(diag_mutex);
     if (diag) {
       std::fprintf(diag, "%s\n", message);
@@ -487,11 +759,15 @@ void InstallShaderCache() {
   options.stripRestart = Deko3DStripRestartOn();
   options.vsOutputs = Deko3DVsOutputsOn();
   options.uamFlags = Deko3DUamFlags();
+  options.logMisses = REXCVAR_GET(banjo_deko3d_log_misses);  // banjo-nx (2026-11-20)
   options.mergeBarriers = Deko3DBarrierMergeOn();  // banjo-nx (2026-10-19, GPU)
   options.leanBarriers = Deko3DBarrierLeanOn();
+  options.copyRunBarriers = REXCVAR_GET(banjo_deko3d_copy_run_barriers);  // port 161 (from fnxf_xiii)
+  options.swapInterval = uint32_t(std::clamp<int32_t>(REXCVAR_GET(banjo_deko3d_swap_interval), 1, 4));  // port 165
   options.asyncVariants = Deko3DAsyncVariantsOn();  // banjo-nx (2026-10-21)
   // The uam thread on the background compile core, below the game's threads (2026-10-18).
   options.compileCore = Deko3DCompileCore();
+  options.placeCompileThread = Deko3DCompileThreadPlacer();  // sasrt-nx (2026-11-22): sasrt_compile_threads_core -1
   options.compilePriority = Deko3DCompilePriority();
   options.backgroundCompileShare = Deko3DBackgroundCompileShare();  // 2026-10-23
   options.compileWaitBoost = Deko3DCompileWaitBoostOn();  // 2026-10-23

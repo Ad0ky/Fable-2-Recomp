@@ -1,5 +1,6 @@
 // sasrt-nx (2026-11-08): the GPU round after the move to the ultimate base (sasrt_gpu_round.h, docs/gpu-round-1108.md).
 #include "renut_engine/gpu/sasrt_gpu_round.h"
+#include "banjo_switch_default.h"  // banjo-nx (port 251): BANJO_SWITCH_DEFAULT
 
 #include <fmt/format.h>
 #include <rex/cvar.h>
@@ -112,6 +113,9 @@ REXCVAR_DEFINE_BOOL(sasrt_gpu_readback_compute, true, "SASRT/GPU",
                     "pixels")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// renut-ultimate (2026-11-16, port 145): kept OFF although tw2de_nx runs it on (its console: prologue 23.7-23.8 ->
+// 24.9-25.2 fps, GPU 40.4 -> 35.8-36.8 ms a frame): vivapinata-nx measured it slower (19.0 -> 17.7 fps) and sasrt-nx no
+// better (docs/off-by-default.md, section 3a). Game by game.
 REXCVAR_DEFINE_BOOL(sasrt_gpu_tiled_cache, false, "SASRT/GPU",
                     "deko3d renderer (GPU round of 2026-11-08, item 12, A/B 102; OFF by default until a console run says "
                     "the picture is the same: Ryujinx does not emulate it): Maxwell's tiled caching (binning: the GPU "
@@ -267,8 +271,11 @@ REXCVAR_DEFINE_BOOL(sasrt_gpu_export_raster_discard, true, "SASRT/GPU",
 
 // sasrt-nx (2026-11-08): the third GPU round (docs/gpu-round-1108.md "Round 3"; the user: "Try to aim for 20 more pixel
 // identical gpu optimisations"). A/B 120 and up.
-REXCVAR_DEFINE_BOOL(sasrt_gpu_seed_cpu_direct, true, "SASRT/GPU",
-                    "deko3d renderer (third GPU round, item 30, A/B 120; with sasrt_gpu_fetch_copy_compute): a memexport "
+// Port 263 (2026-11-23, the user: "please make this false sasrt_gpu_seed_cpu_direct also banjo was getting vertex
+// explosions from it"): OFF by default; a game's own toml may turn it on.
+REXCVAR_DEFINE_BOOL(sasrt_gpu_seed_cpu_direct, false, "SASRT/GPU",
+                    "deko3d renderer (third GPU round, item 30, A/B 120; with sasrt_gpu_fetch_copy_compute; OFF by default "
+                    "since port 263: banjo-nx saw vertex explosions with it on): a memexport "
                     "draw's fresh windows get their seed (guest memory's bytes there) written by the CPU straight into the "
                     "slot's export buffer as the draw is recorded, not copied into the upload ring and then by a compute "
                     "dispatch: no dispatch, and no wait between it and the export draw. The buffer is the GPU's and the "
@@ -287,12 +294,17 @@ REXCVAR_DEFINE_BOOL(sasrt_gpu_convert_tail_no_texture_drop, true, "SASRT/GPU",
                     "frames ago, and every queue flush since dropped the texture and L2 caches (deko3d's postSubmitFlush). "
                     "The wait itself (all 3D work done, the stream in L2) stays. Same bytes read: same pixels")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// banjo-nx (2026-11-21) turns it off for N&B in its own settings: two in-run A/Bs of 122 in Showdown Town (console
+// c28, c34) had it on worse (render thread +0.6 % and +0.8 % a frame, fps -1.1 % and -0.8 %, GPU +0.3 %): the per-draw
+// mask costs more CPU than the attribute fetches it saves on the GPU there. The base keeps it on (port 251; its rule
+// for one port's finding: docs/off-by-default.md section 7).
 REXCVAR_DEFINE_BOOL(sasrt_gpu_vs_input_mask, true, "SASRT/GPU",
                     "deko3d renderer (third GPU round, item 32, A/B 122): a pipeline's vertex attributes that the bound "
                     "vertex shader variant never reads (its shader program header's input map, read from the DKSH at load: "
                     "the outputs a pixel shader does not read, constant 905, take their inputs out with them) are bound as "
                     "constants, which the vertex attribute fetch does not read from memory. The shader reads the same "
-                    "attributes as before: same pixels")
+                    "attributes as before: same pixels. banjo-nx turns it off for N&B (two A/Bs: on cost the render "
+                    "thread more than it saved the GPU there)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(sasrt_gpu_export_no_pixel_shader, true, "SASRT/GPU",
                     "deko3d renderer (third GPU round, item 33, A/B 123; with sasrt_gpu_export_raster_discard): an "
@@ -436,6 +448,12 @@ REXCVAR_DEFINE_BOOL(fable2_gpu_crumbs, false, "Fable2",
 REXCVAR_DEFINE_INT32(fable2_image_pool_mb, 64, "Fable2",
                      "Retired GPU images kept (up to this many MB) and reused by new textures of the same layout, "
                      "instead of new memory and a new GPU mapping each time; 0 = off");
+// blur-nx (2026-11-18, for 1 % lows, every port): plume_deko3d.h, Deko3DSetImageSpareChunk.
+REXCVAR_DEFINE_BOOL(blur_renut_image_spare_chunk, true, "SASRT/GPU",
+                    "The image heap keeps one empty 32 MB chunk ready, made ahead on a thread of its own (the uam "
+                    "thread's core and priority): a texture that finds no room in the chunks takes it, instead of "
+                    "making a chunk where it is (20-38 ms on Blur's console, 4-5 times a race, the heap's lock held)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // sasrt-nx (2026-11-09; port 58): plume_deko3d.h, Deko3DSetDedicatedTargets.
 // sasrt-nx (2026-11-11, port 79; the stutter hunt, run slow2: 55 of the race's 60 frames over 60 ms followed a dynamic-resolution
 // step, each step ~33 dedicated blocks made in one frame and the old ones destroyed two frames later). plume_deko3d.h,
@@ -496,7 +514,9 @@ REXCVAR_DEFINE_BOOL(sasrt_gpu_export_no_point_gs, true, "SASRT/GPU",
                     "cost ~120 ns a point whatever their vertex shader did. The vertex shader runs once a point either way: "
                     "the same exports, and no pixel either way. Its vertex variant then gets constant 905 (no outputs)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(sasrt_gpu_handover_with_smaa, false, "SASRT/GPU",
+// banjo-nx (2026-11-22, console run c44, N&B with SMAA on): A/B 135 gave GPU -1.1 % a draw (9 of 9 pairs lower),
+// the render thread and fps flat, the town's picture right in 22 captures: on by default on the Switch.
+REXCVAR_DEFINE_BOOL(sasrt_gpu_handover_with_smaa, BANJO_SWITCH_DEFAULT(true, false), "SASRT/GPU",
                     "deko3d renderer (fourth GPU round, item 45, A/B 135): banjo's colour hand-over "
                     "(banjo_deko3d_color_handover: a whole resolve into a texture of its size and format left in the "
                     "target's image, not copied) was off whenever SMAA was on, so every resolve was drawn since the SMAA "
@@ -556,9 +576,104 @@ REXCVAR_DEFINE_BOOL(sasrt_rt_cached_export_seeds, true, "SASRT/RenderThread",
                     "every line a seed touches is wholly its own: the GPU sees the same bytes. The CPU never reads the "
                     "buffer (readbacks go through a GPU copy). For games with memory exports")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// sasrt-nx's render-thread rounds 2-4 (2026-11-20; docs/render-thread-ideas-1120.md and
+// docs/handoff/rt_rounds_1120 there): their universal items, each pixel-identical with its own key, on by default.
+// Measured on Sonic Transformed's console (4 players standing still, after a PGO cycle): rounds 2-4 together -12 % of
+// the render thread a frame. Their A/B targets: sasrt_gpu_round.h AbTargetOf; 241-243 each round at once.
+REXCVAR_DEFINE_BOOL(sasrt_rt2_drop_throttle, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 56, A/B 190): "
+                    "DropReplacedRanges' pass while the stream cache is over its limit runs every 4th frame, not every "
+                    "frame (kameo-nx's rule for 3 fps; Sonic Transformed's 4-player race sat at 135.7 MB of 128 and "
+                    "walked both caches every frame, and a whole entry among the drops staled every mesh object). "
+                    "Memory only: what a draw reads does not change")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_pages_tail, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 57, A/B 191): PagesClean's "
+                    "last 1-7 pages of a range (most vertex ranges are that short) tested in one masked NEON block "
+                    "when none of their four views' cards is written, as the 8- and 16-page blocks do; else page by "
+                    "page as before (AArch64). The same answer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_ring_prefetch, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 58, A/B 192): The render "
+                    "thread prefetches the next ring item's narrowed device delta to six lines, not four (it averages "
+                    "~360 bytes in Sonic Transformed's 4-player race). Prefetches only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_readable_memo, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 59, A/B 193): The vertex "
+                    "fills' check that their guest bytes are committed (dishonored_renut_vertex_readable_check: each a "
+                    "heap's recursive mutex, which the game's allocations hold too, and a page-table walk) keeps the "
+                    "ranges it found readable, 64 of them, while no page anywhere has lost read access since "
+                    "(rex::memory::g_page_access_generation, raised when a decommit, release, protect, reset, restore "
+                    "or commit without read access starts and when it returns)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_texture_memo_two_way, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 60, A/B 194): "
+                    "FillTextures' texture slot memo (4,096 entries by texture address and fetch words) as 2,048 sets "
+                    "of two ways: a texture's entry kept while another hashes to its set, the way bound in an earlier "
+                    "frame replaced (Sonic Transformed's four-player race missed ~1,950 binds a second to another "
+                    "entry, each a whole BindTextureLocked). Every hit checks the entry's words as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_repeat_ring, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 61, A/B 195): "
+                    "WholeGeometryTry's repeat answer (blur_renut_whole_repeat: a draw whose streams, index buffer, "
+                    "shader and layout are an earlier draw's of the same kick takes its copies without the probes) "
+                    "kept for the last four such answers, not the last one: draws that take turns between a few "
+                    "meshes. Each answer is checked as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_held_export_bitmap, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 62, A/B 196): "
+                    "GetStreamSource looks in the kept exports' map (sasrt_renut_exports_held; about 257 a frame in "
+                    "Sonic Transformed's 4-player race, a std::map walk per stream) only when a 64 KB granule bitmap "
+                    "of the kept exports' ranges says one may lie at the stream's address. For games with memory "
+                    "exports")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_color_alias_memo, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 63, A/B 197): "
+                    "ColorAliasesLocked (two scans of every target per colour resolve, about 118 a frame in Sonic "
+                    "Transformed's 4-player race) answers from a per-surface list kept until a target is made or "
+                    "retired (the target table's epoch, g_sasrt_table_epoch)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt3_surface_memo_256, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's third render-thread round, 2026-11-20; item 64, A/B 198): "
+                    "GetHostSurfaceLocked's memo (a surface's target by its address, header words and the surface "
+                    "epoch) has 256 entries, not 64: Sonic Transformed's four views' targets, resolves, EDRAM views "
+                    "and stack headers conflicted in 64")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt3_depth_bias_fields, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's third render-thread round, 2026-11-20; item 65, A/B 199): A fast draw "
+                    "does not call SetDrawDepthBias when the bias set is still bound and none of the packets it reads "
+                    "(the view packets' mode control, the point packet's bias words, the destination packet's depth "
+                    "info) changed since the draw before in the chain (banjo-nx keeps it in N&B, its A/B 302)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt4_push_runs_merged, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's fourth render-thread round, 2026-11-20; item 66, A/B 201): "
+                    "PushFloatConstants pushes two runs of constant groups that one or two groups separate as one run, "
+                    "the groups between them with the device's current values (they become valid); never across a "
+                    "group with a literal register of this shader or of the buffer: one dkCmdBufPushConstants call "
+                    "instead of two")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt4_state_id_crc, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's fourth render-thread round, 2026-11-20; item 67, A/B 202): "
+                    "RenderStateIdLocked (the render-state number by content) finds its table slot by a CRC32C of the "
+                    "20 render-state words and the targets' words (the A57's crc32cx, 8 bytes an instruction) instead "
+                    "of 27 dependent multiplies; a hit compares the words as before. AArch64 with the CRC extension "
+                    "(the Switch) only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt4_export_reads_fast, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's fourth render-thread round, 2026-11-20; item 68, A/B 203): A draw whose "
+                    "only reads of pending memexport results are vertex streams the host layout reads from windows "
+                    "FindExportedStream finds on the GPU stays on the fast path: ConvertExportedStreamsLocked converts "
+                    "them there (as DrawStateLocked does) and BindStreams binds the converted streams; whole-buffer "
+                    "geometry and fetch, index and texture reads of exports take the full path as before (Sonic "
+                    "Transformed's 4-player race: 93 'export read' draws a frame to the full path; banjo-nx's N&B city "
+                    "~6,300 a 10 s, with banjo-nx's two fixes). For games with memory exports")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 #if defined(PLUME_DEKO3D)
 #include <plume_deko3d.h>
+
+#include "renut_engine/gpu/banjo_renut_record.h"  // banjo-nx (2026-11-21): StageActive
+#include "renut_engine/gpu/banjo_renut_tuning.h"  // sasrt-nx 1.0.1: RegionCpuReserveBytes
 #endif
 
 namespace sasrt::gpu_round {
@@ -576,10 +691,50 @@ void LatchNow() {
 #undef SASRT_GPU_ROUND_LATCH
   g_latched = l;
   g_latched_ready.store(true, std::memory_order_release);
+  RefreshEffective();
 }
+
+// banjo-nx (2026-11-20): On()'s answers (see the header): the latched key, and not this item's A/B "off" half.
+uint8_t g_effective[kCount] = {};  // constant-initialised to 0: not latched
+void RefreshEffective() {
+  const int ab = banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed);
+  for (int i = 0; i < kCount; ++i) {
+    // sasrt-nx (2026-11-22, the base port of the render-thread rounds 2-4): each item's own target (AbTargetOf), and
+    // 241-243 for each round's items at once. kAbRtGroup (port 54's round) stays that round's two items alone.
+    const bool on = g_latched.on[i] && ab != AbTargetOf(i) &&
+                    !(ab == kAbRtGroup && i >= kRtRestoreCandidates && i < kRt2First) &&
+                    !(ab == kAbRt2Group && i >= kRt2First && i < kRt3First) &&
+                    !(ab == kAbRt3Group && i >= kRt3First && i < kRt4First) && !(ab == kAbRt4Group && i >= kRt4First);
+    g_effective[i] = on ? 2 : 1;
+  }
+}
+
+// banjo-nx (2026-11-21, the render thread to 33 ms; A/B 173): plume's Deko3DOptions::cachedCommands (see there).
+// Console, Showdown Town, in-run pairs (median, render thread a draw with it on): c36 +0.11 % (21 pairs), c39 +0.90 %
+// (16); GPU -1.0 % and -0.9 % a draw (34 of 37 pairs lower). The ranges' clean at each list's end is the render
+// thread's, and the render thread sets the frame rate in the town: off by default (a GPU-bound scene may want it).
+REXCVAR_DEFINE_BOOL(banjo_deko3d_cached_commands, false, "Banjo/Enhancements",
+                    "deko3d renderer (2026-11-21, A/B 173): command memory CPU-cached, each list's written ranges cleaned "
+                    "to memory at its end (uncached before: every command word a store to the bus). The same commands. "
+                    "Console c36/c39: GPU -1 % a draw, render thread +0.1/+0.9 % a draw (off: the town is render-bound)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// banjo-nx (2026-11-21, console run c43): with the core-3 command stage the list's end, and so the clean, is the
+// stage's: A/B 173 then gave render thread -1.2 % a draw (10 of 10 pairs lower), GPU -1.4 %, all threads' CPU -1.8 %.
+REXCVAR_DEFINE_BOOL(banjo_deko3d_cached_commands_with_stage, true, "Banjo/Enhancements",
+                    "deko3d renderer: command memory CPU-cached (banjo_deko3d_cached_commands) whenever the core-3 "
+                    "command stage plays the lists (banjo_deko3d_command_stage), its clean then off the render thread")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 void ApplyPlume() {
 #if defined(PLUME_DEKO3D)
+  {
+    static const bool cached = REXCVAR_GET(banjo_deko3d_cached_commands);
+    static const bool with_stage = REXCVAR_GET(banjo_deko3d_cached_commands_with_stage);
+    plume::g_deko3dOptions.cachedCommands =
+        (cached || (with_stage && banjo::renut_gpu::record::StageActive())) &&
+        banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed) != 173;  // banjo-nx (2026-11-21)
+  }
+  plume::g_deko3dCounts = banjo::renut_gpu::Latch().counts;  // banjo-nx (2026-11-20): plume's stats bumps
   plume::g_deko3dOptions.preciseDepthResolve = On(kPreciseDepth);
   plume::g_deko3dOptions.decompressMerge = On(kDecompressMerge);
   plume::g_deko3dOptions.readbackMerge = On(kReadbackMerge);
@@ -601,7 +756,10 @@ void ApplyPlume() {
   plume::Deko3DSetGpuCrumbs(REXCVAR_GET(fable2_gpu_crumbs));  // fable2-nx (2026-11-19)
   plume::Deko3DSetTargetBlockCacheMb(uint32_t(REXCVAR_GET(sasrt_target_block_cache_mb)));  // sasrt-nx (2026-11-11)
   plume::Deko3DSetRegionBestFit(REXCVAR_GET(sasrt_region_best_fit));      // sasrt-nx (2026-11-09 night; port 58)
+  // sasrt-nx 1.0.1 (2026-11-24, sasrt_region_cpu_reserve_mb; banjo_renut_tuning.cpp): the room the region leaves newlib
+  plume::Deko3DSetRegionCpuReserve(banjo::renut_gpu::RegionCpuReserveBytes());
   plume::Deko3DSetImageBestFit(REXCVAR_GET(sasrt_image_best_fit));        // sasrt-nx (2026-11-09 night; port 58)
+  plume::Deko3DSetImageSpareChunk(REXCVAR_GET(blur_renut_image_spare_chunk));  // blur-nx (2026-11-18, 1 % lows)
 #endif
 }
 
@@ -613,8 +771,17 @@ const char *AbName(int target) {
   };
   if (target == kAbRtGroup)  // sasrt-nx (2026-11-09; port 54)
     return "the render-thread round's items, all at once (sasrt_rt_*, A/B 200)";
-  const int i = target - kAbBase;
-  return i >= 0 && i < kCount ? kNames[i] : nullptr;
+  // sasrt-nx (2026-11-22): the render-thread rounds 2-4, each round at once.
+  if (target == kAbRt2Group)
+    return "the second render-thread round's items, all at once (sasrt_rt2_*, A/B 241)";
+  if (target == kAbRt3Group)
+    return "the third render-thread round's items, all at once (sasrt_rt3_*, A/B 242)";
+  if (target == kAbRt4Group)
+    return "the fourth render-thread round's items, all at once (sasrt_rt4_*, A/B 243)";
+  for (int i = 0; i < kCount; ++i)
+    if (AbTargetOf(i) == target)
+      return kNames[i];
+  return nullptr;
 }
 
 std::string Report() {

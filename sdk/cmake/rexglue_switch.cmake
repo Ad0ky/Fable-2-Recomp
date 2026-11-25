@@ -37,7 +37,13 @@ if(NOT REXGLUE_SWITCH_NVK AND NOT TARGET rex::nvk)
     target_link_directories(rexglue_switch_nvk INTERFACE
         "${DEVKITPRO}/portlibs/switch/lib"
         "${DEVKITPRO}/libnx/lib")
-    target_link_libraries(rexglue_switch_nvk INTERFACE zstd z nx stdc++ m)
+    # renut-ultimate (2026-11-20, port 194; TFU-nx's of 2026-11-12, via S4ep1-nx): libzstd only when the switch-zstd
+    # portlib is installed. Without NVK nothing here needs it (Renut decompresses with its own copy, renut_zstd), and
+    # -lzstd with no library stops the link.
+    if(EXISTS "${DEVKITPRO}/portlibs/switch/lib/libzstd.a")
+        target_link_libraries(rexglue_switch_nvk INTERFACE zstd)
+    endif()
+    target_link_libraries(rexglue_switch_nvk INTERFACE z nx stdc++ m)
     target_link_options(rexglue_switch_nvk INTERFACE -pthread)
 endif()
 if(NOT TARGET rex::nvk)
@@ -95,7 +101,12 @@ if(NOT TARGET rexglue_switch_startup)
         "LINKER:--wrap=nvGpuChannelGetErrorNotification"
         "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx"
         "LINKER:--wrap=armDCacheClean,--wrap=nwindowQueueBuffer,--wrap=bqDequeueBuffer"
-        "LINKER:--wrap=svcSleepThread,--wrap=svcSetThreadCoreMask")
+        # renut-ultimate (2026-11-16, port 145): async present (switch_perf.cpp, banjo_async_present).
+        "LINKER:--wrap=nwindowDequeueBuffer"
+        "LINKER:--wrap=svcSleepThread,--wrap=svcSetThreadCoreMask"
+        # blur-nx (2026-11-23, the boot crash): deko3d's aborts write rex_crash.log and leave a record on the stack
+        # (switch_perf.cpp, __wrap_diagAbortWithResult).
+        "LINKER:--wrap=diagAbortWithResult")
 endif()
 
 function(rexglue_switch_configure_target target_name)
