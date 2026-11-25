@@ -21,7 +21,8 @@
 
 #include <cstring>
 
-#include <rex/system/xmemory.h>  // fable2-nx (2026-11-14): MarkStoreCards
+#include <rex/system/xmemory.h>  // fable2-nx (2026-11-14): MarkStoreCards; (2026-11-24) MarkStoreCardsAt with the guest base
+// (the generated code's base): g_store_cards is the runtime's data, which the PC app (the runtime a DLL) cannot link to.
 
 extern "C" void __imp__MemCpy_SdkRuntime_82CA2C60(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__MemCpy_Aligned_82CA30E8(PPCContext& ctx, uint8_t* base);
@@ -59,7 +60,7 @@ inline bool NativeCopy(PPCContext& ctx, uint8_t* base) {
   // fable2-nx (2026-11-14, the logo blinking): a host writer of guest memory marks its pages' store cards, as the
   // generated stores do (banjo_renut_store_cards): unmarked, Renut kept its old copy of what this wrote. The Bink frames
   // the game copies into its two video textures were "proven" unchanged and the older frame was drawn again.
-  rex::memory::MarkStoreCards(d, n);
+  rex::memory::MarkStoreCardsAt(base, d, n);
   return true;  // r3 stays = dst, as in both guest routines
 }
 
@@ -84,7 +85,7 @@ extern "C" void MemMove_SdkRuntime_82CAA2E0(PPCContext& __restrict ctx, uint8_t*
     return;
   }
   std::memmove(REX_RAW_ADDR(d), REX_RAW_ADDR(s), n);
-  rex::memory::MarkStoreCards(d, n);  // fable2-nx (2026-11-14): see NativeCopy
+  rex::memory::MarkStoreCardsAt(base, d, n);  // fable2-nx (2026-11-14): see NativeCopy
   ctx.r3.u64 = d;
 }
 
@@ -97,5 +98,5 @@ extern "C" void MemSet_SdkRuntime_82CA3190(PPCContext& __restrict ctx, uint8_t* 
     return;
   }
   std::memset(REX_RAW_ADDR(d), byte, n);
-  rex::memory::MarkStoreCards(d, n);  // fable2-nx (2026-11-14): see NativeCopy
+  rex::memory::MarkStoreCardsAt(base, d, n);  // fable2-nx (2026-11-14): see NativeCopy
 }

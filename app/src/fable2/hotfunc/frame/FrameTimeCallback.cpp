@@ -28,6 +28,10 @@
 #include <cstdint>
 
 #include <rex/cvar.h>
+
+#if defined(BANJO_RENUT_RENDERER)
+#include "renut_engine/gpu/banjo_renut_select.h"  // fable2-nx (2026-11-24): Active(), for the emulated GPU
+#endif
 #include <rex/logging.h>
 
 REXCVAR_DEFINE_BOOL(fable2_frame_time_callback, true, "Fable2",
@@ -77,6 +81,12 @@ extern "C" void ProcessAndProcessAndProcess952_821F5F20(PPCContext& __restrict c
   __imp__ProcessAndProcessAndProcess952_821F5F20(ctx, base);
   if (!callback)
     return;
+#if defined(BANJO_RENUT_RENDERER)
+  // fable2-nx (2026-11-24, the PC's emulated GPU): with reNut off (banjo_renderer = emulated) the emulated GPU runs the
+  // callbacks the ring holds; running them here too ran each twice.
+  if (!::banjo::renut_gpu::Active())
+    return;
+#endif
   static const bool frame_time = REXCVAR_GET(fable2_frame_time_callback);
   static const bool all = REXCVAR_GET(fable2_ring_callbacks_all);
   const bool run = all || (frame_time && callback == kFrameTimeCallback);

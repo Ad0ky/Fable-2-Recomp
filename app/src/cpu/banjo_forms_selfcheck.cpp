@@ -41,6 +41,7 @@
 #include <rex/ppc/vec_batch2.h>  // blur-nx (2026-11-11): the dot-product merges (VecBatch2 below)
 #include "hot/blur_swap.h"  // blur-nx (2026-11-12): word swaps for lane-wise natives (VecBatch3 below)
 #include <rex/ppc/fma_single.h>  // blur-nx (2026-11-12): fmadds rounded once (FmaSingle below)
+#include <rex/ppc/float_be.h>  // blur-nx (2026-11-13, M-23): singles stored and loaded in the vector unit
 
 namespace {
 
@@ -101,6 +102,15 @@ void Conversions(Tally& t) {
     int64_t fctid, fctiw, fctidz;
   };
   const double nan = std::numeric_limits<double>::quiet_NaN();
+  // banjo-nx (2026-11-19, the rebase; a handoff): with blur-nx's near-exact #2 (REX_NX_FCTI_NO_NAN, N&B's cleared set,
+  // docs/banjo-near-exact.md) a NaN converts to 0 by design (AArch64's fcvtzs, no NaN test): that is the expected
+  // result then, so the check still proves the form instead of reporting the switch at every start (and writing
+  // banjo_selfcheck_failed.txt next to the program).
+#if defined(REX_NX_FCTI_NO_NAN)
+  constexpr bool kNanToZero = true;
+#else
+  constexpr bool kNanToZero = false;
+#endif
   const Case cases[] = {
       {0.5, 0, 0, 0},
       {1.5, 2, 2, 1},
@@ -116,7 +126,7 @@ void Conversions(Tally& t) {
       {-1e10, -10000000000ll, INT32_MIN, -10000000000ll},
       {9223372036854775808.0, INT64_MAX, INT32_MAX, INT64_MAX},
       {-1e19, INT64_MIN, INT32_MIN, INT64_MIN},
-      {nan, INT64_MIN, int64_t(0x80000000u), INT64_MIN},
+      {nan, kNanToZero ? 0 : INT64_MIN, kNanToZero ? 0 : int64_t(0x80000000u), kNanToZero ? 0 : INT64_MIN},
   };
   for (const Case& c : cases) {
     const double v = Opaque(c.v);
@@ -127,7 +137,7 @@ void Conversions(Tally& t) {
     // fctiwz (the first round's): truncation with the same saturation and NaN image.
     int64_t z;
     if (std::isnan(c.v)) {
-      z = int64_t(0x80000000u);
+      z = kNanToZero ? 0 : int64_t(0x80000000u);
     } else if (c.v >= 2147483647.0) {
       z = INT32_MAX;
     } else if (c.v <= -2147483648.0) {
@@ -138,6 +148,22 @@ void Conversions(Tally& t) {
     t.Expect("fctiwz", in, uint64_t(rex::ppc::fctiwz(v)), uint64_t(z));
   }
 }
+
+// blur-nx (2026-11-18): the reference follows the build's near-exact switches (BLUR_NEAR_EXACT; docs/cpu-near-exact-
+// 50-1113.md), which change two of these forms by design: #17 REX_NX_DIV_NO_CHECK (the AArch64 divisions give sdiv's
+// INT_MIN for INT_MIN / -1, where the old form gave 0) and #1 REX_NX_SNAN_PASS (QuietSingleBits keeps a signalling
+// NaN's bits, as the Xenon's lfs / stfs pair does). Before, every start of the release reported those four results as
+// failures (banjo_selfcheck_failed.txt on the card) though each is the form the build chose.
+#if defined(REX_NX_DIV_NO_CHECK) && defined(__aarch64__)
+constexpr bool kDivOverflowGivesMin = true;
+#else
+constexpr bool kDivOverflowGivesMin = false;
+#endif
+#if defined(REX_NX_SNAN_PASS)
+constexpr bool kSnanKept = true;
+#else
+constexpr bool kSnanKept = false;
+#endif
 
 void Divisions(Tally& t) {
   struct Signed {
@@ -150,7 +176,9 @@ void Divisions(Tally& t) {
     const std::string in = fmt::format("{}, {}", p.n, p.d);
     {
       const int32_t n = int32_t(p.n), d = int32_t(p.d);
-      const uint32_t want = (d == 0 || (n == INT32_MIN && d == -1)) ? 0u : uint32_t(int64_t(n) / int64_t(d));
+      const uint32_t want = d == 0 ? 0u
+                            : (n == INT32_MIN && d == -1) ? (kDivOverflowGivesMin ? uint32_t(INT32_MIN) : 0u)
+                                                          : uint32_t(int64_t(n) / int64_t(d));
       t.Expect("divw", in, rex::ppc::divw(Opaque(n), Opaque(d)), want);
       const uint32_t un = uint32_t(n), ud = uint32_t(d);
       t.Expect("divwu", in, rex::ppc::divwu(Opaque(un), Opaque(ud)), ud == 0 ? 0u : un / ud);
@@ -159,6 +187,7 @@ void Divisions(Tally& t) {
       const int64_t n = p.n, d = p.d;
       int64_t want = 0;
       if (d != 0 && !(n == INT64_MIN && d == -1)) want = n / d;
+      if (n == INT64_MIN && d == -1 && kDivOverflowGivesMin) want = INT64_MIN;
       t.Expect("divd", in, uint64_t(rex::ppc::divd(Opaque(n), Opaque(d))), uint64_t(want));
       const uint64_t un = uint64_t(n), ud = uint64_t(d);
       t.Expect("divdu", in, rex::ppc::divdu(Opaque(un), Opaque(ud)), ud == 0 ? 0u : un / ud);
@@ -184,7 +213,34 @@ void FloatCopies(Tally& t) {
     const std::string in = fmt::format("{:08X}", c.single);
     t.Expect("SingleToDoublePure", in, std::bit_cast<uint64_t>(rex::ppc::SingleToDoublePure(Opaque(c.single))),
              c.as_double);
-    t.Expect("QuietSingleBits", in, rex::ppc::QuietSingleBits(Opaque(c.single)), c.stored);
+    t.Expect("QuietSingleBits", in, rex::ppc::QuietSingleBits(Opaque(c.single)), kSnanKept ? c.single : c.stored);
+  }
+}
+
+// blur-nx (2026-11-13, M-23): the vector-unit single store and load (rex/ppc/float_be.h) against the integer forms:
+// the same four bytes, every class of value (zeros, normals, denormals, infinities, quiet and signalling NaNs).
+void FloatBigEndian(Tally& t) {
+  uint32_t bits[] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x00000001u, 0x807FFFFFu, 0x00800000u,
+                     0x7F7FFFFFu, 0x7F800000u, 0xFF800000u, 0x7FC00001u, 0x7F800001u, 0xFFA00000u, 0x12345678u,
+                     0xDEADBEEFu, 0x3EAAAAABu};
+  for (uint32_t b : bits) {
+    const std::string in = fmt::format("{:08X}", b);
+    uint8_t out[4];
+    rex::ppc::FloatToBigEndian(out, std::bit_cast<float>(Opaque(b)));
+    uint32_t got;
+    std::memcpy(&got, out, 4);
+    t.Expect("FloatToBigEndian", in, got, __builtin_bswap32(b));
+    const uint32_t be = __builtin_bswap32(Opaque(b));
+    t.Expect("FloatFromBigEndian", in, std::bit_cast<uint32_t>(rex::ppc::FloatFromBigEndian(&be)), b);
+  }
+  // blur-nx (2026-11-17, #231): the double load (the same eight bytes).
+  const uint64_t dbits[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x3FF0000000000000ull,
+                            0x0000000000000001ull, 0x7FF0000000000000ull, 0x7FF8000000000001ull,
+                            0x7FF0000000000001ull, 0xFFF4000000000000ull, 0x0123456789ABCDEFull};
+  for (uint64_t b : dbits) {
+    const std::string in = fmt::format("{:016X}", b);
+    const uint64_t be = __builtin_bswap64(Opaque(b));
+    t.Expect("DoubleFromBigEndian", in, std::bit_cast<uint64_t>(rex::ppc::DoubleFromBigEndian(&be)), b);
   }
 }
 
@@ -506,6 +562,10 @@ void FmaSingle(Tally& t) {
     const double got = rex::ppc::FmaddsSingle(da, db, dc);
     const std::string in = fmt::format("{:08X} {:08X} {:08X}", std::bit_cast<uint32_t>(a), std::bit_cast<uint32_t>(b),
                                        std::bit_cast<uint32_t>(c));
+    // blur-nx (2026-11-13, M-24): the known-single form (three single inputs) against the tested one, bit for bit
+    // (NaN payloads too: the same instruction on the same operands).
+    t.Expect("FmaddsSingleKnown", in, std::bit_cast<uint64_t>(rex::ppc::FmaddsSingleKnown(da, db, dc)),
+             std::bit_cast<uint64_t>(got));
     if constexpr (sizeof(long double) > 8) {
       const long double exact = (long double)a * (long double)b + (long double)c;
       const float want = float(exact);
@@ -639,6 +699,7 @@ void FormsSelfCheck() {
   Conversions(t);
   Divisions(t);
   FloatCopies(t);
+  FloatBigEndian(t);  // blur-nx (2026-11-13, M-23)
   VectorHelpers(t);
   VecLanes(t);
   VecBatch1(t);

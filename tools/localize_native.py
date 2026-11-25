@@ -63,6 +63,17 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import reg_liveness as reg_liveness_mod  # noqa: E402  (sasrt-nx 2026-11-12, stage 1; port 121: tools/reg_liveness.py)
 
+
+def gen_file(gen, suffix):
+    """renut-ultimate (2026-11-19, port 186; found by sasrt-nx's sync): the generator names its files after the project
+    (<project>_pch.h, <project>_init.cpp, <project>_recomp.N.cpp): renut_ in the base, a port's own name otherwise."""
+    for name in sorted(os.listdir(gen)):
+        m = re.fullmatch(r'(\w+)_recomp\.\d+\.cpp', name)
+        if m:
+            return os.path.join(gen, m.group(1) + '_' + suffix)
+    return os.path.join(gen, 'renut_' + suffix)
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'app')
 GEN = os.path.join(APP, 'generated')
@@ -174,7 +185,31 @@ def live_out_keep(name):
 BULK_SLOT = 9999  # past PPCContext::host_counters: the guard's countdown is the hook's own (banjo_hot_guest.h)
 HAND = os.path.join(APP, 'src', 'cpu', 'hot', 'hand.txt')
 IMAGE_BASE = 0x82000000
-INDEX_FORMAT = 9  # raise when summarise() changes: the cached index is rebuilt (5: carded vector stores; 6, 7: inline leaves; 8: r1 mirror, 2026-10-23; 9: atomics, sasrt-nx 2026-11-10)
+INDEX_FORMAT = 12  # raise when summarise() changes: the cached index is rebuilt (5: carded vector stores; 6, 7: inline leaves; 8: r1 mirror, 2026-10-23; 9: atomics, sasrt-nx 2026-11-10; 10: promoted fallbacks counted, blur-nx 2026-11-13; 12: rex::ppc::exact:: helpers and rex_spin_hint known, port 144)
+# blur-nx (2026-11-13, M-25 of docs/cpu-moonshots-50-1113.md and its audit): a promoted indirect call (tools/
+# indirect_calls.py: `if (REX_PROMOTED_IS(ctr, T)) { sub_T(ctx, base); } else { REX_CALL_INDIRECT_FUNC_AT(..); }`) no
+# longer keeps a function out of a closure: its fallback is an open call like any other (the copy's running form
+# hands over every register around it, the logged forms stop there), and its guarded direct call is a call of T,
+# which comes along when T's own tree qualifies. Before, every function with such a site counted as making an indirect
+# call, and the promoted targets were real calls from the copies: of the copies' 623 M promoted calls in the PC
+# census, the targets of 514 M (82.5 %) have trees closed but for promoted fallbacks. A member's reach stays everything
+# when it has a fallback (Reach.own): the hand-over around the call is the same; the call, the target's entry and
+# return and the context round trip go when it is inlined.
+# 2026-11-13, cycle 2's PC guard runs: OFF unless BLUR_LOCALIZE_PROMOTED_MEMBERS=1. With it on, guarded boots hung
+# before boot.pak in 6 of 8 runs (all 203 copies it changed switched off at run time: 2 of 2 booted; a bisect was misled
+# by the hang being random), and the light guard found copies of promoted targets writing back r12 where the original
+# leaves it (sub_82507988, sub_825087A0; harmless by the calling convention, but the guard turns them off). Not
+# verifiable as it stands: parked.
+PROMOTED_MEMBERS = os.environ.get('BLUR_LOCALIZE_PROMOTED_MEMBERS', '0') == '1'
+# blur-nx (2026-11-17, #232): the non-volatile registers of the Xbox 360's PowerPC ABI (r14-r31, f14-f31, the VMX
+# v14-v31 and VMX128 v64-v127, CR fields 2-4): a real call returns them as it found them (call_text).
+# renut-ultimate (2026-11-17, port 149): OFF in the base, as every near-exact switch is (port 140): a callee that breaks
+# the ABI (hand-written assembly) is the one case it changes. BLUR_LOCALIZE_ABI_TRUST=1 in the environment turns it on.
+ABI_TRUST = os.environ.get('BLUR_LOCALIZE_ABI_TRUST', '0') == '1'
+NONVOLATILE = frozenset(['r%d' % i for i in range(14, 32)] + ['f%d' % i for i in range(14, 32)] +
+                        ['v%d' % i for i in list(range(14, 32)) + list(range(64, 128))] + ['cr2', 'cr3', 'cr4'])
+ABI_SKIPPED = [0, 0]  # (real calls with a reload left out, reloads left out)
+PROMOTED_SITE = re.compile(r'^\tif \(REX_PROMOTED_IS\(')
 
 REG = re.compile(r'\bctx\.(r\d+|f\d+|v\d+|cr\d|ctr|xer|reserved)\b')
 DEF = re.compile(r'^DEFINE_REX_FUNC\((\w+)\) \{$')
@@ -188,14 +223,17 @@ GOTO = re.compile(r'\bgoto loc_[0-9A-F]{8};')
 # Every name the generator writes in front of a parenthesis (tools/loop_locals.py's list): anything else is a
 # port's own host function (a mid-asm hook), which a copy cannot contain.
 NAME = re.compile(r'([A-Za-z_][A-Za-z0-9_:]*(?:<[A-Za-z0-9_ ]+>)?)\s*\(')
-KNOWN = re.compile(r'^(?:REX_\w+|simde_\w+|__builtin_\w+|rex::ppc::\w+|std::fma|std::bit_cast<\w+>|double|float|sqrt|'
+KNOWN = re.compile(r'^(?:REX_\w+|simde_\w+|__builtin_\w+|rex::ppc::\w+|rex::ppc::exact::\w+|std::fma|std::bit_cast<\w+>|double|float|sqrt|'
                    r'memset|if|for|switch|sizeof|u?int(?:8|16|32|64)_t|u(?:8|16|32|64)|size_t|int|short|char|'
                    r'static_cast<[A-Za-z0-9_ ]+>|compare(?:<\w+>)?|setFromMask|(?:en|dis)ableFlushMode(?:Unconditional)?|'
-                   r'flushModeIs(?:On|Off)|ppc_trap|simde__m128i?)$')
+                   r'flushModeIs(?:On|Off)|ppc_trap|simde__m128i?|'
+                   # renut-ultimate (port 144): the spin-wait hints' yield (spin_hint_yield; no guest state)
+                   r'rex_spin_hint)$')
 # Forms that make a function unfit for a copy and for a closure (see the docstring).
 SPECIAL = re.compile(r'\b(REX_GUEST_CAS|reserved|REX_MM_(?:STORE|LOAD)_\w+|ppc_setjmp|ppc_longjmp|REX_ENTER_GLOBAL_LOCK|'
                      r'REX_LEAVE_GLOBAL_LOCK|REX_CHECK_GLOBAL_LOCK|REX_QUERY_TIMEBASE|REX_UNIMPLEMENTED|'
-                     r'std::atomic_thread_fence|storeFromGuest|loadFromHost|log2f)\b')
+                     r'std::atomic_thread_fence|REX_GUEST_SYNC|REX_GUEST_LWSYNC|REX_GUEST_EIEIO|storeFromGuest|'
+                     r'loadFromHost|log2f)\b')
 # Guest memory through a raw host address. Loads (the vector loads) and the two store forms the tool logs.
 # banjo-nx (2026-10-23): the store-card form of a vector store too (package 34: REX_CARD(ea), then the store, one comma
 # expression); the guard's Note goes in front of the whole expression, so the card and the store run together.
@@ -212,12 +250,14 @@ RAW_LOAD = re.compile(r'^\tsimde_mm_store_si128\(\(simde__m128i\*\)\w+(?:\.\w+)+
 # logged run ends before the first one (the call is then not compared, as for a call outside the copy), and in the
 # running form Open() is a constant false. log2f is a pure function. SASRT_LOCALIZE_ATOMICS=0: refused, as before.
 ATOMICS = os.environ.get('SASRT_LOCALIZE_ATOMICS', '1') != '0'
-ATOMIC_SPECIAL = {'reserved', 'REX_GUEST_CAS', 'std::atomic_thread_fence', 'log2f'}
+# blur-nx (2026-11-16, tools/guest_fences.py): the guest fences as macros with the PowerPC orderings, the same rules.
+ATOMIC_SPECIAL = {'reserved', 'REX_GUEST_CAS', 'std::atomic_thread_fence', 'REX_GUEST_SYNC', 'REX_GUEST_LWSYNC',
+                  'REX_GUEST_EIEIO', 'log2f'}
 ATOMIC_HOST = {'std::atomic_thread_fence', 'log2f'}
 ATOMIC_LOAD = re.compile(r'^\t+reserved\.u(?:32|64) = \*\(uint(?:32|64)_t\*\)REX_RAW_ADDR\(ea\);$')
 ATOMIC_CAS = re.compile(r'^\t+[\w.]+\.eq = REX_GUEST_CAS(?:_C)?\((?:ea, )?reinterpret_cast<uint(?:32|64)_t\*>\(REX_RAW_ADDR\(ea\)\), '
                         r'reserved\.s(?:32|64), __builtin_bswap(?:32|64)\([\w.]+\.s(?:32|64)\)\);$')
-ATOMIC_FENCE = re.compile(r'^\t+std::atomic_thread_fence\(std::memory_order_\w+\);$')
+ATOMIC_FENCE = re.compile(r'^\t+(?:std::atomic_thread_fence\(std::memory_order_\w+\)|REX_GUEST_(?:SYNC|LWSYNC|EIEIO)\(\));$')
 
 
 # sasrt-nx (2026-11-11, port 74; its idea 39): store-card runs. Every guest store outside the stack marks its page's card
@@ -250,7 +290,36 @@ LOOP_LABEL = re.compile(r'^(loc_[0-9A-F]+):\s*$')
 CTR_DEC = re.compile(r'^\t--(?:ctx\.)?ctr\.u64;$')
 CTR_BACK = re.compile(r'^\tif \((?:ctx\.)?ctr\.u32 != 0\) goto (loc_[0-9A-F]+);$')
 CTR_WRITE = re.compile(r'\b(?:ctx\.)?ctr\.(?:u|s)(?:32|64) = ')
-LOOP_STATS = [0, 0]  # idea 52 prefetches, idea 60 barriers left out
+LOOP_STATS = [0, 0, 0]  # idea 52 prefetches, idea 60 barriers left out, M-19 rules applied
+# blur-nx (2026-11-13, M-19 of docs/cpu-moonshots-50-1113.md and its audit): hand-named prefetches. Each line of
+# app/src/cpu/hot/prefetch_rules.txt, `<function> <label> <statement>`, puts the statement right after that label in
+# the copy's running form (and its logged twin, the same text; not in the original statements' form), written in the
+# generated code's names (ctx.<register> becomes the copy's local, as everywhere). For the node loops whose callee first
+# touches the next node's object cold: its first lines, prefetched one iteration ahead (REX_PREFETCH_GUEST cannot fault;
+# a load the statement makes must be one the guest could make there, e.g. the next entry while one is left). A rule of a
+# function that is copied but no longer has the label stops the tool (the guest code under the rule changed).
+# SASRT_LOCALIZE_PREFETCH=0: none written.
+PREFETCH_RULES_FILE = os.path.join(APP, 'src', 'cpu', 'hot', 'prefetch_rules.txt')
+
+
+def load_prefetch_rules():
+    rules = {}
+    if not os.path.isfile(PREFETCH_RULES_FILE):
+        return rules
+    for number, raw in enumerate(open(PREFETCH_RULES_FILE, encoding='utf-8'), 1):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split(None, 2)
+        if len(parts) != 3 or not re.fullmatch(r'(?:sub_)?[0-9A-Fa-f]{8}', parts[0]) or \
+                not re.fullmatch(r'loc_[0-9A-F]{8}', parts[1]) or not parts[2].endswith(('}', ';')):
+            sys.exit(f'localize_native: prefetch_rules.txt:{number}: not `<function> <label> <statement>`: {line}')
+        name = parts[0] if parts[0].startswith('sub_') else 'sub_' + parts[0].upper()
+        rules.setdefault(name, {}).setdefault(parts[1], []).append(parts[2])
+    return rules
+
+
+PREFETCH_RULES = load_prefetch_rules() if PREFETCH else {}
 CONST_ARGS = os.environ.get('SASRT_LOCALIZE_CONST_ARGS', '1') != '0'  # port 74, its idea 34 (localize())
 CONST_ARG_FORCED = [0]
 
@@ -429,6 +498,7 @@ def summarise(name, lines):
     callees = []
     unknown = 0
     traps = 0
+    promoted = 0  # blur-nx (2026-11-13, M-25): of `unknown`, the fallbacks of promoted sites
     for l in lines:
         for m in CALL.finditer(l):
             if m.group(1) is None:
@@ -436,6 +506,8 @@ def summarise(name, lines):
                     traps += 1
                 else:
                     unknown += 1
+                    if PROMOTED_SITE.match(l):
+                        promoted += 1
             elif m.group(1) not in callees:
                 callees.append(m.group(1))
     if traps:
@@ -454,7 +526,7 @@ def summarise(name, lines):
                                          (ATOMICS and (ATOMIC_LOAD.match(l) or ATOMIC_CAS.match(l)))):
             special.append('raw guest access')
     return {'regs': regs, 'written': written_registers(regs, text), 'callees': callees, 'unknown': unknown,
-            'traps': traps, 'special': sorted(set(special)), 'lines': len(lines)}
+            'promoted': promoted, 'traps': traps, 'special': sorted(set(special)), 'lines': len(lines)}
 
 
 class Index:
@@ -552,17 +624,63 @@ def hand_entries(path=HAND):
             continue
         parts = line.split()
         name = parts[0] if not re.fullmatch(r'[0-9A-Fa-f]{8}', parts[0]) else 'sub_' + parts[0].upper()
-        entry = {'id': identifier(name), 'exact': set()}
+        entry = {'id': identifier(name), 'exact': set(), 'calls': []}
         for part in parts[1:]:
             key, _, value = part.partition('=')
             if key == 'exact':
                 entry['exact'] = set(value.split(','))
             elif key == 'id':
                 entry['id'] = value
+            elif key == 'inexact':
+                # blur-nx (2026-11-16): an inexact native (audio) declines while the guard runs, so the guard compares
+                # the exact copy: it adds nothing to the hook's skip set.
+                entry['inexact'] = True
+            elif key == 'calls':
+                # blur-nx (2026-11-16, the 15 ms batch): a native that calls guest functions (see calls_struct).
+                entry['calls'] = ['sub_' + c.upper() if re.fullmatch(r'[0-9A-Fa-f]{8}', c) else c
+                                  for c in value.split(',') if c]
             else:
                 sys.exit(f'localize_native: hand.txt: {part!r} in the line of {name}')
         out[name] = entry
     return out
+
+
+def native_call(entry):
+    """The call of a hand-written native: `::banjo::hand::n_<id>::Native` with, for one that calls guest functions
+    (hand.txt calls=), the header's struct of those calls as its first template argument."""
+    if entry.get('calls'):
+        return '::banjo::hand::n_%s::Native<Calls_%s>' % (entry['id'], entry['id'])
+    return '::banjo::hand::n_%s::Native' % entry['id']
+
+
+def calls_struct(entry, member_set, externs, hand):
+    """blur-nx (2026-11-16, the 15 ms batch): the guest calls of a hand-written native (hand.txt calls=), for one copy
+    header. A native that calls guest functions gets this struct as its template argument C and calls C::sub_X(ctx,
+    base, s) with the callee's arguments in ctx, as the guest code would; then `if (s.Stopped()) return true;`.
+      - A callee in this header's closure runs as its copy f_sub_X (any form: the guard's logged run follows it, its
+        stores recorded).
+      - Any other callee is a real call of the generated function (the in-place copy on the Switch); in the guard's
+        logged forms Open() stops the run there (the call is then not compared), as for the copies' own real calls.
+    The native hands over registers through ctx itself (it holds none of the guest's), and sets ctx.r1 to the frame its
+    original allocates, so the callees' frames land where they would."""
+    lines = ['struct Calls_%s {' % entry['id']]
+    for c in entry['calls']:
+        lines.append('  template <class S>')
+        if c in member_set and c in hand:
+            # A callee with a native of its own (the node loop's child mixers: itself): the native first, as at the
+            # copies' own call sites.
+            lines.append('  [[gnu::always_inline]] static inline void %s(PPCContext& __restrict ctx, uint8_t* base, '
+                         'S& s) { if (!%s(ctx, base, s)) f_%s(ctx, base, s); }' % (c, native_call(hand[c]), c))
+        elif c in member_set:
+            lines.append('  [[gnu::always_inline]] static inline void %s(PPCContext& __restrict ctx, uint8_t* base, '
+                         'S& s) { f_%s(ctx, base, s); }' % (c, c))
+        else:
+            externs.add(c)
+            # The generated function by its global name: inside the struct the bare name is the member itself.
+            lines.append('  [[gnu::always_inline]] static inline void %s(PPCContext& __restrict ctx, uint8_t* base, '
+                         'S& s) { if (s.Open()) return; ::%s(ctx, base); }' % (c, c))
+    lines.append('};')
+    return lines
 
 
 def skip_literal(regs):
@@ -590,14 +708,52 @@ def skip_literal(regs):
             % (gpr, fpr, vr[0], vr[1], cr, 'true' if ctr else 'false', 'true' if xer else 'false'))
 
 
+def strip_windows_only(text):
+    """blur-nx (2026-11-13, M-28 of docs/cpu-moonshots-50-1113.md): the text without its Windows-only branches (#if
+    defined(_WIN32) / #ifdef _WIN32 up to the matching #else, #elif or #endif; an #else branch is kept, the Switch
+    compiles it). Code the Switch never compiles hooks nothing there. In Blur only blur_write_watch.cpp/.h has such
+    branches naming guest addresses: a PC diagnostic that wraps sub_8216AE98, sub_8216CA28 and sub_8256D6D8 through the
+    indirect-call table (SetFunction) and calls their __imp__ originals, which a copy leaves as they are; it kept those
+    three out of the copies (0.1-0.2 ms a frame)."""
+    out, skip_depth, depth = [], None, 0
+    for line in text.split('\n'):
+        d = re.match(r'\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)', line)
+        if d:
+            kind, rest = d.group(1), d.group(2)
+            if kind in ('if', 'ifdef', 'ifndef'):
+                depth += 1
+                windows = (kind == 'ifdef' and rest.strip() == '_WIN32') or \
+                          (kind == 'if' and re.fullmatch(r'\s*defined\s*\(?\s*_WIN32\s*\)?\s*(//.*)?', rest))
+                if skip_depth is None and windows:
+                    skip_depth = depth
+                    continue
+            elif kind in ('else', 'elif') and skip_depth == depth:
+                skip_depth = None  # the other branch is compiled on the Switch
+                continue
+            elif kind == 'endif':
+                depth -= 1
+                if skip_depth is not None and depth < skip_depth:
+                    skip_depth = None
+                    continue
+        if skip_depth is None:
+            out.append(line)
+    return '\n'.join(out)
+
+
 class Hooks:
-    """What an app or SDK hook may replace: every 82xxxxxx address and every identifier their sources' code mentions
+    """What an app or SDK hook may replace: every 82xxxxxx (83xxxxxx: port 144) address and every identifier their sources' code mentions
     (comments and __imp__ references left out, as in sa2-nx's tool: a comment hooks nothing and __imp__sub_X is the
     original). The functions of localized.txt are not in it: a copy touches no more than its original."""
 
     def __init__(self, natives):
         self.addresses = set()
         self.words = set()
+        # renut-ultimate (2026-11-16, port 144; tw2de_nx's): 83xxxxxx too when the game's code runs there (its function
+        # table has entries at 0x83000000 and above: TW2's sub_833C2518 ...); a tree without them reads as before.
+        addr_re = r'(?<![0-9A-Fa-f])(82[0-9A-Fa-f]{6})(?![0-9A-Fa-f])'
+        for p in glob.glob(os.path.join(GEN, '*_init.cpp')):
+            if re.search(r'\{ 0x83[0-9A-Fa-f]{6},', open(p, encoding='utf-8', errors='ignore').read()):
+                addr_re = r'(?<![0-9A-Fa-f])(8[23][0-9A-Fa-f]{6})(?![0-9A-Fa-f])'
         roots = [os.path.join(APP, 'src'), os.path.join(ROOT, 'sdk', 'src'), os.path.join(ROOT, 'sdk', 'include')]
         # sasrt-nx (2026-11-11, port 74; its idea 29): not app/config/renut_gpu_funcs.toml any more. It is a game's map of
         # Direct3D's names (a reference: no code hooks through it; this base's Renut hooks Direct3D by address,
@@ -621,8 +777,10 @@ class Hooks:
             except OSError:
                 continue
             text = strip_comments(text, toml)
+            if not toml:
+                text = strip_windows_only(text)  # blur-nx (2026-11-13, M-28)
             text = re.sub(r'__imp__\w+', ' ', text)
-            self.addresses.update(m.upper() for m in re.findall(r'(?<![0-9A-Fa-f])(82[0-9A-Fa-f]{6})(?![0-9A-Fa-f])', text))
+            self.addresses.update(m.upper() for m in re.findall(addr_re, text))
             if not toml:
                 self.words.update(re.findall(r'\b[A-Za-z_]\w{5,}\b', text))
         self.natives = set(natives)
@@ -847,7 +1005,7 @@ def closed_tree(index, hooks, name, limit, memo):
             continue
         f = index.funcs.get(n)
         why = fits(index, hooks, n)
-        if why is None and f['unknown']:
+        if why is None and f['unknown'] - (f.get('promoted', 0) if PROMOTED_MEMBERS else 0):  # M-25
             why = 'it (or %s under it) makes an indirect call' % n if n != name else 'it makes an indirect call'
         if why is not None:
             if n != name and not why.startswith('it (or'):
@@ -928,7 +1086,7 @@ def addresses(gen):
     """name -> (guest address, bytes up to the next function) from the generated function table."""
     global _ADDRESSES
     if _ADDRESSES is None:
-        text = open(os.path.join(gen, 'renut_init.cpp'), encoding='utf-8').read()
+        text = open(gen_file(gen, 'init.cpp'), encoding='utf-8').read()
         table = [(int(a, 16), n) for a, n in re.findall(r'^\t\{ 0x([0-9A-F]{8}), (\w+) \},$', text, re.M)]
         table.sort()
         _ADDRESSES = {}
@@ -1092,6 +1250,28 @@ def localize(index, hooks, reach, root, what, opts, out_dir, quiet=False, hand=N
             return {'r3', 'r4'}, set(), False  # the trap helper reads two registers and writes none
         return ALL, ALL, False
 
+    sync_memo = {}
+
+    def call_syncs(name):
+        """blur-nx (2026-11-16, CG-11): can a call of this function (or anything under it) synchronise with another
+        thread? True when unsure (a cycle while it is being decided, a function outside the index)."""
+        b = base_name(name) or name
+        if b in sync_memo:
+            return sync_memo[b]
+        sync_memo[b] = True
+        f = index.funcs.get(b)
+        if f is None or f['unknown'] or hooks.replaced(b) or name.startswith('__imp__') or (hand and b in hand):
+            return True
+        if any(s.startswith('host function') or 'setjmp' in s or 'longjmp' in s for s in f['special']):
+            return True
+        for _, l in index.body(b):
+            if ATOMIC_LOAD.match(l) or ATOMIC_CAS.match(l) or ATOMIC_FENCE.match(l) or 'storeFromGuest' in l or \
+                    '__imp__' in l or 'REX_CALL_INDIRECT' in l or 'ppc_trap(' in l:
+                return True
+        result = any(call_syncs(c) for c in f['callees'])
+        sync_memo[b] = result
+        return result
+
     def call_text(m, me, my_regs, my_written, localized, site=None):
         """The replacement of one call statement. my_written: the registers that can be dirty here. site: the guest
         instruction index of the statement in its function (tools/reg_liveness.py's call sites), when known."""
@@ -1129,6 +1309,16 @@ def localize(index, hooks, reach, root, what, opts, out_dir, quiet=False, hand=N
                     CALL_SKIPPED[3] += len(out_regs) - len(kept)
                     out_regs = kept
         in_regs = my_regs if change is ALL else [r for r in my_regs if r in change]
+        # blur-nx (2026-11-17, #232 of docs/cpu-codegen-universal-30-1116.md, near-exact): after a real call, the
+        # PowerPC ABI's non-volatile registers are taken as the callee left them, i.e. as they were: not reloaded. Only
+        # a callee that breaks the ABI (hand-written assembly) tells; the guard then sees this copy's write-back of the
+        # register differ from the original's. BLUR_LOCALIZE_ABI_TRUST=0: every register the callee can change, as before.
+        if ABI_TRUST and not closed:
+            kept_in = [r for r in in_regs if r not in NONVOLATILE]
+            if len(kept_in) < len(in_regs):
+                ABI_SKIPPED[0] += 1
+                ABI_SKIPPED[1] += len(in_regs) - len(kept_in)
+                in_regs = kept_in
         before = ''.join(f'ctx.{r} = l_{r}; ' for r in out_regs)
         after = ''.join(f' l_{r} = ctx.{r};' for r in in_regs)
         stats['synced'].append((len(out_regs), len(in_regs)))
@@ -1141,9 +1331,14 @@ def localize(index, hooks, reach, root, what, opts, out_dir, quiet=False, hand=N
                 # registers their originals write back (hand.txt exact=: the hash and the comparison return r3), and
                 # a caller that read r3 after an inlined native that ran got its own stale r3 (sub_82737F80 and
                 # sub_8271F9C0 took the other branch; the first diet PC run crashed after them).
-                return ('{ ' + before + CARD_FLUSH + 'if (!::banjo::hand::n_%s::Native(ctx, base, s)) { f_%s(ctx, base, s); '
-                        'if (s.Stopped()) return; } else if (s.Stopped()) return;%s }' % (hand[b]['id'], b, after))
-            return '{ ' + before + CARD_FLUSH + 'f_%s(ctx, base, s); if (s.Stopped()) return;' % b + after + ' }'
+                return ('{ ' + before + CARD_FLUSH + 'if (!%s(ctx, base, s)) { f_%s(ctx, base, s); '
+                        'if (s.Stopped()) return; } else if (s.Stopped()) return;%s }' % (native_call(hand[b]), b, after))
+            # blur-nx (2026-11-16, the 15 ms batch, CG-11 of docs/codegen-ideas-3.md): the pending card run is flushed
+            # before a call only when the callee's tree can tell another thread about stores (a fence, an atomic, a
+            # kernel import, an indirect or unknown call, a hook). Otherwise this copy's next flush (at its own
+            # synchronisation or return) marks the page in time for Renut, which reads the cards only after one.
+            flush = CARD_FLUSH if call_syncs(b) else ''
+            return '{ ' + before + flush + 'f_%s(ctx, base, s); if (s.Stopped()) return;' % b + after + ' }'
         stats['calls_open'] += 1
         return '{ if (s.Open()) return; ' + before + CARD_FLUSH + m.group(0) + after + ' }'
 
@@ -1226,6 +1421,12 @@ def localize(index, hooks, reach, root, what, opts, out_dir, quiet=False, hand=N
             dead_out.update((name, r) for r in written if not keep_out(r))
         for m in PROMOTED.finditer(text):
             externs.add(m.group(1))
+        if name in PREFETCH_RULES:  # blur-nx (2026-11-13, M-19): the rule's labels must still be there
+            have = {l.strip()[:-1] for l in lines if LABEL.match(l)}
+            gone = sorted(set(PREFETCH_RULES[name]) - have)
+            if gone:
+                sys.exit(f'localize_native: {name}: prefetch_rules.txt names {", ".join(gone)}, which its code no '
+                         f'longer has (the guest code under the rule changed: check the rule)')
         dirty, writes, dirty_end = dirty_sets(name, lines, lambda l: [call_reach(m)[0] for m in CALL.finditer(l)])
         # sasrt-nx (2026-11-12, stage 1; port 121): the guest instruction index of each generated line (reg_liveness.py)
         raw = index.files.get(funcs[name]['file']) or []
@@ -1261,6 +1462,9 @@ def localize(index, hooks, reach, root, what, opts, out_dir, quiet=False, hand=N
                         pending = False
                         body.append((l, block))
                         body.append((f'\ts.Hit({block});', block))
+                        for stmt in PREFETCH_RULES.get(name, {}).get(l.strip()[:-1], ()):
+                            body.append(('\t' + REG.sub(lambda m: 'l_' + m.group(1), stmt), block))  # M-19
+                            LOOP_STATS[2] += 1
                         file_lines[number] = block
                         continue
                     if pending:
@@ -1348,7 +1552,8 @@ def localize(index, hooks, reach, root, what, opts, out_dir, quiet=False, hand=N
     hand_members = [m for m in members if m in hand]
     skip = set()
     for m in hand_members:
-        skip |= set(funcs[m]['written']) - hand[m]['exact']
+        if not hand[m].get('inexact'):
+            skip |= set(funcs[m]['written']) - hand[m]['exact']
     # sasrt-nx (2026-11-11, port 74; its idea 37): the registers the hook may leave different from the original: those
     # dead after the root returns (its LiveOut). A member's dropped write-back of a register live after the root is
     # rewritten before the root's exit (or LiveOut would have kept it): still compared (sasrt-nx's round A audit,
@@ -1357,8 +1562,12 @@ def localize(index, hooks, reach, root, what, opts, out_dir, quiet=False, hand=N
     if root_keep is not None:
         skip |= {r for m in members for r in funcs[m]['written'] if not root_keep(r)}
     LIVE_OUT_DROPPED[0] += sum(1 for m, _ in dead_out if m in members)
-    entry = (f'if (!::banjo::hand::n_{hand[root]["id"]}::Native(ctx, base, s)) f_{root}(ctx, base, s);'
+    entry = (f'if (!{native_call(hand[root])}(ctx, base, s)) f_{root}(ctx, base, s);'
              if root in hand else f'f_{root}(ctx, base, s);')
+    # blur-nx (2026-11-16): the guest calls of the natives that make any (hand.txt calls=), after the declarations.
+    for m in hand_members:
+        if hand[m].get('calls'):
+            declarations.extend([''] + calls_struct(hand[m], member_set, externs, hand))
     hand_note = ('' if not hand_members else
                  '\n// Hand-written natives in front of their copies (app/src/cpu/hot/banjo_hand_natives.h): '
                  + ', '.join(hand_members) + '.\n// Registers the guard does not compare for this hook (they leave '
@@ -1474,6 +1683,8 @@ def write_list(entries, out_dir, bulk=()):
                           f'edit): shard {k} of {SHARDS},', f'// {size // 1024} KB of copies, compiled by '
                           f'app/src/cpu/banjo_hot_shard_{k}.cpp.'] + lines) + '\n'
         path = os.path.join(out_dir, f'banjo_hot_bulk_{k}.inc')
+        # blur-nx (2026-11-10): a fresh tree has no generated/hot yet (the first build of a new port stopped here).
+        os.makedirs(out_dir, exist_ok=True)
         try:
             same = open(path, encoding='utf-8').read() == text
         except OSError:
@@ -1510,7 +1721,8 @@ def survey(index, hooks, reach, names):
         members, left_out = closure_of(index, hooks, name, 6000, 1200)
         opens = sorted(left_out.items())
         print(f'{name}: {f["lines"]} lines, {len(f["regs"])} ctx registers ({len(f["written"])} written), '
-              f'{len(f["callees"])} direct callees, {f["unknown"]} indirect calls or traps'
+              f'{len(f["callees"])} direct callees, {f["unknown"]} indirect calls or traps '
+              f'({f.get("promoted", 0)} of them promoted sites\' fallbacks)'
               f'{"; CANNOT be a copy: " + why if why else ""}'
               f'{"; replaced by an app hook already?" if hooks.replaced(name) else ""}')
         print(f'    closure: {len(members)} functions, {sum(index.funcs[m]["lines"] for m in members)} lines'
@@ -1559,8 +1771,10 @@ def main():
               f'hand-overs) (stage 1, tools/reg_liveness.py; data {"used" if reg_liveness()["sites"] else "NOT available"}); '
               f'{CALL_SKIPPED[3]} scratch vector stores left out of {CALL_SKIPPED[2]} indirect calls (stage 1d)')
         print(f'localize_native: {LOOP_STATS[0]} pointer-chase prefetches (idea 52), {LOOP_STATS[1]} counted loops\' '
-              f'barriers left out (idea 60)')
+              f'barriers left out (idea 60), {LOOP_STATS[2]} hand-named prefetches (M-19, prefetch_rules.txt)')
         print(f'localize_native: {CONST_ARG_FORCED[0]} members with a constant argument forced inline (idea 34)')
+        print(f'localize_native: {ABI_SKIPPED[1]} non-volatile register reloads left out after {ABI_SKIPPED[0]} real '
+              f'calls (#232, ABI trust{"" if ABI_TRUST else ": OFF"})')
         # Port 74 (its idea 39; sasrt-nx's batch 2 audit, finding 2): the shards turn the card runs on only for copies
         # written with them (app/src/cpu/banjo_hot_prelude.h reads this header).
         opt = os.path.join(a.out, 'banjo_hot_options.h')
