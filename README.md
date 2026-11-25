@@ -15,7 +15,7 @@
 
 ### [Download](https://github.com/Ad0ky/Fable-2-Recomp/releases) · [Report a problem](https://github.com/Ad0ky/Fable-2-Recomp/issues) · [Discord](https://discord.gg/8TQUZpPNeR)
 
-By **Ad0ky**, based on [himdo's Fable 2 Recomp](https://github.com/himdo/Fable-2-Recomp) and
+By **Ad0ky** and **[StevensND](https://github.com/StevensND)**, based on [himdo's Fable 2 Recomp](https://github.com/himdo/Fable-2-Recomp) and
 [renut_nx_ultimate_base](https://github.com/ChanseyIsTheBest/renut_nx_ultimate_base).
 Free and open source: if you paid for this, ask for a refund.
 
