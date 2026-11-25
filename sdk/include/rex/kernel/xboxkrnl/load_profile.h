@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace rex::kernel::xboxkrnl::load_profile {
 
@@ -50,5 +51,10 @@ void BeginWait(uint32_t kind, uint32_t object, const char* what, uint32_t count)
 void EndWait();
 // Called for every presented frame (VdSwap), for the stall detector.
 void NoteSwap();
+
+// fable2-nx (2026-11-25, the Switch-only save corruption): the calling thread's host call chain, for a log line. On
+// Windows the recompiled game functions on it by name (DbgHelp, innermost first, "a < b"); on the Switch the return
+// addresses as offsets from the executable's start ("+1a2b3c ..."), to name offline with the build's ELF.
+std::string CallerChain();
 
 }  // namespace rex::kernel::xboxkrnl::load_profile

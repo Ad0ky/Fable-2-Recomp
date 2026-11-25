@@ -7,6 +7,7 @@
 // Renut's side, renut_native_sub_X, when Renut's renderer is chosen.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include <rex/hook.h>
@@ -24,6 +25,37 @@ inline bool Active() {
   const int8_t a = detail::g_active;
   return a ? a > 0 : detail::LatchActive();
 }
+
+// fable2-nx (2026-11-25, the emulated GPU's refresh rate of 0 and the game stopping after the intro): with Renut's
+// renderer not chosen a hook calls the game's original (__imp__sub_X). The generated originals of hooked functions do
+// not save and restore the non-volatile registers (the __savegprlr / __restgprlr calls are left out, their callers
+// keep them), yet the generated caller of a hooked function reads them back after the call as the hook left them. So
+// the original's own use of r14-r31 / f14-f31 leaked into its caller: CDevice::Initialize (sub_82BA0220) left r29 = 16
+// in sub_82B69978, which then copied the refresh rate from 16 + 20 instead of XGetVideoMode's answer. The fallback
+// keeps them, as the PowerPC ABI promises a caller.
+struct PreservedNonVolatiles {
+  PPCContext& ctx;
+  PPCRegister gpr[18];
+  PPCRegister fpr[18];
+  explicit PreservedNonVolatiles(PPCContext& c) : ctx(c) {
+    const PPCRegister* g = &ctx.r14;
+    const PPCRegister* f = &ctx.f14;
+    for (int i = 0; i < 18; ++i) {
+      gpr[i] = g[i];
+      fpr[i] = f[i];
+    }
+  }
+  ~PreservedNonVolatiles() {
+    PPCRegister* g = &ctx.r14;
+    PPCRegister* f = &ctx.f14;
+    for (int i = 0; i < 18; ++i) {
+      g[i] = gpr[i];
+      f[i] = fpr[i];
+    }
+  }
+};
+static_assert(offsetof(PPCContext, r31) - offsetof(PPCContext, r14) == 17 * sizeof(PPCRegister));
+static_assert(offsetof(PPCContext, f31) - offsetof(PPCContext, f14) == 17 * sizeof(PPCRegister));
 
 }  // namespace banjo::renut_gpu
 
@@ -55,6 +87,7 @@ inline bool Active() {
       ::rex::ppc::HostToGuestFunction<function>(ctx, base);                            \
       return;                                                                          \
     }                                                                                  \
+    ::banjo::renut_gpu::PreservedNonVolatiles banjo_keep_(ctx);                        \
     __imp__##subroutine(ctx, base);                                                    \
   }
 
@@ -73,6 +106,7 @@ inline bool Active() {
       banjo_renut_raw_##subroutine(ctx, base);                                         \
       return;                                                                          \
     }                                                                                  \
+    ::banjo::renut_gpu::PreservedNonVolatiles banjo_keep_(ctx);                        \
     __imp__##subroutine(ctx, base);                                                    \
   }                                                                                    \
   static void banjo_renut_raw_##subroutine([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)

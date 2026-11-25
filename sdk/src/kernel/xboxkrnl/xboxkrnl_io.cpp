@@ -781,8 +781,9 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   if (const std::string save_path = SaveFilePath(file_handle, file.get()); !save_path.empty()) {  // fable2-nx
     const int64_t at = byte_offset_ptr ? int64_t(byte_offset) : int64_t(-1);
     const uint32_t done = io_status_block ? (uint32_t)io_status_block->information : 0u;
-    REXKRNL_INFO("[save] NtReadFile '{}' (handle {:#x}): {} bytes at {} -> {:#x} ({} read)", save_path,
-                 (uint32_t)file_handle, (uint32_t)buffer_length, at, (uint32_t)result, done);
+    REXKRNL_INFO("[save] NtReadFile '{}' (handle {:#x}): {} bytes at {} -> {:#x} ({} read) | from{}", save_path,
+                 (uint32_t)file_handle, (uint32_t)buffer_length, at, (uint32_t)result, done,
+                 load_profile::CallerChain());
     SaveJournal('R', (uint32_t)file_handle, save_path, at, (uint32_t)buffer_length, (uint32_t)result, done,
                 buffer.host_address(), done);
   }
@@ -965,8 +966,9 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
   if (const std::string save_path = SaveFilePath(file_handle, file.get()); !save_path.empty()) {  // fable2-nx
     const int64_t at = byte_offset_ptr ? int64_t(static_cast<uint64_t>(*byte_offset_ptr)) : int64_t(-1);
     const uint32_t done = io_status_block ? (uint32_t)io_status_block->information : 0u;
-    REXKRNL_INFO("[save] NtWriteFile '{}' (handle {:#x}): {} bytes at {} -> {:#x} ({} written)", save_path,
-                 (uint32_t)file_handle, (uint32_t)buffer_length, at, (uint32_t)result, done);
+    REXKRNL_INFO("[save] NtWriteFile '{}' (handle {:#x}): {} bytes at {} -> {:#x} ({} written) | from{}", save_path,
+                 (uint32_t)file_handle, (uint32_t)buffer_length, at, (uint32_t)result, done,
+                 load_profile::CallerChain());
     SaveJournal('W', (uint32_t)file_handle, save_path, at, (uint32_t)buffer_length, (uint32_t)result, done,
                 buffer.host_address(), (uint32_t)buffer_length);
   }

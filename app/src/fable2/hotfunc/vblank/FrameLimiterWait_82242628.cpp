@@ -50,6 +50,10 @@
 
 #include "fable2_platform.h"
 
+#include <chrono>
+
+#include <rex/logging.h>
+
 extern "C" void FastHelper_821E8D20(PPCContext& ctx, uint8_t* base);
 extern "C" void GpuProgressCheck_82B9BF90(PPCContext& ctx, uint8_t* base);
 extern "C" void __restgprlr_29(PPCContext& ctx, uint8_t* base);
@@ -208,7 +212,19 @@ extern "C" void FrameLimiterWait_82242628(PPCContext& __restrict ctx, uint8_t* b
   // sub_82B9BEC8. The loop leaves on GpuProgressCheck == 0 (beq 0x8224270C)
   // or once the counter reaches the deadline (blt cr6,0x822426E0 not taken).
   BuildArgBlock(ctx, base);
+  // fable2-nx (2026-11-25, the emulated GPU stopping after the intro): a wait longer than 2 s is logged once with the
+  // fence it waits for (the counter's address and value, the fence asked and the last one issued).
+  const auto wait_start = std::chrono::steady_clock::now();
+  bool wait_logged = false;
   while (ctx.cr6.lt != 0) {
+    if (!wait_logged && std::chrono::steady_clock::now() - wait_start > std::chrono::seconds(2)) {
+      wait_logged = true;
+      const uint32_t counter_ptr = REX_LOAD_U32(ctx.r31.u32 + kCounterPtrOffset);
+      REXLOG_WARN("[fence] BlockOnFence waiting 2 s: device {:08X}, counter at {:08X} = {:08X}, fence asked {:08X}, "
+                  "last issued {:08X}",
+                  ctx.r31.u32, counter_ptr, uint32_t(REX_LOAD_U32(counter_ptr)), ctx.r30.u32,
+                  uint32_t(REX_LOAD_U32(ctx.r31.u32 + kDeadlineOffset)));
+    }
     ctx.r3.s64 = ctx.r1.s64 + kArgBlock;
     ctx.lr = kRetProgressCheck;
     GpuProgressCheck_82B9BF90(ctx, base);

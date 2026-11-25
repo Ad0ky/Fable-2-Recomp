@@ -21,6 +21,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/chrono/clock.h>
 #include <rex/system/xthread.h>
 
@@ -1249,6 +1250,45 @@ void ControlMain() {
   }
 }
 }  // namespace
+
+#if REX_PLATFORM_SWITCH
+extern "C" char _start;  // the executable's first instruction (as in xmemory.cpp)
+#endif
+
+std::string CallerChain() {
+  std::string out;
+#ifdef _WIN32
+  void* frames[48] = {};
+  const USHORT n = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
+  int named = 0;
+  for (USHORT i = 0; i < n && named < 10; ++i) {
+    std::string name = Symbolize(reinterpret_cast<uint64_t>(frames[i]));
+    if (!IsGameFunctionName(name)) {
+      continue;
+    }
+    if (named++) {
+      out += " < ";
+    }
+    out += name;
+  }
+#elif REX_PLATFORM_SWITCH
+  const uint64_t base = reinterpret_cast<uint64_t>(&_start);
+  auto frame = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+  for (int i = 0; i < 24 && frame && (frame & 7) == 0; ++i) {
+    const uint64_t next = reinterpret_cast<const uint64_t*>(frame)[0];
+    const uint64_t ret = reinterpret_cast<const uint64_t*>(frame)[1];
+    if (ret < base || ret - base > 0x10000000ull) {
+      break;
+    }
+    out += fmt::format(" +{:x}", ret - base);
+    if (next <= frame || next - frame > 0x100000ull) {
+      break;
+    }
+    frame = next;
+  }
+#endif
+  return out;
+}
 
 void StartControl() {
   if (!(ActiveNow() || REXCVAR_GET(load_timer))) {

@@ -324,6 +324,23 @@ bool CommandProcessor::SetupContext() {
 void CommandProcessor::ShutdownContext() {}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+  // fable2-nx (2026-11-25, the emulated GPU hanging at the first frame): Fable calls VdInitializeRingBuffer three times,
+  // the last from another guest thread after it has already kicked commands into the ring. Moving the ring under the
+  // running GPU thread lost its place, so the change is made on the GPU thread, between batches; and a ring initialized
+  // again starts empty, its write pointer at 0 as well as its read pointer (the game writes it from 0 again).
+  if (worker_running_ && worker_thread_ && !system::XThread::IsInThread(worker_thread_.get())) {
+    thread::Fence fence;
+    CallInThread([this, ptr, size_log2, &fence]() {
+      InitializeRingBuffer(ptr, size_log2);
+      fence.Signal();
+    });
+#if !REX_PLATFORM_SWITCH
+    write_ptr_index_event_->Set();
+#endif
+    fence.Wait();
+    return;
+  }
+  write_ptr_index_ = 0;
   read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);

@@ -69,6 +69,10 @@ REXCVAR_DEFINE_INT32(fable2_ring_ahead_kib, 0, "Fable2",
 // how many the 3D Engine reads a frame.
 REXCVAR_DEFINE_BOOL(fable2_ring_report, false, "Fable2",
                     "Log every 10 s the game's command rings: bytes written and read, waits, and who writes");
+// fable2-nx (2026-11-25, the emulated GPU stopping after the intro video): Renut's [freeze] watchdog is what calls the
+// report; with the SDK's emulated GPU nothing does. N > 0: a thread writes the report every N seconds.
+REXCVAR_DEFINE_INT32(fable2_probe_report_s, 0, "Fable2",
+                     "Diagnostic: write the deadlock probe's report every N seconds (0 = only at Renut's freeze)");
 REXCVAR_DEFINE_BOOL(fable2_drain_before_pause, true, "Fable2",
                     "Before the game pauses its 3D Engine, wait for it to read the ring the main thread fills "
                     "(fixes the freeze at the idle demo and after pressing A on the title screen)");  // the game's frames (D3DDevice_Swap_hook; app/src/katamari_keys.cpp)
@@ -508,8 +512,29 @@ extern "C" void ProcessAndProcessAndProcess543_822943E8(PPCContext& __restrict c
   __imp__ProcessAndProcessAndProcess543_822943E8(ctx, base);
 }
 
+extern "C" void Fable2DeadlockProbeReport();
+
+namespace {
+void StartPeriodicReport() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    const int32_t seconds = REXCVAR_GET(fable2_probe_report_s);
+    if (seconds <= 0)
+      return;
+    std::thread([seconds] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        REXLOG_WARN("[probe] periodic report (fable2_probe_report_s = {})", seconds);
+        Fable2DeadlockProbeReport();
+      }
+    }).detach();
+  });
+}
+}  // namespace
+
 extern "C" void ProcessAndWaitMapStatus_82B49B50(PPCContext& __restrict ctx, uint8_t* base) {
   g_base.store(base, std::memory_order_relaxed);
+  StartPeriodicReport();
   Slot* s = SlotForThisThread();
   const uint32_t object = ctx.r3.u32;
   if (s) {

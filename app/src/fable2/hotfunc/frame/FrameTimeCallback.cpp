@@ -30,6 +30,10 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#if defined(BANJO_RENUT_RENDERER)
+#include "renut_engine/gpu/banjo_renut_select.h"
+#endif
+
 REXCVAR_DEFINE_BOOL(fable2_frame_time_callback, true, "Fable2",
                     "Run the 3D Engine's frame-time GPU callback (82B89A78) that Fable writes into the ring, so its "
                     "clock follows the real time below 30 fps (fixes the game slowing down after the intro)");
@@ -79,7 +83,14 @@ extern "C" void ProcessAndProcessAndProcess952_821F5F20(PPCContext& __restrict c
     return;
   static const bool frame_time = REXCVAR_GET(fable2_frame_time_callback);
   static const bool all = REXCVAR_GET(fable2_ring_callbacks_all);
-  const bool run = all || (frame_time && callback == kFrameTimeCallback);
+  // fable2-nx (2026-11-25): with the SDK's emulated GPU (banjo_renderer = "emulated") the GPU itself raises the ring's
+  // INTERRUPT and D3D's handler runs the callbacks; running them here as well hung the 3D Engine at its first frame.
+#if defined(BANJO_RENUT_RENDERER)
+  static const bool renut = ::banjo::renut_gpu::Active();
+#else
+  static const bool renut = false;
+#endif
+  const bool run = renut && (all || (frame_time && callback == kFrameTimeCallback));
   NoteFirst(callback, context, run);
   if (!run)
     return;
