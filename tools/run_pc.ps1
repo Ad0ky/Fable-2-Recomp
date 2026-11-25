@@ -19,7 +19,7 @@ $log = Join-Path $logs "$Name.log"
 Remove-Item $log -ErrorAction SilentlyContinue
 $min = if ($Visible) { "false" } else { "true" }
 $args = @("--log_file=$log", "--audio_mute=true", "--window_start_minimized=$min", "--fullscreen=false",
-          "--game_data_root=`"$gameRoot`"", "--banjo_renderer=$Renderer", "--user_data_root=$root/out/pc_user",
+          "--game_data_root=$gameRoot", "--banjo_renderer=$Renderer", "--user_data_root=$root/out/pc_user",
           "--nfsmw_captura_cada_s=$Every", "--nfsmw_captura_max=60", "--log_file_writer=false") +
         @($Extra -split ' ' | Where-Object { $_ })
 # The emulated GPU is the SDK's plugin (rexgpu-xenos.dll), loaded only when named.
