@@ -90,6 +90,17 @@ def demangled_kind(name, by_name, in_place=frozenset()):
         if sub in in_place:
             return 'copy', sub  # port 81: a copy in place of its generated function (no original left)
         return 'gen', sub
+    # fable2-nx (2026-11-26): a game whose manifest names its functions (Fable II: ProcessAndProcessAndProcess1054_82CD6010,
+    # InterpolateFloatArray_82C62548...) has generated code under those names too. They count as generated code, listed
+    # by name (localize_native.list_entries takes a name as well as an address).
+    m = re.fullmatch(r'(?:__imp__)?([A-Za-z_]\w*_(8[0-9A-F]{7}))', name)
+    if m and not name.startswith('_Z'):
+        gen = m.group(1)
+        if gen in by_name and '__imp__' + gen in by_name and by_name[gen] != by_name['__imp__' + gen]:
+            return 'hooked', gen
+        if 'sub_' + m.group(2) in in_place:
+            return 'copy', gen
+        return 'gen', gen
     m = re.search(r'banjo3hot\d+n_([0-9A-F]{8})', name)  # _ZN5banjo3hot10n_823A9E80...
     if m:
         return 'copy', 'sub_' + m.group(1)
@@ -241,7 +252,7 @@ def main():
         if a.min_instructions:
             pruned = []
             for l in lines:
-                m = re.match(r'\s*([0-9A-Fa-f]{8}) (\d+) console samples, (\d+) instructions', l)
+                m = re.match(r'\s*(?:\w*_)?([0-9A-Fa-f]{8}) (\d+) console samples, (\d+) instructions', l)
                 if m and int(m.group(3)) < a.min_instructions and int(m.group(2)) < a.small_keep_samples:
                     left['small, taken out of the list'] += 1
                     continue
@@ -249,14 +260,16 @@ def main():
             lines = pruned
         # (sasrt-nx's 2026-11-10 audit, finding 5: what the list still has after the prune, so a pruned function the
         # profiles now find hot enough comes back.)
-        have = {m.group(1).upper() for l in lines for m in [re.match(r'\s*([0-9A-Fa-f]{8})\b', l)] if m}
+        have = {m.group(1).upper() for l in lines for m in [re.match(r'\s*(?:\w*_)?([0-9A-Fa-f]{8})\b', l)] if m}
         # blur-nx (2026-11-13): '# out: XXXXXXXX reason' lines keep a function out for good (a copy the guard found
         # different, or one that must not be copied): the profiles would otherwise add it back at the next refresh.
         out = {m.group(1).upper() for l in lines for m in [re.match(r'#\s*out:\s*([0-9A-Fa-f]{8})\b', l)] if m}
-        left['kept out by a "# out:" line'] += sum(1 for r in rows if r[0][4:].upper() in out)
-        rows = [r for r in rows if r[0][4:].upper() not in have and r[0][4:].upper() not in out]
+        left['kept out by a "# out:" line'] += sum(1 for r in rows if r[0][-8:].upper() in out)
+        rows = [r for r in rows if r[0][-8:].upper() not in have and r[0][-8:].upper() not in out]
     for sub, n, ins, calls in rows:
-        lines.append(f'{sub[4:]} {n} console samples, {ins} instructions, {calls} direct callees')
+        # A named function goes in by its name (fable2-nx), a sub_ by its address.
+        key = sub[4:] if re.fullmatch(r'sub_[0-9A-F]{8}', sub) else sub
+        lines.append(f'{key} {n} console samples, {ins} instructions, {calls} direct callees')
     open(a.write, 'w', encoding='utf-8', newline='\n').write('\n'.join(lines) + '\n')
     print(f'{len(rows)} functions {"added to" if a.merge else "written to"} {a.write}; left out: ' +
           ', '.join(f'{k} {v}' for k, v in left.most_common()))
