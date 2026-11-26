@@ -5885,7 +5885,21 @@ REXCVAR_DEFINE_BOOL(fable2_renut_tess_adaptive_max, true, "Banjo/Enhancements",
                     "Fable 2 NX: adaptive tessellated draws use the device's maximum level instead of the edge factors "
                     "read from their index buffer (the coarse terrain then matches the detail terrain: no black "
                     "ground). false: the highest factor read, as before");
+// fable2-nx (2026-11-26, the console's GPU profile: the 192x192 pass that draws the whole world again for the sun's
+// mask costs ~4 ms a frame, its terrain shader 52FE118F alone 3.1 ms for 47 draws: vertex work, not pixels). Every
+// terrain patch is drawn at the device's maximum level (fable2_renut_tess_adaptive_max), 16x16 segments, whatever the
+// size of the target it lands in. With fable2_renut_tess_small_target_px > 0, a tessellated draw into a target whose
+// larger side (host pixels) is at most that many is drawn with at most fable2_renut_tess_small_target_segments
+// segments per edge. Both terrain layers of one target get the same cap, so they still match (no black ground). It
+// changes those targets' pixels (the sun's mask, at 1024 the shadow map too): off by default, a decision per game.
+REXCVAR_DEFINE_INT32(fable2_renut_tess_small_target_px, 0, "Banjo/Enhancements",
+                     "Fable 2 NX: tessellated draws into a target whose larger side is at most this many host pixels "
+                     "use at most fable2_renut_tess_small_target_segments segments per edge (0 = off; 256: the sun's "
+                     "mask pass; 1024: the shadow map too)");
+REXCVAR_DEFINE_INT32(fable2_renut_tess_small_target_segments, 4, "Banjo/Enhancements",
+                     "Fable 2 NX: the most segments per patch edge in a small target (fable2_renut_tess_small_target_px)");
 namespace {
+u32 g_tess_target_px = 0;  // the draw's target, its larger side in host pixels (set before PrepareTessellation)
 bool PrepareTessellation(const GuestDevice &device, const DrawCall &call, Geometry &g,
                          u32 tessellation[4]) {
   g_cp_fetch = {};
@@ -5960,6 +5974,17 @@ bool PrepareTessellation(const GuestDevice &device, const DrawCall &call, Geomet
   // fable2-nx (2026-11-15, the 4-second frames once its tessellated draws were hooked): a cap on the segments per edge
   // (fable2_renut_tess_max_segments; 64 = the hardware's, as before).
   segments = std::min(segments, u32(std::clamp(REXCVAR_GET(fable2_renut_tess_max_segments), 1, 64)));
+  {
+    static const u32 small_px = u32(std::max(REXCVAR_GET(fable2_renut_tess_small_target_px), 0));
+    static const u32 small_segments = u32(std::clamp(REXCVAR_GET(fable2_renut_tess_small_target_segments), 1, 64));
+    if (small_px && g_tess_target_px && g_tess_target_px <= small_px && segments > small_segments) {
+      static uint32_t logged = 0;
+      if (LogLimited(logged, 4))
+        RGPU_INFO("[tess] a {}-pixel target: {} segments per edge instead of {} (fable2_renut_tess_small_target_px {})",
+                  g_tess_target_px, small_segments, segments, small_px);
+      segments = small_segments;
+    }
+  }
   const u32 per_segment = triangles ? 3 : 6;  // vertices per segment^2
   while (segments > 1 &&
          uint64_t(patches) * segments * segments * per_segment > kMaxTessellatedVertices)
@@ -15290,6 +15315,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
       VerifyWholeGeometry(device, call, *vs, shader_strides, declaration->layout, geometry, whole_copies);
   } else {
     ++g_range_draws;
+    g_tess_target_px = std::max(targets.width, targets.height);  // fable2-nx: fable2_renut_tess_small_target_px
     if (call.tessellation ? !PrepareTessellation(device, call, geometry, tessellation)
                           : !PrepareGeometry(device, call, geometry)) {
       ++g_dropped_draws[kDropGeometry];
