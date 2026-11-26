@@ -229,3 +229,7 @@ fable2_xma_frame_cache = false
 # With the GPU's counts (2), the castle, houses, roofs and the lights and shadows on them flickered: the counts of some
 # of the game's test boxes swing between 0 and not from one frame to the next. About 11 % more draws in town.
 fable2_occlusion_queries = 0
+# fable2-nx (2026-11-25): the save journal off (save_journal.bin next to the NRO, every read and write of a save file
+# with its bytes). It was for the corrupt mainsave.bin, which port 203's shared descriptors fixed (checked on the console:
+# a new game saved, quit and continued).
+fable2_save_journal = false
