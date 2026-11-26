@@ -1557,7 +1557,12 @@ void RefreshLinearLocked(HostTexture &t, const TextureFetch &fetch) {
     const bool watched = g_frame - t.unlock_frame < kUnlockWatchFrames;
     if (t.unlocked) {
       upload(CheckedHash(fetch, t, false));
-    } else if (watched || verify_due) {
+    } else {
+      // Fable 2 NX (2026-11-26): every check, not only while watched or when a verify is due. The video decoder locks
+      // and unlocks a video's luma plane once as it starts, then writes it without a lock: outside the 8 watched
+      // frames the plane kept the frame of the end of the fade-in until the next verify (frames 12 to 36 on the
+      // Switch), and the two planes the video alternates flickered. CheckedHash costs little while the cards prove the
+      // pages unwritten.
       const uint64_t hash = CheckedHash(fetch, t, false);
       if (hash != t.content_hash) {
         upload(hash);
