@@ -541,7 +541,7 @@ CsGuarded_HandlerDispatch_82B43CF0 7 console samples, 80 instructions, 3 direct 
 ComputeFromCount_821888C0 7 console samples, 178 instructions, 0 direct callees
 ProcessState_8219F010 7 console samples, 166 instructions, 6 direct callees
 ProcessHashTable_829FC3C0 7 console samples, 156 instructions, 8 direct callees
-ProcessAndProcessAndProcess714_821D8B60 7 console samples, 212 instructions, 4 direct callees
+# out: 821D8B60 ProcessAndProcessAndProcess714_821D8B60 has a hand-written override (hotfunc/particles/ParticleSharedData.cpp)
 ProcessAndProcessAndProcess537_832BAA28 7 console samples, 164 instructions, 1 direct callees
 ProcessAndProcessAndProcess658_821F3C80 7 console samples, 100 instructions, 0 direct callees
 SwitchDispatch_82A2F3E8 7 console samples, 70 instructions, 0 direct callees
