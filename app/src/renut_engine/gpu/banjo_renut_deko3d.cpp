@@ -329,7 +329,7 @@ const PackageEntry *Find(InstalledPackage &p, uint64_t hash) {
 // uam 1.1.0 with SwitchWakerHD's 8 patches and banjo-nx's passes (bnx3, 2026-10-18: with the value numbering).
 // banjo-nx (2026-10-20): bnx4 with uam banjo flag 1024 (the 128-bit bone rows) in the default flags: a cache
 // compiled before is another compiler's.
-constexpr char kCacheTag[16] = "uam110-sw8-bnx4";
+constexpr char kCacheTag[16] = "uam110-sw8-f2u5";  // fable2-nx (2026-11-26): bnx4 -> f2u5, the uam of 2026-11-25 (caches compiled by the older uam are dropped: the sky and the distant trees flickered with them)
 
 constexpr uint32_t kDkshMagic = 0x48534B44u;  // "DKSH", the first word of every record's data
 
