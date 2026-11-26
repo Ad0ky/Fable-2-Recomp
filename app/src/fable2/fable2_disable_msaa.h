@@ -11,19 +11,20 @@
 // longer replays the scene once per predicated tile (Begin/EndTiling, SetPredication: reNut's first frames on deko3d
 // were black but for the bloom, with the tiling path barely tested on Fable), and the main pass has half the samples
 // (FableDroid: the single largest GPU cost, 21.7 -> 26.9 fps on an Adreno 740). fable2_disable_msaa = false restores it.
+//
+// Fable 2 NX (2026-11-26): off on the Switch too. Without the game's MSAA a false shadow came and went with the camera
+// on the roof lit by the lamp in Bowerstone Old Town, a piece of the lamp's light cut out in the shape of the house to
+// its left, and lights and shadows on the walls there flickered the same way; the PC (MSAA on) never had them, and with
+// fable2_disable_msaa = false on the console they were gone. renut's fable2_msaa_level (1 on the Switch) still decides
+// the samples drawn, so the cost stays small (13-16 fps at that spot, as before).
 #pragma once
 
 #include <rex/cvar.h>
 #include <rex/ppc/context.h>
 
-#if defined(__SWITCH__)
-#define FABLE2_DISABLE_MSAA_DEFAULT true
-#else
-#define FABLE2_DISABLE_MSAA_DEFAULT false
-#endif
-
-REXCVAR_DEFINE_BOOL(fable2_disable_msaa, FABLE2_DISABLE_MSAA_DEFAULT, "GPU",
-                    "Render Fable II without its 2x MSAA (Xenia 'Disable MSAA' patch; on by default on the Switch)");
+REXCVAR_DEFINE_BOOL(fable2_disable_msaa, false, "GPU",
+                    "Render Fable II without its 2x MSAA (Xenia 'Disable MSAA' patch; a false lamp shadow on the "
+                    "roofs with it on the Switch)");
 
 extern "C" void __imp__sub_8238DE58(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8238DE58(PPCContext& ctx, uint8_t* base) {
