@@ -19,7 +19,13 @@ CC="${HOST_CC:-$(command -v clang-20 || command -v clang)}"
 CXX="${HOST_CXX:-$(command -v clang++-20 || command -v clang++)}"
 out="$root/out/deko3d_tools"
 stamp="$out/.stamp"
-want="dxc=$DXC_TAG spirv-cross=$SPIRV_CROSS_TAG uam=$(sha256sum app/thirdparty/uam/CMakeLists.txt | cut -c1-16) glslang=1"
+# fable2-nx (2026-11-26, the sky flickering only with the prebuilt DKSH cache): the stamp took only uam's CMakeLists.txt,
+# so the uam sources' changes since 2026-11-12 (port 163's passes, compiler_iface, glsl_frontend) never rebuilt the PC's
+# uam. The cache was compiled by that old uam while the NRO's own uam is the new one, and the console took the old code
+# (same cache tag). Every uam source counts now.
+uam_hash=$(find app/thirdparty/uam -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name '*.py' \
+    -o -name 'CMakeLists.txt' -o -name '*.cmake' \) -print0 | sort -z | xargs -0 cat | sha256sum | cut -c1-16)
+want="dxc=$DXC_TAG spirv-cross=$SPIRV_CROSS_TAG uam=$uam_hash glslang=1"
 dxc_dir="$root/app/thirdparty/reblue-XenosRecomp/thirdparty/dxc-bin"
 if [ "$(cat "$stamp" 2>/dev/null || true)" = "$want" ] && [ -x "$dxc_dir/bin/x64/dxc-linux" ] \
     && [ -x "$root/out/glslang-linux/StandAlone/glslangValidator" ]; then
