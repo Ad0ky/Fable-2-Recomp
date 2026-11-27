@@ -18,6 +18,18 @@ REXCVAR_DEFINE_STRING(renut_shadow_resolution, "Resolution", "Nuts&Bolts/Graphic
                       "renut_resolution; 1x is the console's; 2x, 3x and 4x are sharper.")
     .allowed({"Resolution", "1x", "2x", "3x", "4x"});
 
+// fable2-nx (2026-11-27, the distant trees' dark blocks and the dog's and the hero's textures at 480p/540p): the game
+// draws a mip chain into one texture from targets of 256, 128 and 64 pixels. At a scale other than 1x the 256 one
+// followed the resolution while the 128 and 64 ones were post-processing buffers (1x), so each level's resolve made the
+// destination again at the other scale and lost the levels before it (the resolve report: ~1,100 a second "another
+// scale" at 480p, none at 720p). Colour and depth targets of at most half the screen's height on each side stay at the
+// console's size: one scale for the whole chain, the console's pixels.
+REXCVAR_DEFINE_BOOL(fable2_renut_small_targets_native, true, "Nuts&Bolts/Graphics",
+                    "Fable 2 NX: render targets of at most half the screen's height on each side (the trees' "
+                    "impostors, texture morphs) at the console's size at every internal resolution (one scale for "
+                    "their mip chains)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_STRING(renut_ambient_occlusion, "Half", "Nuts&Bolts/Graphics",
                       "Ambient occlusion (SSAO) resolution: Half the screen's, as on the console, "
                       "or Full.")
@@ -209,6 +221,10 @@ RenderScale SurfaceRenderScale(const d3d::SurfaceDesc &desc, RenderScale resolut
     return resolution.Times(2);
   if (IsPostProcessBuffer(desc, width, height))
     return {};  // the console's
+  // fable2-nx (2026-11-27): fable2_renut_small_targets_native (above), colour and depth alike.
+  static const bool small_native = REXCVAR_GET(fable2_renut_small_targets_native);
+  if (small_native && width * 2 <= kGuestScreenHeight && height * 2 <= kGuestScreenHeight)
+    return {};
   // banjo-nx (2026-10-21, package 36z2): a depth target of a quarter of the screen or less goes with the colour targets
   // of that size (the post-processing buffers' rule, which takes colour only): a 128x128 one at 0.9x under its 128x128
   // colour target at 1x cut its draws to 115x115 (console log of 36z: ten draws a frame).
