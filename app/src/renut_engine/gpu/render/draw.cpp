@@ -18576,6 +18576,11 @@ struct HbResolveScope {
       ::renut::gpu::host_batch::Add(::renut::gpu::host_batch::kResolveTicksWork, total > dest ? total - dest : 0);
     }
 };
+// fable2-nx (2026-11-27): ResolveTargetsLocked's [kinds] lines.
+REXCVAR_DEFINE_BOOL(fable2_diag_resolve_kinds, false, "Banjo/Diagnostics",
+                    "Fable 2 NX: log each kind of resolve once (source and destination sizes, formats, scale, level)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 void ResolveTargetsLocked(const u32 *targets, u32 flags, const ClearRect *source_rect,
                           u32 dest_texture_va, const d3d::TextureFetchConstant *dest_format,
                           i32 dest_x, i32 dest_y, u32 dest_level, u32 dest_slice,
@@ -18666,6 +18671,31 @@ void ResolveTargetsLocked(const u32 *targets, u32 flags, const ClearRect *source
               surface->depth ? "depth" : "colour", source_va, surface->width, surface->height, u32(surface->format),
               u32(surface->samples), dest_texture_va, dest_x, dest_y, dest_level, dest_slice, r.x1, r.y1, r.x2, r.y2,
               flags, (flags & 0x100) ? "clear colour after " : "", (flags & 0x200) ? "clear depth after" : "");
+  }
+  // fable2-nx (2026-11-27, the hero's and the dog's textures at 480p; diagnostics only): each kind of resolve once (source
+  // size, format and scale; destination size, format, level and slice), with its frame, so the ones made while an area
+  // loads are seen too.
+  static const bool resolve_kinds = REXCVAR_GET(fable2_diag_resolve_kinds);
+  if (resolve_kinds && surface) [[unlikely]] {
+    static std::unordered_set<uint64_t> seen;
+    TextureFetch df;
+    if (dest_format)
+      for (u32 i = 0; i < 6; ++i)
+        df.dword[i] = dest_format->dword[i];
+    const u32 dw = dest_format ? (df.dword[2] & 0x1FFFu) + 1 : 0, dh = dest_format ? ((df.dword[2] >> 13) & 0x1FFFu) + 1 : 0;
+    const uint64_t k = uint64_t(surface->width) ^ uint64_t(surface->height) << 13 ^ uint64_t(int(surface->format)) << 26 ^
+                       uint64_t(surface->depth) << 33 ^ uint64_t(surface->scale.code) << 34 ^ uint64_t(dw) << 40 ^
+                       uint64_t(dh) << 53 ^ uint64_t(dest_level) << 7 ^ uint64_t(dest_slice) << 20 ^
+                       uint64_t(source_rect != nullptr) << 63 ^ uint64_t(dest_format ? u32(df.Format()) : 0) << 45;
+    if (seen.size() < 400 && seen.insert(k).second)
+      RGPU_INFO("[kinds] frame {}: resolve {} {}x{} fmt {} scale {} (host {}x{}) -> {:08X} {}x{} fmt {} level {} slice {} "
+                "at ({},{}){}", TextureFrameLocked(), surface->depth ? "depth" : "colour", surface->width,
+                surface->height, int(surface->format), u32(surface->scale.code), surface->scale.Size(surface->width),
+                surface->scale.Size(surface->height), dest_texture_va, dw, dh, dest_format ? u32(df.Format()) : 0,
+                dest_level, dest_slice, dest_x, dest_y,
+                source_rect ? fmt::format(" rect {},{}-{},{}", source_rect->x1, source_rect->y1, source_rect->x2,
+                                          source_rect->y2)
+                            : std::string());
   }
   if (surface && DrawLogFrameLocked(TextureFrameLocked())) [[unlikely]] {  // culdcept-nx (2026-11-19): the draw log's window
     RGPU_INFO("[drawlog] frame {} resolve {} at {:08X} ({}x{}) -> texture {:08X}, flags {:X}{}{}", TextureFrameLocked(),
